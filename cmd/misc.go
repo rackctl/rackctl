@@ -89,7 +89,8 @@ var destroyCmd = &cobra.Command{
 		for i := len(comps) - 1; i >= 0; i-- {
 			c := comps[i]
 			fmt.Println(ui.Step("destroy " + c))
-			if err := run.Run(ctx, "terragrunt", "--working-dir", "live/aws/workload-"+env+"/"+c,
+			dir := fmt.Sprintf("live/aws/workload-%s/%s/%s/%s", env, cfg.Cloud.Region, env, c)
+			if err := run.Run(ctx, "terragrunt", "--working-dir", dir,
 				"--non-interactive", "destroy", "-auto-approve"); err != nil {
 				return err
 			}
