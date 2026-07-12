@@ -72,8 +72,10 @@ func destroy(ctx context.Context, st *engine.State, component string) error {
 }
 func tg(ctx context.Context, st *engine.State, verb, component string) error {
 	dir := "live/aws/workload-" + string(st.Config.Environment) + "/" + component
-	return st.Runner.Run(ctx, "terragrunt", verb, "--terragrunt-non-interactive",
-		"--terragrunt-working-dir", dir)
+	// terragrunt 1.0+ takes global flags (--working-dir, --non-interactive) before
+	// the command; -auto-approve is a tofu flag after it. The old post-command
+	// --terragrunt-working-dir is silently ignored by 1.0.x (runs in the cwd).
+	return st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", verb, "-auto-approve")
 }
 
 // captureOutputs merges a component's `terragrunt output -json` into State. It
@@ -83,7 +85,7 @@ func captureOutputs(ctx context.Context, st *engine.State, component string) {
 		return
 	}
 	dir := "live/aws/workload-" + string(st.Config.Environment) + "/" + component
-	data, err := st.Runner.Capture(ctx, "terragrunt", "output", "-json", "--terragrunt-working-dir", dir)
+	data, err := st.Runner.Capture(ctx, "terragrunt", "--working-dir", dir, "output", "-json")
 	if err != nil || data == "" {
 		return
 	}
