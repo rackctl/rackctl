@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="rackctl">
+  <g fill="#1D2025">
+    <rect x="56" y="59"  width="144" height="34" rx="10"/>
+    <rect x="56" y="111" width="144" height="34" rx="10"/>
+    <rect x="56" y="163" width="144" height="34" rx="10"/>
+  </g>
+  <circle cx="178" cy="128" r="8" fill="#6E9C82"/>
+</svg>
