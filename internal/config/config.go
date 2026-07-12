@@ -103,10 +103,16 @@ type DNS struct {
 }
 
 type AgentPlatform struct {
-	Enable               bool       `json:"enable"`
+	// Enable installs the agent platform. Omitted (nil) defaults to true — it is
+	// the whole point of the platform; set it false to explicitly opt out.
+	Enable               *bool      `json:"enable,omitempty"`
 	BedrockModelFamilies []string   `json:"bedrockModelFamilies"`
 	Compliance           Compliance `json:"compliance"`
 }
+
+// Enabled reports whether the agent platform should be installed. An omitted
+// agentPlatform block (nil) defaults to enabled.
+func (a AgentPlatform) Enabled() bool { return a.Enable == nil || *a.Enable }
 
 type Compliance struct {
 	SOC2  bool `json:"soc2"`
@@ -125,6 +131,8 @@ type FirstTenant struct {
 	MonthlyBudgetUSD int    `json:"monthlyBudgetUsd"`
 }
 
+func boolPtr(b bool) *bool { return &b }
+
 // Default returns a Config populated with the sane dev defaults.
 func Default() *Config {
 	return &Config{
@@ -139,7 +147,7 @@ func Default() *Config {
 		Quotas: Quotas{AutoRequest: true, VCPU: 256},
 		Addons: Addons{Observability: true},
 		AgentPlatform: AgentPlatform{
-			Enable:               true,
+			Enable:               boolPtr(true),
 			BedrockModelFamilies: []string{"anthropic", "amazon-nova"},
 			Compliance:           Compliance{SOC2: true},
 		},
@@ -170,7 +178,7 @@ func (c *Config) ApplyDefaults() {
 	if c.Quotas.VCPU == 0 {
 		c.Quotas = d.Quotas
 	}
-	if c.AgentPlatform.Enable && len(c.AgentPlatform.BedrockModelFamilies) == 0 {
+	if c.AgentPlatform.Enabled() && len(c.AgentPlatform.BedrockModelFamilies) == 0 {
 		c.AgentPlatform.BedrockModelFamilies = d.AgentPlatform.BedrockModelFamilies
 	}
 	if c.Org.Name != "" && c.Org.GitOps.EKSGitopsRepo == "" {
