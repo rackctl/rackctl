@@ -149,8 +149,17 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 		return err
 	}
 	// Clone the fork to the exact path (gh's --clone ignores the target dir).
-	return st.Runner.Run(ctx, "git", "clone",
-		fmt.Sprintf("https://github.com/%s/eks-gitops.git", org), st.Repos.EKSGitops)
+	if err := st.Runner.Run(ctx, "git", "clone",
+		fmt.Sprintf("https://github.com/%s/eks-gitops.git", org), st.Repos.EKSGitops); err != nil {
+		return err
+	}
+	// The portal chart is not published to ghcr; clone its repo so the portal
+	// phase can install from the local chart (mirrors the operator fallback).
+	if st.Config.ControlPlane.Portal {
+		note(st, "cloning nanohype/portal (day-2 UI) for its local chart")
+		return st.Runner.Run(ctx, "git", "clone", "https://github.com/nanohype/portal.git", st.Repos.Portal)
+	}
+	return nil
 }
 
 // --- Phase 2: identity & state backend ---
@@ -300,7 +309,19 @@ type portal struct{ base }
 func (portal) Run(ctx context.Context, st *engine.State) error {
 	note(st, "deploying portal (Go API + River worker + React); needs Postgres/Redis/S3")
 	note(st, "wiring GitOps deploy keys for %s and %s", st.Config.Org.GitOps.ClustersRepo, st.Config.Org.GitOps.TenantsRepo)
-	return st.Runner.Run(ctx, "helm", "upgrade", "--install", "portal", "oci://ghcr.io/nanohype/charts/portal")
+	// The portal OCI chart is not published yet; fall back to the local chart in
+	// the cloned repo when the pull fails (mirrors the operator).
+	if err := st.Runner.Run(ctx, "helm", "upgrade", "--install", "portal",
+		"oci://ghcr.io/nanohype/charts/portal"); err != nil {
+		note(st, "portal OCI chart unavailable — falling back to local ./deploy/helm/portal")
+		st.Runner.Dir = st.Repos.Portal
+		return st.Runner.Run(ctx, "helm", "upgrade", "--install", "portal", "deploy/helm/portal")
+	}
+	return nil
+}
+
+func (portal) Teardown(ctx context.Context, st *engine.State) error {
+	return st.Runner.Run(ctx, "helm", "uninstall", "portal", "--ignore-not-found")
 }
 
 // --- Phase 9 (optional): first-tenant smoke test ---

@@ -15,6 +15,7 @@ type Repos struct {
 	LandingZone   string // landing-zone (Terragrunt substrate)
 	EKSGitops     string // the org's fork of nanohype/eks-gitops (addon catalog)
 	AgentPlatform string // eks-agent-platform (operator + CRDs + charts)
+	Portal        string // portal (day-2 UI; cloned only when controlPlane.portal)
 }
 
 // State threads shared data through the phase pipeline.
