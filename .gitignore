@@ -1,0 +1,6 @@
+/rackctl
+/dist/
+*.exe
+*.test
+.env
+rackctl.yaml
