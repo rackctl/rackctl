@@ -53,16 +53,26 @@ func (b base) Enabled(st *engine.State) bool {
 	}
 	return b.enabled(st)
 }
+
+// Teardown is a no-op by default; phases that create billable cloud resources
+// override it (cluster, gitops, addons, platform) so the engine's rollback
+// actually destroys them.
 func (base) Teardown(context.Context, *engine.State) error { return nil }
 
 func note(st *engine.State, format string, a ...any) {
 	fmt.Fprintf(st.Runner.Out, "    "+format+"\n", a...)
 }
 
-// apply runs a landing-zone Terragrunt component for the current env.
+// apply / destroy run a landing-zone Terragrunt component for the current env.
 func apply(ctx context.Context, st *engine.State, component string) error {
+	return tg(ctx, st, "apply", component)
+}
+func destroy(ctx context.Context, st *engine.State, component string) error {
+	return tg(ctx, st, "destroy", component)
+}
+func tg(ctx context.Context, st *engine.State, verb, component string) error {
 	dir := "live/aws/workload-" + string(st.Config.Environment) + "/" + component
-	return st.Runner.Run(ctx, "terragrunt", "apply", "--terragrunt-non-interactive",
+	return st.Runner.Run(ctx, "terragrunt", verb, "--terragrunt-non-interactive",
 		"--terragrunt-working-dir", dir)
 }
 
@@ -94,12 +104,28 @@ func (preflight) Run(ctx context.Context, st *engine.State) error {
 	if err := exec.RequireTools("tofu", "terragrunt", "kubectl", "helm", "aws", "git", "gh"); err != nil {
 		return err
 	}
-	note(st, "verifying caller identity and EC2 vCPU quota L-1216C47A (target %d)", st.Config.Quotas.VCPU)
-	_ = st.Runner.Run(ctx, "aws", "sts", "get-caller-identity")
-	_ = st.Runner.Run(ctx, "aws", "service-quotas", "get-service-quota",
-		"--service-code", "ec2", "--quota-code", "L-1216C47A")
+	// Verify the caller is authenticated and points at the configured account —
+	// failing here beats a confusing failure three phases into provisioning.
+	account, err := st.Runner.Capture(ctx, "aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text")
+	if err != nil {
+		return fmt.Errorf("aws auth check failed (run `aws sso login`): %w", err)
+	}
+	if account != "" && account != st.Config.Cloud.AccountID {
+		return fmt.Errorf("caller account %s does not match cloud.accountId %s", account, st.Config.Cloud.AccountID)
+	}
+	// EC2 vCPU quota (L-1216C47A): fresh accounts cap ~32, which strands the
+	// cluster apply mid-provision. Read it, and file an increase if requested.
+	note(st, "checking EC2 vCPU quota L-1216C47A (target %d)", st.Config.Quotas.VCPU)
+	if err := st.Runner.Run(ctx, "aws", "service-quotas", "get-service-quota",
+		"--service-code", "ec2", "--quota-code", "L-1216C47A"); err != nil {
+		return err
+	}
 	if st.Config.Quotas.AutoRequest {
-		note(st, "FOOTGUN GUARD: fresh accounts cap ~32 vCPU — filing the increase before Phase 3")
+		note(st, "requesting vCPU quota increase to %d", st.Config.Quotas.VCPU)
+		// Ignore the error: a duplicate/pending request is expected and benign.
+		_ = st.Runner.Run(ctx, "aws", "service-quotas", "request-service-quota-increase",
+			"--service-code", "ec2", "--quota-code", "L-1216C47A",
+			"--desired-value", fmt.Sprintf("%d", st.Config.Quotas.VCPU))
 	}
 	return nil
 }
@@ -152,6 +178,16 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 	return st.Runner.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", string(st.Config.Environment)+"-eks")
 }
 
+func (cluster) Teardown(ctx context.Context, st *engine.State) error {
+	st.Runner.Dir = st.Repos.LandingZone
+	for _, comp := range []string{"cluster", "network"} { // reverse of apply
+		if err := destroy(ctx, st, comp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- Phase 4: secrets & ArgoCD bootstrap ---
 type bootstrap struct{ base }
 
@@ -160,6 +196,16 @@ func (bootstrap) Run(ctx context.Context, st *engine.State) error {
 	note(st, "installing ArgoCD + app-of-apps pointing at %s", st.Config.Org.GitOps.EKSGitopsRepo)
 	for _, comp := range []string{"secrets", "cluster-bootstrap"} {
 		if err := apply(ctx, st, comp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (bootstrap) Teardown(ctx context.Context, st *engine.State) error {
+	st.Runner.Dir = st.Repos.LandingZone
+	for _, comp := range []string{"cluster-bootstrap", "secrets"} { // reverse of apply
+		if err := destroy(ctx, st, comp); err != nil {
 			return err
 		}
 	}
@@ -207,23 +253,36 @@ func (addons) Run(ctx context.Context, st *engine.State) error {
 		"applications", "--all", "--timeout=30m")
 }
 
+func (addons) Teardown(ctx context.Context, st *engine.State) error {
+	st.Runner.Dir = st.Repos.LandingZone
+	return destroy(ctx, st, "cluster-addons")
+}
+
 // --- Phase 6: agent-platform substrate, CRDs & operator ---
 type platform struct{ base }
 
 func (platform) Run(ctx context.Context, st *engine.State) error {
 	if !st.Config.AgentPlatform.Enable {
-		note(st, "agentPlatform.enable=false — skipping agent substrate")
+		note(st, "agentPlatform.enable=false — skipping the agent operator")
 		return nil
 	}
 	st.Runner.Dir = st.Repos.AgentPlatform
-	note(st, "provisioning agent substrate: bedrock, agent-iam, model-artifacts, cost-pipeline, kill-switch, eval-runtime")
-	note(st, "installing CRDs: platform.nanohype.dev, agents.nanohype.dev, governance.nanohype.dev")
+	note(st, "installing the agent operator + CRDs (platform/agents/governance.nanohype.dev); the operator + GitOps reconcile the substrate")
 	if arn := st.Outputs["operator_role_arn"]; arn != "" {
 		note(st, "operator IRSA role: %s", arn)
 	}
-	note(st, "FOOTGUN GUARD: operator OCI chart may be empty on a fresh org — falling back to local ./charts/operator with the SSM role ARN")
-	return st.Runner.Run(ctx, "helm", "upgrade", "--install", "operator",
-		"oci://ghcr.io/nanohype/charts/operator")
+	// The operator OCI chart is empty until the first charts-v* tag; fall back to
+	// the local chart in the cloned repo when the pull fails.
+	if err := st.Runner.Run(ctx, "helm", "upgrade", "--install", "operator",
+		"oci://ghcr.io/nanohype/charts/operator"); err != nil {
+		note(st, "operator OCI chart unavailable — falling back to local ./charts/operator")
+		return st.Runner.Run(ctx, "helm", "upgrade", "--install", "operator", "charts/operator")
+	}
+	return nil
+}
+
+func (platform) Teardown(ctx context.Context, st *engine.State) error {
+	return st.Runner.Run(ctx, "helm", "uninstall", "operator", "--ignore-not-found")
 }
 
 // --- Phase 7 (optional): eks-fleet cluster control plane ---
@@ -249,9 +308,12 @@ type smoke struct{ base }
 
 func (smoke) Run(ctx context.Context, st *engine.State) error {
 	ft := st.Config.FirstTenant
-	note(st, "rendering tenant %q (persona=%s) → Tenant + Platform + BudgetPolicy + AgentFleet + EvalSuite", ft.Name, ft.Persona)
-	note(st, "FOOTGUN GUARD: enforcing the tenant app-seam order (extraPolicyArns:[] → Ready → set ARN → re-apply → register ApplicationSet)")
-	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "-"); err != nil {
+	st.Runner.Dir = st.Repos.AgentPlatform
+	note(st, "installing first tenant %q (persona=%s) from charts/tenant, then waiting for Ready", ft.Name, ft.Persona)
+	if err := st.Runner.Run(ctx, "helm", "upgrade", "--install", ft.Name, "charts/tenant",
+		"--set", "tenant="+ft.Tenant,
+		"--set", "persona="+ft.Persona,
+		"--set", fmt.Sprintf("budget.monthlyUsd=%d", ft.MonthlyBudgetUSD)); err != nil {
 		return err
 	}
 	return st.Runner.Run(ctx, "kubectl", "wait", "--for=condition=Ready",
