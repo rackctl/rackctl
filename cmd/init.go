@@ -33,7 +33,14 @@ var initCmd = &cobra.Command{
 
 		run := exec.New(os.Stdout)
 		run.DryRun = !initApply
-		run.Env = []string{"AWS_PROFILE=" + cfg.Cloud.Profile, "AWS_REGION=" + cfg.Cloud.Region}
+		// landing-zone's root.hcl resolves the account via TERRAGRUNT_ACCOUNT_ID
+		// (its account.hcl is a placeholder), and the tfstate bucket is
+		// {account}-{region}-tfstate — so terragrunt must see the real account.
+		run.Env = []string{
+			"AWS_PROFILE=" + cfg.Cloud.Profile,
+			"AWS_REGION=" + cfg.Cloud.Region,
+			"TERRAGRUNT_ACCOUNT_ID=" + cfg.Cloud.AccountID,
+		}
 
 		title := fmt.Sprintf("rackctl init — %s · %s · %s", cfg.Org.Name, cfg.Cloud.Region, cfg.Environment)
 		st := &engine.State{Config: cfg, Runner: run}
