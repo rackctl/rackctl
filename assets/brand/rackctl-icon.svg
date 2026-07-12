@@ -1,11 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="rackctl">
-  <rect width="1024" height="1024" rx="220" fill="#0c0f14" />
-  <g transform="translate(192,192) scale(2.5)">
-    <g fill="#9bb0d0">
-      <rect x="56" y="59" width="144" height="34" rx="10" />
-      <rect x="56" y="111" width="144" height="34" rx="10" />
-      <rect x="56" y="163" width="144" height="34" rx="10" />
-    </g>
-    <circle cx="178" cy="128" r="8" fill="#c2d0e6" />
+  <rect width="1024" height="1024" fill="#0c0f14" />
+  <g fill="#9bb0d0">
+    <rect x="96" y="172" width="832" height="184" rx="46" />
+    <rect x="96" y="420" width="832" height="184" rx="46" />
+    <rect x="96" y="668" width="832" height="184" rx="46" />
   </g>
+  <circle cx="812" cy="512" r="42" fill="#c2d0e6" />
 </svg>
