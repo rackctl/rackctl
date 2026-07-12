@@ -4,7 +4,7 @@
 
 `rackctl init` takes an operator from zero to a running, nanohype-shaped platform —
 cloud, cluster, GitOps, controllers, and (optionally) the portal — then hands off to
-the portal for day-2 operations. It is `kubefirst` for an agent-native platform.
+the portal for day-2 operations.
 
 rackctl is an **orchestrator, not a rewrite**: it drives the existing nanohype repos
 (`landing-zone` Terragrunt, `eks-gitops` ArgoCD catalog, `eks-agent-platform` operator)
