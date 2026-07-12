@@ -76,7 +76,11 @@ var destroyCmd = &cobra.Command{
 		ctx := context.Background()
 		run := exec.New(os.Stdout)
 		run.DryRun = !destroyApply
-		run.Env = []string{"AWS_PROFILE=" + cfg.Cloud.Profile, "AWS_REGION=" + cfg.Cloud.Region}
+		run.Env = []string{
+			"AWS_PROFILE=" + cfg.Cloud.Profile,
+			"AWS_REGION=" + cfg.Cloud.Region,
+			"TERRAGRUNT_ACCOUNT_ID=" + cfg.Cloud.AccountID,
+		}
 		run.Dir = engine.RepoPaths(cfg.Org.Name).LandingZone
 
 		fmt.Println(ui.Title(fmt.Sprintf("rackctl destroy — %s · %s · %s", cfg.Org.Name, cfg.Cloud.Region, cfg.Environment)))
