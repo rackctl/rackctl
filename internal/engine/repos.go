@@ -18,5 +18,6 @@ func RepoPaths(org string) Repos {
 		LandingZone:   filepath.Join(work, "landing-zone"),
 		AgentPlatform: filepath.Join(work, "eks-agent-platform"),
 		EKSGitops:     filepath.Join(work, "eks-gitops"),
+		Portal:        filepath.Join(work, "portal"),
 	}
 }
