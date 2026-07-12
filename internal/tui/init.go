@@ -9,17 +9,9 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/rackctl/rackctl/internal/engine"
-)
-
-var (
-	cGreen = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	cRed   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	cGray  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	cBlue  = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
-	cBold  = lipgloss.NewStyle().Bold(true)
+	"github.com/rackctl/rackctl/internal/ui"
 )
 
 type eventMsg engine.Event
@@ -126,35 +118,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	var b strings.Builder
-	b.WriteString(cBold.Render(m.title) + "\n\n")
+	b.WriteString(ui.Bold.Render(m.title) + "\n\n")
 	for _, r := range m.rows {
 		var icon string
 		switch {
 		case r.active:
-			icon = cBlue.Render(m.spinner.View())
+			icon = ui.Blue.Render(m.spinner.View())
 		case !r.seen:
-			icon = cGray.Render("•")
+			icon = ui.Gray.Render("•")
 		case r.status == engine.StatusOK:
-			icon = cGreen.Render("✓")
+			icon = ui.Green.Render("✓")
 		case r.status == engine.StatusFail:
-			icon = cRed.Render("✗")
+			icon = ui.Red.Render("✗")
 		default: // skip
-			icon = cGray.Render("•")
+			icon = ui.Gray.Render("•")
 		}
 		title := r.title
 		if !r.seen && !r.active {
-			title = cGray.Render(title)
+			title = ui.Gray.Render(title)
 		}
 		b.WriteString(fmt.Sprintf(" %s %s\n", icon, title))
 	}
 	b.WriteString("\n")
 	switch {
 	case m.finished && m.err != nil:
-		b.WriteString(cRed.Render("✗ "+m.err.Error()) + "\n")
+		b.WriteString(ui.Red.Render("✗ "+m.err.Error()) + "\n")
 	case m.finished:
-		b.WriteString(cGreen.Render("✓ platform is up — hand off to the portal") + "\n")
+		b.WriteString(ui.Green.Render("✓ platform is up — hand off to the portal") + "\n")
 	default:
-		b.WriteString(cGray.Render("  q to quit") + "\n")
+		b.WriteString(ui.Gray.Render("  q to quit") + "\n")
 	}
 	return b.String()
 }

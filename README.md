@@ -54,7 +54,7 @@ down in reverse so a half-failed init never leaves billable resources.
 - **Service-quota deadlock** — fresh accounts cap ~32 vCPU (phase 0).
 - **Operator OCI chicken-and-egg** — empty chart registry on a fresh org (phase 6).
 - **Tenant app-seam ordering** — the 5-step `extraPolicyArns` dance (phase 9).
-- **Teardown safety** — always clean up on failure (engine).
+- **Teardown safety** — a failed `--apply` destroys the completed phases in reverse (`terragrunt destroy` per component); no stranded VPC/EKS (engine + per-phase `Teardown`).
 
 ## Development
 
@@ -83,10 +83,11 @@ internal/
 
 - v1: **AWS only** (no `aks-gitops` catalog exists yet).
 - CRD group: **`*.nanohype.dev`** (canonical).
-- The CLI, config schema, phase engine, all commands, and the dry-run/TUI are wired;
-  `--apply` executes against your account. Live end-to-end provisioning is validated
-  by running it — the glue (repo acquisition, IRSA writeback, output parsing) is
-  unit-tested.
+- The CLI, config schema, phase engine, all commands, and the dry-run/TUI are wired.
+  `--apply` executes against your account; on failure, completed phases tear down in
+  reverse. Live end-to-end provisioning is validated by running it — the engine
+  ordering + reverse-teardown, IRSA writeback, output parsing, and config validation
+  are covered by tests.
 
 ## License
 
