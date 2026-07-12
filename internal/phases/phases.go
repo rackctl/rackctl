@@ -63,6 +63,14 @@ func note(st *engine.State, format string, a ...any) {
 	fmt.Fprintf(st.Runner.Out, "    "+format+"\n", a...)
 }
 
+// componentDir is the landing-zone Terragrunt path for a component. The live
+// layout is live/aws/<account>/<region>/<env>/<component>, where the account
+// dir is workload-<env> (e.g. live/aws/workload-dev/us-west-2/dev/network).
+func componentDir(st *engine.State, component string) string {
+	env := string(st.Config.Environment)
+	return fmt.Sprintf("live/aws/workload-%s/%s/%s/%s", env, st.Config.Cloud.Region, env, component)
+}
+
 // apply / destroy run a landing-zone Terragrunt component for the current env.
 func apply(ctx context.Context, st *engine.State, component string) error {
 	return tg(ctx, st, "apply", component)
@@ -71,7 +79,7 @@ func destroy(ctx context.Context, st *engine.State, component string) error {
 	return tg(ctx, st, "destroy", component)
 }
 func tg(ctx context.Context, st *engine.State, verb, component string) error {
-	dir := "live/aws/workload-" + string(st.Config.Environment) + "/" + component
+	dir := componentDir(st, component)
 	// terragrunt 1.0+ takes global flags (--working-dir, --non-interactive) before
 	// the command; -auto-approve is a tofu flag after it. The old post-command
 	// --terragrunt-working-dir is silently ignored by 1.0.x (runs in the cwd).
@@ -84,7 +92,7 @@ func captureOutputs(ctx context.Context, st *engine.State, component string) {
 	if st.Runner.DryRun {
 		return
 	}
-	dir := "live/aws/workload-" + string(st.Config.Environment) + "/" + component
+	dir := componentDir(st, component)
 	data, err := st.Runner.Capture(ctx, "terragrunt", "--working-dir", dir, "output", "-json")
 	if err != nil || data == "" {
 		return
