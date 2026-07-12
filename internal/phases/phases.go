@@ -271,7 +271,7 @@ func (addons) Teardown(ctx context.Context, st *engine.State) error {
 type platform struct{ base }
 
 func (platform) Run(ctx context.Context, st *engine.State) error {
-	if !st.Config.AgentPlatform.Enable {
+	if !st.Config.AgentPlatform.Enabled() {
 		note(st, "agentPlatform.enable=false — skipping the agent operator")
 		return nil
 	}
