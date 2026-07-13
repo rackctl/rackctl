@@ -385,8 +385,29 @@ func (addons) Run(ctx context.Context, st *engine.State) error {
 	}
 
 	note(st, "waiting for ArgoCD applications to converge (sync-waves 0→52)")
-	return st.Runner.Run(ctx, "kubectl", "-n", "argocd", "wait", "--for=condition=Healthy",
-		"applications", "--all", "--timeout=30m")
+	if err := st.Runner.Run(ctx, "kubectl", "-n", "argocd", "wait", "--for=condition=Healthy",
+		"applications", "--all", "--timeout=30m"); err != nil {
+		// The cloud is provisioned. ArgoCD is running and has generated the catalog.
+		// Something on the cluster has not settled — which is NOT a reason to destroy
+		// the cluster.
+		//
+		// `kubectl wait` fails with a bare "exit status 1" and names nothing, so say
+		// what is actually unhealthy. Some apps legitimately converge slowly: opencost
+		// crashloops until metrics reach AMP, which cannot happen until alloy has been
+		// scraping for a few minutes. A 30-minute wait that expires with 42 of 44
+		// Applications Healthy is not a failed install — and rolling the cluster back
+		// destroys the only surface the remaining two can be diagnosed on.
+		unhealthy, _ := st.Runner.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications",
+			"-o", `jsonpath={range .items[?(@.status.health.status!='Healthy')]}{.metadata.name}{" ("}{.status.health.status}{"/"}{.status.sync.status}{") "}{end}`)
+		if s := strings.TrimSpace(unhealthy); s != "" {
+			note(st, "not converged: %s", s)
+		}
+		return &engine.NoRollbackError{Err: fmt.Errorf(
+			"ArgoCD applications did not all reach Healthy within 30m. The cloud IS provisioned and " +
+				"the cluster is left standing — run `rackctl doctor` to see what has not settled, and " +
+				"`rackctl destroy` if you want it gone")}
+	}
+	return nil
 }
 
 func (addons) Teardown(ctx context.Context, st *engine.State) error {

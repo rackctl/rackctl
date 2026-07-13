@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -59,7 +60,11 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 		if err := p.Run(ctx, st); err != nil {
 			ev.Status, ev.Err = StatusFail, err
 			e.report(ev, ui.Fail(label+"  — "+err.Error()))
-			if e.CleanOnFail {
+			// A phase can declare that its failure must not tear the platform down —
+			// see NoRollbackError. A workload that has not converged is not a reason to
+			// destroy the cloud it is running on.
+			var noRollback *NoRollbackError
+			if e.CleanOnFail && !errors.As(err, &noRollback) {
 				// The phase that FAILED is torn down too. It failed partway, which
 				// means it may have created resources before it died — a terragrunt
 				// apply that errors on one resource has usually already created
