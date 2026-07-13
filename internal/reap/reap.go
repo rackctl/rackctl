@@ -97,3 +97,56 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 		fmt.Fprintln(out, ui.OK(s))
 	}
 }
+
+// OrphanedVolumes deletes EBS volumes the cluster left behind, AFTER it is gone.
+//
+// Graceful PVC deletion is the right first move and an unreliable last one. A PVC
+// carries a kubernetes.io/pvc-protection finalizer that blocks its deletion while any
+// pod still mounts it, so `kubectl delete pvc --all --wait` hangs on exactly the
+// workloads a teardown has not stopped yet — tempo, loki, the kagent database. It
+// times out, the volumes are never released, and they outlive the cluster:
+//
+//	✗ PVCs did not delete cleanly — the EBS CSI driver may not have released their
+//	  volumes.
+//
+// Unwinding that gracefully means stopping ArgoCD, pruning every workload, and only
+// then deleting PVCs — a long sequence with several ways to stall, run against a
+// cluster that is being demolished anyway.
+//
+// So this is the backstop, and it is deterministic. Every dynamically provisioned
+// volume is tagged kubernetes.io/cluster/<name>=owned by the EBS CSI driver. Once the
+// cluster is destroyed, no volume of its can still be attached — anything left with
+// that tag in `available` state is an orphan, by definition. Delete it.
+//
+// Runs after the cluster is destroyed, never before: an in-use volume is skipped by
+// the status filter, so this cannot detach a volume from anything living.
+func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
+	if run.DryRun {
+		fmt.Fprintln(out, ui.Step("sweep EBS volumes orphaned by "+cluster))
+		return
+	}
+
+	ids, err := run.Capture(ctx, "aws", "ec2", "describe-volumes",
+		"--region", region,
+		"--filters",
+		"Name=status,Values=available",
+		"Name=tag-key,Values=kubernetes.io/cluster/"+cluster,
+		"--query", "Volumes[].VolumeId", "--output", "text")
+	if err != nil {
+		return // no credentials, no region, nothing to do — not a teardown failure
+	}
+	ids = strings.TrimSpace(ids)
+	if ids == "" || ids == "None" {
+		return
+	}
+
+	vols := strings.Fields(ids)
+	fmt.Fprintln(out, ui.Step(fmt.Sprintf("sweeping %d EBS volume(s) orphaned by %s", len(vols), cluster)))
+	for _, v := range vols {
+		if err := run.Run(ctx, "aws", "ec2", "delete-volume", "--region", region, "--volume-id", v); err != nil {
+			fmt.Fprintln(out, ui.Fail("could not delete "+v+" — it will keep billing: "+err.Error()))
+			continue
+		}
+		fmt.Fprintln(out, ui.OK("deleted "+v))
+	}
+}

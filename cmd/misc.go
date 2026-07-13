@@ -142,6 +142,8 @@ var destroyCmd = &cobra.Command{
 				return err
 			}
 		}
+		// The cluster is gone; anything still tagged for it is an orphan by definition.
+		reap.OrphanedVolumes(ctx, run, os.Stdout, env+"-eks", cfg.Cloud.Region)
 		fmt.Println(ui.OK("platform destroyed"))
 		return nil
 	},
