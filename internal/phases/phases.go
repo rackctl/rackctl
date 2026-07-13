@@ -336,29 +336,66 @@ func (addons) Teardown(ctx context.Context, st *engine.State) error {
 // --- Phase 6: agent-platform substrate, CRDs & operator ---
 type platform struct{ base }
 
+// agentPlatformCRDs are CRDs from each of the operator's three API groups. If these
+// are established, the operator's chart has been applied.
+var agentPlatformCRDs = []string{
+	"platforms.platform.nanohype.dev",
+	"agentfleets.agents.nanohype.dev",
+	"budgetpolicies.governance.nanohype.dev",
+}
+
+// Run WAITS for the agent operator; it does not install it.
+//
+// The GitOps catalog owns the operator. The addons-agent-operator ApplicationSet
+// deploys charts/operator from the eks-agent-platform repo (a multi-source
+// Application: the chart from the product repo, its values from this org's catalog
+// fork), gated on the eks-agent-platform/enabled label that cluster-bootstrap stamps
+// on the ArgoCD cluster Secret. The chart carries its own crds/, so the CRDs come
+// with it.
+//
+// This phase used to `helm upgrade --install operator` on top of that — a SECOND,
+// competing Helm release of the same chart, racing ArgoCD for ownership of the same
+// Deployment, ClusterRoles and CRDs. It pulled oci://ghcr.io/nanohype/charts/operator,
+// which does not exist (the release workflow's chart-push-to-OCI step is skipped, and
+// that path 403s), then silently fell back to a local clone — so the cluster ran an
+// operator installed from a working copy on the machine that happened to run rackctl,
+// while ArgoCD believed it owned one from git.
+//
+// GitOps owns what runs on the cluster; rackctl orchestrates the substrate underneath
+// it and then verifies. So: wait for the CRDs to be established and the operator to be
+// Available, and fail loudly if the catalog did not deliver them — which is a real
+// failure (a missing enable label, an appset that never generated) and must not be
+// papered over by installing it a second way.
 func (platform) Run(ctx context.Context, st *engine.State) error {
 	if !st.Config.AgentPlatform.Enabled() {
 		note(st, "agentPlatform.enable=false — skipping the agent operator")
 		return nil
 	}
-	st.Runner.Dir = st.Repos.AgentPlatform
-	note(st, "installing the agent operator + CRDs (platform/agents/governance.nanohype.dev); the operator + GitOps reconcile the substrate")
+	note(st, "agent operator + CRDs are owned by the GitOps catalog (addons-agent-operator); waiting for convergence")
 	if arn := st.Outputs["operator_role_arn"]; arn != "" {
-		note(st, "operator IRSA role: %s", arn)
+		note(st, "operator role: %s", arn)
 	}
-	// The operator OCI chart is empty until the first charts-v* tag; fall back to
-	// the local chart in the cloned repo when the pull fails.
-	if err := st.Runner.Run(ctx, "helm", "upgrade", "--install", "operator",
-		"oci://ghcr.io/nanohype/charts/operator"); err != nil {
-		note(st, "operator OCI chart unavailable — falling back to local ./charts/operator")
-		return st.Runner.Run(ctx, "helm", "upgrade", "--install", "operator", "charts/operator")
+
+	for _, crd := range agentPlatformCRDs {
+		if err := st.Runner.Run(ctx, "kubectl", "wait", "--for=condition=Established",
+			"crd/"+crd, "--timeout=10m"); err != nil {
+			return fmt.Errorf("agent-platform CRD %s never established — the catalog did not deliver the operator chart "+
+				"(check the eks-agent-platform/enabled label on the ArgoCD cluster Secret, and the "+
+				"addons-agent-operator ApplicationSet): %w", crd, err)
+		}
+	}
+
+	if err := st.Runner.Run(ctx, "kubectl", "-n", "eks-agent-platform", "wait",
+		"--for=condition=Available", "deploy/eks-agent-platform-operator", "--timeout=10m"); err != nil {
+		return fmt.Errorf("agent operator never became Available: %w", err)
 	}
 	return nil
 }
 
-func (platform) Teardown(ctx context.Context, st *engine.State) error {
-	return st.Runner.Run(ctx, "helm", "uninstall", "operator", "--ignore-not-found")
-}
+// Teardown is a no-op: the operator is an ArgoCD Application, so it is removed when
+// the cluster is. Uninstalling a Helm release rackctl no longer creates would fail,
+// and deleting it out from under ArgoCD would just make ArgoCD put it back.
+func (platform) Teardown(context.Context, *engine.State) error { return nil }
 
 // --- Phase 7 (optional): eks-fleet cluster control plane ---
 type fleet struct{ base }

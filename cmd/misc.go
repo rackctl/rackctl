@@ -164,17 +164,23 @@ var upgradeCmd = &cobra.Command{
 		repos := engine.RepoPaths(cfg.Org.Name)
 
 		fmt.Println(ui.Title("rackctl upgrade — " + cfg.Org.Name))
+
+		// An upgrade is a git operation, not a helm one. The catalog is the source of
+		// truth for everything running on the cluster — including the agent operator,
+		// which the addons-agent-operator ApplicationSet installs from the
+		// eks-agent-platform repo. Pull the catalog, push it, and ArgoCD reconciles.
+		//
+		// This used to also `helm upgrade --install operator
+		// oci://ghcr.io/nanohype/charts/operator`, which (a) 403s — that chart is not
+		// published to OCI — and (b) would install a SECOND, competing Helm release of
+		// an operator ArgoCD already owns. Bumping the operator means bumping the chart
+		// ref the catalog points at, not reaching around the catalog to install it.
 		run.Dir = repos.EKSGitops
-		fmt.Println(ui.Step("pulling latest eks-gitops addon catalog"))
+		fmt.Println(ui.Step("pulling the latest addon catalog"))
 		if err := run.Run(ctx, "git", "pull", "--ff-only"); err != nil {
 			return err
 		}
-		run.Dir = repos.AgentPlatform
-		fmt.Println(ui.Step("bumping the operator chart"))
-		if err := run.Run(ctx, "helm", "upgrade", "--install", "operator", "oci://ghcr.io/nanohype/charts/operator"); err != nil {
-			return err
-		}
-		fmt.Println(ui.OK("upgrade applied — ArgoCD will reconcile the catalog"))
+		fmt.Println(ui.OK("catalog updated — ArgoCD will reconcile it, operator included"))
 		return nil
 	},
 }
