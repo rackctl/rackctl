@@ -8,15 +8,48 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/gitops"
 	"github.com/rackctl/rackctl/internal/tf"
 )
 
-// CoreComponents is the landing-zone apply order for the core path; destroy
+// CoreComponents returns the landing-zone apply order for the core path; destroy
 // runs it in reverse.
-var CoreComponents = []string{"network", "cluster", "secrets", "cluster-bootstrap", "cluster-addons"}
+//
+// The list is derived from the config rather than fixed, because three components
+// are conditional and the old fixed list omitted all three — so a config that asked
+// for them applied nothing, and the cluster came up subtly broken:
+//
+//   - agent-iam creates the eks-agent-platform operator's IAM role. Without it the
+//     operator crashloops on AssumeRoleWithWebIdentity 403 — it is not optional
+//     whenever the agent platform is installed, which is the default.
+//
+//   - managed-monitoring provisions AMP + AMG and writes the endpoints to SSM.
+//     cluster-bootstrap READS those SSM params (grafana_url, amp_endpoint,
+//     amp_workspace_id) to stamp them onto the ArgoCD cluster Secret, so it must be
+//     applied BEFORE cluster-bootstrap or the read fails. It is gated on
+//     addons.observability because AMP and AMG both cost money — it is never
+//     applied unless asked for.
+//
+//   - dns creates the hosted zone + external-dns identity; gated on a dns block.
+//
+// Ordering is load-bearing and is NOT enforced by terragrunt (these roots declare
+// no dependency blocks) — this slice is the only thing that sequences them.
+func CoreComponents(cfg *config.Config) []string {
+	comps := []string{"network", "cluster", "secrets"}
+	if cfg.AgentPlatform.Enabled() {
+		comps = append(comps, "agent-iam")
+	}
+	if cfg.Addons.Observability {
+		comps = append(comps, "managed-monitoring") // must precede cluster-bootstrap
+	}
+	if cfg.DNS != nil && cfg.DNS.HostedZone != "" {
+		comps = append(comps, "dns")
+	}
+	return append(comps, "cluster-bootstrap", "cluster-addons")
+}
 
 // All returns the ordered bootstrap pipeline. Phases 0–6 are the core
 // 0→running path (AWS-only, v1); 7–9 are opt-in layers.
@@ -210,10 +243,32 @@ func (cluster) Teardown(ctx context.Context, st *engine.State) error {
 // --- Phase 4: secrets & ArgoCD bootstrap ---
 type bootstrap struct{ base }
 
+// bootstrapComponents is the slice of CoreComponents this phase owns: everything
+// from secrets through cluster-bootstrap. It is derived from CoreComponents rather
+// than restated, so the conditional components (agent-iam, managed-monitoring, dns)
+// can only ever be applied in the one order CoreComponents documents. Restating the
+// list here is what let those three go missing in the first place: CoreComponents
+// was only ever read by destroy, while apply walked a hardcoded {"secrets",
+// "cluster-bootstrap"} — so the two paths silently disagreed.
+func bootstrapComponents(cfg *config.Config) []string {
+	all := CoreComponents(cfg)
+	out := make([]string, 0, len(all))
+	for _, c := range all {
+		switch c {
+		case "network", "cluster": // applied by the cluster phase
+			continue
+		case "cluster-addons": // applied by the addons phase
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 func (bootstrap) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
-	note(st, "installing ArgoCD + app-of-apps pointing at %s", st.Config.Org.GitOps.EKSGitopsRepo)
-	for _, comp := range []string{"secrets", "cluster-bootstrap"} {
+	note(st, "installing ArgoCD + app-of-apps pointing at %s", st.Config.Org.GitOps.GitURL())
+	for _, comp := range bootstrapComponents(st.Config) {
 		if err := apply(ctx, st, comp); err != nil {
 			return err
 		}
@@ -223,8 +278,9 @@ func (bootstrap) Run(ctx context.Context, st *engine.State) error {
 
 func (bootstrap) Teardown(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
-	for _, comp := range []string{"cluster-bootstrap", "secrets"} { // reverse of apply
-		if err := destroy(ctx, st, comp); err != nil {
+	comps := bootstrapComponents(st.Config)
+	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply
+		if err := destroy(ctx, st, comps[i]); err != nil {
 			return err
 		}
 	}
