@@ -126,3 +126,54 @@ func TestEngineNoTeardownWhenDisabled(t *testing.T) {
 		t.Fatalf("log = %v, want %v (no teardown expected)", log, want)
 	}
 }
+
+// A phase can fail WITHOUT the platform being torn down. The distinction is
+// provisioning vs convergence: rackctl provisions the cloud; the cluster converges the
+// workloads on it. If the cloud came up correctly and a workload has not settled, the
+// cloud is not what is broken — and destroying it removes the only surface on which the
+// problem can be diagnosed.
+//
+// This is not hypothetical. A fresh install provisioned cleanly, ArgoCD generated all
+// 44 Applications, 42 went Healthy, and opencost was still crashlooping (it fails until
+// metrics reach AMP, which takes minutes). The convergence wait expired and the engine
+// destroyed a working EKS cluster — losing the evidence and forty minutes of
+// provisioning, because one workload needed five more.
+type norbPhase struct {
+	id  string
+	log *[]string
+}
+
+func (p norbPhase) ID() string          { return p.id }
+func (p norbPhase) Title() string       { return p.id }
+func (p norbPhase) Optional() bool      { return false }
+func (p norbPhase) Enabled(*State) bool { return true }
+func (p norbPhase) Run(context.Context, *State) error {
+	*p.log = append(*p.log, "run:"+p.id)
+	return &NoRollbackError{Err: errors.New("workloads did not converge")}
+}
+func (p norbPhase) Teardown(context.Context, *State) error {
+	*p.log = append(*p.log, "teardown:"+p.id)
+	return nil
+}
+
+func TestEngineDoesNotRollBackOnNoRollbackError(t *testing.T) {
+	var log []string
+	e := &Engine{
+		Phases: []Phase{
+			recPhase{id: "a", enabled: true, log: &log},
+			norbPhase{id: "b", log: &log},
+			recPhase{id: "c", enabled: true, log: &log}, // must never run
+		},
+		Out:         io.Discard,
+		CleanOnFail: true, // rollback is ON — and must still not fire
+	}
+	err := e.Run(context.Background(), &State{})
+	if err == nil {
+		t.Fatal("expected the phase failure to surface — a convergence timeout is still a failure")
+	}
+	// a ran, b failed with NoRollbackError, c never ran — and NOTHING was torn down.
+	want := []string{"run:a", "run:b"}
+	if !equal(log, want) {
+		t.Fatalf("log = %v, want %v — the platform must be left standing", log, want)
+	}
+}
