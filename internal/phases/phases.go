@@ -204,18 +204,40 @@ func currentVCPUQuota(ctx context.Context, st *engine.State) (float64, error) {
 // --- Phase 1: acquire repos ---
 type acquire struct{ base }
 
-// cloneIfMissing clones url into dir, unless dir is already a git checkout.
+// cloneOrUpdate clones url into dir, or brings an existing checkout up to date.
 //
-// `git clone` fails outright if the target exists, so without this a rerun of init
-// dies before it does anything. Reruns are the NORMAL case, not the exception: the
-// engine's rollback destroys cloud resources but deliberately does not delete the
-// operator's repos or working copies, so the second invocation always finds them.
-func cloneIfMissing(ctx context.Context, st *engine.State, url, dir string) error {
-	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-		note(st, "%s already cloned — reusing", filepath.Base(dir))
+// Two things this must get right, and the naive version gets neither.
+//
+// `git clone` fails outright if the target exists, so a rerun of init used to die
+// before doing anything. Reruns are the NORMAL case: the engine's rollback destroys
+// cloud resources but deliberately does not delete the operator's repos or working
+// copies, so the second invocation always finds them.
+//
+// But merely REUSING what is there is worse than failing. These checkouts are the
+// infrastructure code — landing-zone is what terragrunt applies. A stale clone means a
+// rerun silently provisions with the code from the last run, so a fix you just merged
+// is not in the cluster you just built, and the run that was supposed to prove it
+// disproves it instead. "Present" is not "current".
+//
+// So: pull. --ff-only, because rackctl owns this directory but the operator may have
+// touched it, and a divergence must be reported rather than merged over. It is not
+// fatal — a dirty working copy is the operator's business, and the note says which
+// checkout it is — but they are told.
+func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir string) error {
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		return st.Runner.Run(ctx, "git", "clone", url, dir)
+	}
+	prev := st.Runner.Dir
+	st.Runner.Dir = dir
+	defer func() { st.Runner.Dir = prev }()
+
+	if err := st.Runner.Run(ctx, "git", "pull", "--ff-only"); err != nil {
+		note(st, "%s: could not fast-forward — it has diverged from upstream, and this run "+
+			"will use the code as it stands on disk", filepath.Base(dir))
 		return nil
 	}
-	return st.Runner.Run(ctx, "git", "clone", url, dir)
+	note(st, "%s updated to latest", filepath.Base(dir))
+	return nil
 }
 
 // forkIfMissing forks the upstream catalog into org, unless the fork already exists.
@@ -244,17 +266,17 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 	org := st.Config.Org.Name
 	st.Repos = engine.RepoPaths(org)
 	note(st, "cloning platform repos into %s", st.Repos.Workdir)
-	if err := cloneIfMissing(ctx, st, "https://github.com/nanohype/landing-zone.git", st.Repos.LandingZone); err != nil {
+	if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/landing-zone.git", st.Repos.LandingZone); err != nil {
 		return err
 	}
-	if err := cloneIfMissing(ctx, st, "https://github.com/nanohype/eks-agent-platform.git", st.Repos.AgentPlatform); err != nil {
+	if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/eks-agent-platform.git", st.Repos.AgentPlatform); err != nil {
 		return err
 	}
 	if err := forkIfMissing(ctx, st, org); err != nil {
 		return err
 	}
 	// Clone the fork to the exact path (gh's --clone ignores the target dir).
-	if err := cloneIfMissing(ctx, st,
+	if err := cloneOrUpdate(ctx, st,
 		fmt.Sprintf("https://github.com/%s/eks-gitops.git", org), st.Repos.EKSGitops); err != nil {
 		return err
 	}
@@ -262,7 +284,7 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 	// phase can install from the local chart (mirrors the operator fallback).
 	if st.Config.ControlPlane.Portal {
 		note(st, "cloning nanohype/portal (day-2 UI) for its local chart")
-		return cloneIfMissing(ctx, st, "https://github.com/nanohype/portal.git", st.Repos.Portal)
+		return cloneOrUpdate(ctx, st, "https://github.com/nanohype/portal.git", st.Repos.Portal)
 	}
 	return nil
 }
