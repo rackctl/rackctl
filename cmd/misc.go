@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/rackctl/rackctl/internal/config"
+	"github.com/rackctl/rackctl/internal/doctor"
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/phases"
@@ -25,13 +26,25 @@ var versionCmd = &cobra.Command{
 
 // ---- doctor ----
 
+var doctorConfig string
+
 var doctorCmd = &cobra.Command{
 	Use:   "doctor",
-	Short: "Check prerequisites and platform health",
+	Short: "Check prerequisites and assert platform health",
+	Long: `Check prerequisites, then assert the invariants of a provisioned platform.
+
+Exits non-zero if the platform is unhealthy, so it can gate a deploy.
+
+Each platform check corresponds to a failure that has actually shipped a broken
+cluster while every surface reported success: an app-of-apps syncing from the wrong
+GitHub org, ApplicationSets erroring so silently they generated nothing to notice,
+a metrics collector failing every write, dashboards that never rendered, and a
+node pool tuned to evict half the fleet at once.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 		run := exec.New(os.Stdout)
 
+		// ── prerequisites ──
 		if err := exec.RequireTools("tofu", "terragrunt", "kubectl", "helm", "aws", "git", "gh"); err != nil {
 			fmt.Println(ui.Fail(err.Error()))
 			return err
@@ -44,15 +57,42 @@ var doctorCmd = &cobra.Command{
 			fmt.Println(ui.Warn("aws identity unavailable — run `aws sso login`"))
 		}
 
-		if out, err := run.Capture(ctx, "kubectl", "get", "nodes", "--no-headers"); err == nil && out != "" {
-			fmt.Println(ui.OK("cluster reachable"))
-			if apps, err := run.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications", "--no-headers"); err == nil && apps != "" {
-				fmt.Println(ui.OK("argocd applications present"))
-			} else {
-				fmt.Println(ui.Warn("no argocd applications found"))
-			}
-		} else {
+		if out, err := run.Capture(ctx, "kubectl", "get", "nodes", "--no-headers"); err != nil || out == "" {
 			fmt.Println(ui.Warn("no cluster in kubeconfig — run `rackctl init` first"))
+			return nil // nothing provisioned yet is not a failure
+		}
+		fmt.Println(ui.OK("cluster reachable"))
+
+		// ── platform invariants ──
+		// These need the config: several assertions are only meaningful against what
+		// the operator ASKED for (which catalog is theirs, whether monitoring is on).
+		cfg, err := config.Load(doctorConfig)
+		if err != nil {
+			fmt.Println(ui.Warn("no config — skipping platform checks (pass --config)"))
+			return nil
+		}
+
+		fmt.Println()
+		results := doctor.Run(ctx, &doctor.Env{Cfg: cfg, Run: run})
+		for _, r := range results {
+			line := fmt.Sprintf("%-22s %s", r.Name, r.Detail)
+			switch r.Status {
+			case doctor.OK:
+				fmt.Println(ui.OK(line))
+			case doctor.Warn:
+				fmt.Println(ui.Warn(line))
+			case doctor.Fail:
+				fmt.Println(ui.Fail(line))
+			case doctor.Skip:
+				fmt.Println(ui.Step(line))
+			}
+		}
+
+		if doctor.Failed(results) {
+			fmt.Println()
+			// Return an error so the process exits non-zero. The old doctor always
+			// returned nil, which meant nothing could ever gate on its verdict.
+			return fmt.Errorf("platform is unhealthy — see the failures above")
 		}
 		return nil
 	},
@@ -134,6 +174,7 @@ var upgradeCmd = &cobra.Command{
 }
 
 func init() {
+	doctorCmd.Flags().StringVarP(&doctorConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	destroyCmd.Flags().StringVarP(&destroyConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	destroyCmd.Flags().BoolVar(&destroyApply, "apply", false, "actually destroy (default is a dry-run plan)")
 	upgradeCmd.Flags().StringVarP(&upgradeConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
