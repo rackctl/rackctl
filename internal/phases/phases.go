@@ -16,6 +16,7 @@ import (
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/gitops"
+	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/tf"
 )
 
@@ -298,6 +299,10 @@ func (cluster) Teardown(ctx context.Context, st *engine.State) error {
 			return err
 		}
 	}
+	// The cluster is gone, so nothing of its can still be attached. Anything still
+	// tagged for it is an orphan by definition — sweep it, or it bills forever.
+	reap.OrphanedVolumes(ctx, st.Runner, os.Stdout,
+		string(st.Config.Environment)+"-eks", st.Config.Cloud.Region)
 	return nil
 }
 
