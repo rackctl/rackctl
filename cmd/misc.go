@@ -124,6 +124,12 @@ var destroyCmd = &cobra.Command{
 			fmt.Println(ui.Warn("dry-run — no cloud changes (pass --apply to destroy)"))
 		}
 
+		// Let the operator delete the AWS resources it — not Terraform — created,
+		// while it is still running to do so. Destroying the cluster first orphans
+		// them and makes agent-iam fail on DeleteConflict, halting the teardown with
+		// the cluster already gone. See reap.go.
+		reapOperatorOwnedResources(ctx, run)
+
 		env := string(cfg.Environment)
 		comps := phases.CoreComponents(cfg)
 		for i := len(comps) - 1; i >= 0; i-- {
