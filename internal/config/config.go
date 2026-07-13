@@ -47,11 +47,38 @@ type Org struct {
 
 type OrgGitOps struct {
 	// EKSGitopsRepo is the operator's fork of nanohype/eks-gitops (the ArgoCD addon catalog).
+	// Stored bare ("github.com/<org>/eks-gitops"); use GitURL for the clone/ArgoCD form.
 	EKSGitopsRepo string `json:"eksGitopsRepo"`
 	// ClustersRepo backs eks-fleet Cluster CRs (only with controlPlane.eksFleet).
 	ClustersRepo string `json:"clustersRepo,omitempty"`
 	// TenantsRepo backs rendered tenant charts (only with controlPlane.portal).
 	TenantsRepo string `json:"tenantsRepo,omitempty"`
+}
+
+// GitURL renders EKSGitopsRepo as the clonable https URL ArgoCD wants
+// ("github.com/acme/eks-gitops" -> "https://github.com/acme/eks-gitops.git").
+//
+// This is the value cluster-bootstrap hands to the app-of-apps Application and
+// publishes on the ArgoCD cluster Secret, from which every ApplicationSet in the
+// catalog templates its own source. It must therefore point at the ORG'S FORK, not
+// at the upstream catalog: landing-zone's gitops_repo_url used to default to
+// nanohype/eks-gitops, and because nothing passed a value, every install silently
+// synced from upstream main while the org's fork sat unread.
+//
+// Returns "" for an empty repo so callers can detect the unset case rather than
+// emit a URL like "https://.git".
+func (g OrgGitOps) GitURL() string {
+	if g.EKSGitopsRepo == "" {
+		return ""
+	}
+	u := g.EKSGitopsRepo
+	if !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "git@") {
+		u = "https://" + u
+	}
+	if !strings.HasSuffix(u, ".git") {
+		u += ".git"
+	}
+	return u
 }
 
 type Cloud struct {
