@@ -54,6 +54,8 @@ func reapOperatorOwnedResources(ctx context.Context, run *exec.Runner) {
 		for _, kind := range operatorOwnedKinds {
 			fmt.Printf("    → (dry-run) kubectl delete %s --all -A --wait --timeout=5m\n", kind)
 		}
+		fmt.Println(ui.Step("reap PersistentVolumeClaims (EBS CSI releases the volumes)"))
+		fmt.Printf("    → (dry-run) kubectl delete pvc --all -A --wait --timeout=5m\n")
 		return
 	}
 
@@ -92,5 +94,40 @@ func reapOperatorOwnedResources(ctx context.Context, run *exec.Runner) {
 		if s := strings.TrimSpace(out); s != "" {
 			fmt.Println(ui.OK(s))
 		}
+	}
+
+	reapPersistentVolumeClaims(ctx, run)
+}
+
+// reapPersistentVolumeClaims deletes every PVC so the EBS CSI driver releases the
+// volumes it dynamically provisioned, while the driver is still running to do it.
+//
+// Same trap as the operator's IAM roles, different controller. A dynamically
+// provisioned PV has a Delete reclaim policy, and the EBS volume behind it is deleted
+// by the CSI driver when the PVC goes away. Destroy the cluster with PVCs still bound
+// and the driver dies first: the volumes are never released, and they survive the
+// cluster as orphans that nothing in Terraform knows about.
+//
+// Observed after a real teardown: three unattached gp3 volumes (a 1GB and two 10GB,
+// from tempo and the kagent database) left behind by a destroy that otherwise reported
+// success. Small money — about $1.70/month — but it accrues on EVERY create/destroy
+// cycle, and nothing in the account ties it back to the cluster that made it.
+//
+// Best-effort: PVCs that fail to delete are reported, not fatal. The volumes are then
+// visible with `aws ec2 describe-volumes --filters Name=status,Values=available`.
+func reapPersistentVolumeClaims(ctx context.Context, run *exec.Runner) {
+	fmt.Println(ui.Step("reap PersistentVolumeClaims (EBS CSI releases the volumes)"))
+
+	out, err := run.Capture(ctx, "kubectl", "delete", "pvc",
+		"--all", "--all-namespaces", "--wait", "--timeout=5m", "--ignore-not-found")
+	if err != nil {
+		fmt.Println(ui.Fail(
+			"PVCs did not delete cleanly — the EBS CSI driver may not have released their " +
+				"volumes. After the teardown, check for orphans with: aws ec2 describe-volumes " +
+				"--filters Name=status,Values=available"))
+		return
+	}
+	if s := strings.TrimSpace(out); s != "" {
+		fmt.Println(ui.OK(s))
 	}
 }
