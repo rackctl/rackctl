@@ -7,6 +7,10 @@ package phases
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/engine"
@@ -164,6 +168,18 @@ func (preflight) Run(ctx context.Context, st *engine.State) error {
 		return err
 	}
 	if st.Config.Quotas.AutoRequest {
+		// Only file an increase if we are actually below the target. Service Quotas
+		// rejects a request for a value at or below the current one:
+		//
+		//   IllegalArgumentException: You must provide a quota value greater than the
+		//   current quota value
+		//
+		// which is not a failure — it means the quota is already sufficient. Asking
+		// anyway logged an ERROR on every run of an account that was already fine.
+		if cur, err := currentVCPUQuota(ctx, st); err == nil && cur >= float64(st.Config.Quotas.VCPU) {
+			note(st, "vCPU quota already %.0f (>= %d) — no increase needed", cur, st.Config.Quotas.VCPU)
+			return nil
+		}
 		note(st, "requesting vCPU quota increase to %d", st.Config.Quotas.VCPU)
 		// Ignore the error: a duplicate/pending request is expected and benign.
 		_ = st.Runner.Run(ctx, "aws", "service-quotas", "request-service-quota-increase",
@@ -173,26 +189,71 @@ func (preflight) Run(ctx context.Context, st *engine.State) error {
 	return nil
 }
 
+// currentVCPUQuota reads the account's applied EC2 vCPU quota (L-1216C47A).
+func currentVCPUQuota(ctx context.Context, st *engine.State) (float64, error) {
+	out, err := st.Runner.Capture(ctx, "aws", "service-quotas", "get-service-quota",
+		"--service-code", "ec2", "--quota-code", "L-1216C47A",
+		"--query", "Quota.Value", "--output", "text")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseFloat(strings.TrimSpace(out), 64)
+}
+
 // --- Phase 1: acquire repos ---
 type acquire struct{ base }
+
+// cloneIfMissing clones url into dir, unless dir is already a git checkout.
+//
+// `git clone` fails outright if the target exists, so without this a rerun of init
+// dies before it does anything. Reruns are the NORMAL case, not the exception: the
+// engine's rollback destroys cloud resources but deliberately does not delete the
+// operator's repos or working copies, so the second invocation always finds them.
+func cloneIfMissing(ctx context.Context, st *engine.State, url, dir string) error {
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		note(st, "%s already cloned — reusing", filepath.Base(dir))
+		return nil
+	}
+	return st.Runner.Run(ctx, "git", "clone", url, dir)
+}
+
+// forkIfMissing forks the upstream catalog into org, unless the fork already exists.
+//
+// `gh repo fork` returns HTTP 403 "Name already exists on this account" when the fork
+// is there, which is not an error — it is the desired state. Treating it as one meant
+// that once a fork existed, init could NEVER run again:
+//
+//	failed to fork: HTTP 403: Name already exists on this account
+//	✗ [2/10] Acquire platform repos — gh: exit status 1
+//
+// And a fork always exists after the first attempt, because the rollback (rightly)
+// does not delete the operator's GitHub repo. So every retry after any failure died
+// here, before touching the cloud.
+func forkIfMissing(ctx context.Context, st *engine.State, org string) error {
+	if _, err := st.Runner.Capture(ctx, "gh", "repo", "view", org+"/eks-gitops", "--json", "name"); err == nil && !st.Runner.DryRun {
+		note(st, "%s/eks-gitops already exists — reusing the fork", org)
+		return nil
+	}
+	note(st, "forking nanohype/eks-gitops → %s/eks-gitops (the operator owns the addon catalog for IRSA writeback)", org)
+	return st.Runner.Run(ctx, "gh", "repo", "fork", "nanohype/eks-gitops",
+		"--org", org, "--fork-name", "eks-gitops", "--clone=false")
+}
 
 func (acquire) Run(ctx context.Context, st *engine.State) error {
 	org := st.Config.Org.Name
 	st.Repos = engine.RepoPaths(org)
 	note(st, "cloning platform repos into %s", st.Repos.Workdir)
-	if err := st.Runner.Run(ctx, "git", "clone", "https://github.com/nanohype/landing-zone.git", st.Repos.LandingZone); err != nil {
+	if err := cloneIfMissing(ctx, st, "https://github.com/nanohype/landing-zone.git", st.Repos.LandingZone); err != nil {
 		return err
 	}
-	if err := st.Runner.Run(ctx, "git", "clone", "https://github.com/nanohype/eks-agent-platform.git", st.Repos.AgentPlatform); err != nil {
+	if err := cloneIfMissing(ctx, st, "https://github.com/nanohype/eks-agent-platform.git", st.Repos.AgentPlatform); err != nil {
 		return err
 	}
-	note(st, "forking nanohype/eks-gitops → %s/eks-gitops (the operator owns the addon catalog for IRSA writeback)", org)
-	if err := st.Runner.Run(ctx, "gh", "repo", "fork", "nanohype/eks-gitops",
-		"--org", org, "--fork-name", "eks-gitops", "--clone=false"); err != nil {
+	if err := forkIfMissing(ctx, st, org); err != nil {
 		return err
 	}
 	// Clone the fork to the exact path (gh's --clone ignores the target dir).
-	if err := st.Runner.Run(ctx, "git", "clone",
+	if err := cloneIfMissing(ctx, st,
 		fmt.Sprintf("https://github.com/%s/eks-gitops.git", org), st.Repos.EKSGitops); err != nil {
 		return err
 	}
@@ -200,7 +261,7 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 	// phase can install from the local chart (mirrors the operator fallback).
 	if st.Config.ControlPlane.Portal {
 		note(st, "cloning nanohype/portal (day-2 UI) for its local chart")
-		return st.Runner.Run(ctx, "git", "clone", "https://github.com/nanohype/portal.git", st.Repos.Portal)
+		return cloneIfMissing(ctx, st, "https://github.com/nanohype/portal.git", st.Repos.Portal)
 	}
 	return nil
 }
