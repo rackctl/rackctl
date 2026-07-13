@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/ui"
 )
 
@@ -59,7 +60,14 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 			ev.Status, ev.Err = StatusFail, err
 			e.report(ev, ui.Fail(label+"  — "+err.Error()))
 			if e.CleanOnFail {
-				e.teardown(ctx, st, completed)
+				// The phase that FAILED is torn down too. It failed partway, which
+				// means it may have created resources before it died — a terragrunt
+				// apply that errors on one resource has usually already created
+				// several others. Rolling back only the phases that SUCCEEDED leaves
+				// exactly those orphaned: a failed cluster-addons left seven IAM roles
+				// behind, because its Teardown (which destroys the component) was
+				// never called.
+				e.teardown(ctx, st, append(completed, p))
 			}
 			return fmt.Errorf("phase %q failed: %w", p.ID(), err)
 		}
@@ -84,6 +92,15 @@ func (e *Engine) report(ev Event, line string) {
 func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 	if e.Hook == nil {
 		fmt.Fprintln(e.Out, ui.Warn("failure detected — rolling back provisioned resources"))
+	}
+
+	// Let the controllers delete what they — not Terraform — created, while they are
+	// still alive to do it. Without this a rollback tears the cluster down on top of
+	// live PVCs and Platform CRs, orphaning EBS volumes and IAM roles that nothing
+	// will ever clean up. `rackctl destroy` already did this; the rollback did not,
+	// and a failed install left three unattached volumes behind.
+	if st.Runner != nil && e.Out != nil {
+		reap.All(ctx, st.Runner, e.Out)
 	}
 	for i := len(completed) - 1; i >= 0; i-- {
 		p := completed[i]

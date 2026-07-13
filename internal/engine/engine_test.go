@@ -72,9 +72,19 @@ func TestEngineTeardownReverseOnFailure(t *testing.T) {
 	if err := e.Run(context.Background(), &State{}); err == nil {
 		t.Fatal("expected error from the failing phase")
 	}
-	// a,b complete; c fails (not counted as completed); the two completed phases
-	// tear down in reverse; d never runs.
-	want := []string{"run:a", "run:b", "run:c", "teardown:b", "teardown:a"}
+	// a,b complete; c FAILS; d never runs.
+	//
+	// c is torn down TOO, and first. This test previously asserted the opposite —
+	// that a failed phase is simply abandoned — which is the bug it was pinning: a
+	// phase that fails has failed PARTWAY, so it has usually already created
+	// resources. A terragrunt apply that errors on one resource has typically created
+	// several others first. Rolling back only the phases that SUCCEEDED leaves exactly
+	// those orphaned.
+	//
+	// Observed for real: cluster-addons failed on a bucket name and left seven IAM
+	// roles behind, because its Teardown — which destroys the component — was never
+	// called. The rollback tore down everything around it and reported success.
+	want := []string{"run:a", "run:b", "run:c", "teardown:c", "teardown:b", "teardown:a"}
 	if !equal(log, want) {
 		t.Fatalf("log = %v, want %v", log, want)
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/phases"
+	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/ui"
 )
 
@@ -128,7 +129,7 @@ var destroyCmd = &cobra.Command{
 		// while it is still running to do so. Destroying the cluster first orphans
 		// them and makes agent-iam fail on DeleteConflict, halting the teardown with
 		// the cluster already gone. See reap.go.
-		reapOperatorOwnedResources(ctx, run)
+		reap.All(ctx, run, os.Stdout)
 
 		env := string(cfg.Environment)
 		comps := phases.CoreComponents(cfg)
