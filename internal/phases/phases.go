@@ -118,6 +118,36 @@ func destroy(ctx context.Context, st *engine.State, component string) error {
 }
 func tg(ctx context.Context, st *engine.State, verb, component string) error {
 	dir := componentDir(st, component)
+
+	// Always init first.
+	//
+	// Terragrunt's auto-init only fires when `.terraform` is ABSENT. It does not fire
+	// when the source gained a module — and .terragrunt-cache lives in the checkout and
+	// survives every run. So a component that acquires a new `module` block is copied
+	// into a cache whose .terraform/modules/modules.json was written before that module
+	// existed, and tofu dies at apply time:
+	//
+	//	│ Error: Module not installed
+	//	│   on main.tf line 326:
+	//	│  326: module "grafana_token_rotator_irsa" {
+	//
+	// That took down a run that had already built a VPC, an EKS cluster and two nodes —
+	// the rollback then destroyed 40 resources to unwind it. The cache was from the
+	// previous day and knew about exactly one module; the component now had two.
+	//
+	// This is the third face of the same bug (see cloneOrUpdate and forkOrSync): a reused
+	// artifact treated as current because it is present. Terraform's own contract is that
+	// init follows any change to modules, and rackctl is the thing that just changed them
+	// — by pulling landing-zone. So it inits, rather than betting on a heuristic.
+	//
+	// It is cheap: providers are already in the cache, so init verifies rather than
+	// downloads. And it runs before `destroy` too — a teardown needs its modules
+	// installed exactly as much as an apply does, which is why the rollback's own
+	// `teardown gitops` failed with the same error.
+	if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", "init"); err != nil {
+		return err
+	}
+
 	// terragrunt 1.0+ takes global flags (--working-dir, --non-interactive) before
 	// the command; -auto-approve is a tofu flag after it. The old post-command
 	// --terragrunt-working-dir is silently ignored by 1.0.x (runs in the cwd).
