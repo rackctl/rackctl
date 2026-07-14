@@ -36,10 +36,32 @@ import (
 )
 
 // operatorOwnedKinds are the CRs whose controllers create AWS resources Terraform does
-// not track. Order matters: a Platform is deleted before the Tenant that owns it.
+// not track. Order matters:
+//
+//   - A Platform is deleted before the Tenant that owns it.
+//   - NodeClaims come LAST. Karpenter's nodes are where everything else still runs, so
+//     tearing them out from under the operator would prevent the finalizers above from
+//     ever completing.
+//
+// NodeClaims are the third instance of this package's rule, and the one that cost the
+// most to find. Karpenter creates EC2 instances; Terraform does not know they exist.
+// Destroy the cluster and Karpenter dies with it, leaving its nodes running — orphaned,
+// attached to nothing, and billing.
+//
+// That used to be invisible, because Karpenter's nodes sat in the EKS-managed CLUSTER
+// security group, which EKS deletes along with the cluster. Once they were moved into
+// the Terraform-managed NODE security group (which is what lets Cilium's rules cover
+// them), the orphan became load-bearing: Terraform cannot delete a security group that
+// an instance still holds, so the whole teardown stopped dead —
+//
+//	Error: deleting Security Group (sg-...): DependencyViolation
+//
+// — with the cluster already gone and an m9g still running. The fix is not to move the
+// nodes back; it is to reap what a controller made, before killing the controller.
 var operatorOwnedKinds = []string{
 	"platforms.platform.nanohype.dev",
 	"tenants.platform.nanohype.dev",
+	"nodeclaims.karpenter.sh",
 }
 
 // All reaps everything a controller owns, in dependency order, and waits for the
@@ -96,6 +118,61 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 	if s := strings.TrimSpace(out2); s != "" {
 		fmt.Fprintln(out, ui.OK(s))
 	}
+}
+
+// OrphanedNodes terminates Karpenter's EC2 instances, and must run BEFORE the cluster
+// component is destroyed — unlike OrphanedVolumes, which is a post-destroy sweep.
+//
+// It is the backstop for the NodeClaim reap in All(). That reap is the right first move
+// and cannot be relied on as the last: it needs a reachable cluster and a live Karpenter
+// to honour the finalizers, and a teardown is frequently run against a cluster that is
+// neither — a failed install, an interrupted rollback, an operator that cannot reach the
+// IAM API to finalize.
+//
+// When it does not run, the consequence is not cosmetic. Karpenter's nodes sit in the
+// Terraform-managed NODE security group, and Terraform cannot delete a security group an
+// instance still holds:
+//
+//	Error: deleting Security Group (sg-...): DependencyViolation
+//
+// The teardown stops there, with the EKS cluster already destroyed, the VPC still up,
+// and an instance still billing — the worst possible place to stop, because the thing
+// that could have cleaned up is the thing that was just deleted.
+//
+// The filter is exact rather than heuristic: Karpenter stamps every instance it launches
+// with karpenter.sh/managed-by=<cluster-name>. No instance carrying that tag belongs to
+// anything else, so this cannot touch a node the operator did not ask for.
+func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
+	if run.DryRun {
+		fmt.Fprintln(out, ui.Step("terminate EC2 instances Karpenter launched for "+cluster))
+		return
+	}
+
+	ids, err := run.Capture(ctx, "aws", "ec2", "describe-instances",
+		"--region", region,
+		"--filters",
+		"Name=instance-state-name,Values=running,pending,stopping,stopped",
+		"Name=tag:karpenter.sh/managed-by,Values="+cluster,
+		"--query", "Reservations[].Instances[].InstanceId", "--output", "text")
+	if err != nil {
+		return // no credentials, no region — not a teardown failure
+	}
+	ids = strings.TrimSpace(ids)
+	if ids == "" || ids == "None" {
+		return
+	}
+
+	insts := strings.Fields(ids)
+	fmt.Fprintln(out, ui.Step(fmt.Sprintf("terminating %d Karpenter instance(s) left by %s", len(insts), cluster)))
+	args := append([]string{"ec2", "terminate-instances", "--region", region, "--instance-ids"}, insts...)
+	if err := run.Run(ctx, "aws", args...); err != nil {
+		fmt.Fprintln(out, ui.Fail(
+			"could not terminate Karpenter's instances — they will keep billing, AND the node "+
+				"security group cannot be deleted while they hold it, so the teardown will fail "+
+				"with DependencyViolation: "+err.Error()))
+		return
+	}
+	fmt.Fprintln(out, ui.OK("terminated "+strings.Join(insts, ", ")))
 }
 
 // OrphanedVolumes deletes EBS volumes the cluster left behind, AFTER it is gone.

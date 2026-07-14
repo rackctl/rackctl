@@ -106,6 +106,16 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 	// and a failed install left three unattached volumes behind.
 	if st.Runner != nil && e.Out != nil {
 		reap.All(ctx, st.Runner, e.Out)
+
+		// And backstop the NodeClaim reap: a rollback runs against a half-built cluster,
+		// which is exactly the case where Karpenter is not alive to honour a finalizer.
+		// An instance that survives into the component teardown holds the node security
+		// group, and Terraform cannot delete one that is in use — the rollback then
+		// stops with the cluster gone and the instance still billing.
+		if st.Config != nil {
+			env := string(st.Config.Environment)
+			reap.OrphanedNodes(ctx, st.Runner, e.Out, env+"-eks", st.Config.Cloud.Region)
+		}
 	}
 	for i := len(completed) - 1; i >= 0; i-- {
 		p := completed[i]

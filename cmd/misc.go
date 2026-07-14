@@ -203,6 +203,15 @@ var destroyCmd = &cobra.Command{
 		reap.All(ctx, run, os.Stdout)
 
 		env := string(cfg.Environment)
+
+		// Backstop the NodeClaim reap above. It needs a reachable cluster and a live
+		// Karpenter; a teardown is often run against neither. Any instance Karpenter
+		// launched that survives into the component destroy holds the node security
+		// group, and Terraform cannot delete a security group that is in use — the
+		// teardown then stops with the cluster already gone and the instance still
+		// billing. Runs BEFORE the components, unlike the volume sweep.
+		reap.OrphanedNodes(ctx, run, os.Stdout, env+"-eks", cfg.Cloud.Region)
+
 		comps := phases.CoreComponents(cfg)
 		for i := len(comps) - 1; i >= 0; i-- {
 			c := comps[i]
