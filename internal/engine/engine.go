@@ -37,12 +37,57 @@ type Engine struct {
 	Hook        func(Event) // if set, receives events and suppresses default printing
 }
 
+// PlatformExists reports whether the platform was ALREADY provisioned when this run
+// started. It is the difference between a rollback and a demolition.
+//
+// Overridable for tests; the default asks EKS.
+var PlatformExists = func(ctx context.Context, st *State) bool {
+	if st.Runner == nil || st.Config == nil || st.Runner.DryRun {
+		return false
+	}
+	_, err := st.Runner.Capture(ctx, "aws", "eks", "describe-cluster",
+		"--name", string(st.Config.Environment)+"-eks",
+		"--region", st.Config.Cloud.Region,
+		"--query", "cluster.status", "--output", "text")
+	return err == nil
+}
+
 // Run executes each phase in order. On failure, completed phases are torn down
 // in reverse so a half-failed init never strands billable resources.
 func (e *Engine) Run(ctx context.Context, st *State) error {
 	if st.Outputs == nil {
 		st.Outputs = map[string]string{}
 	}
+
+	// Rollback is only ever safe when this run BUILT the thing it is about to destroy.
+	//
+	// `init --apply` is re-runnable by design (#16): it is how an operator retries after a
+	// failure, and how they re-apply a config change to a platform that is already up.
+	// Against an existing cluster, phases 1-4 all "succeed" as no-ops — the network is
+	// there, the cluster is there, nothing is created. They are recorded as `completed`
+	// all the same.
+	//
+	// So a failure in ANY later phase used to tear those phases down — and phase 4's
+	// teardown destroys the EKS cluster and the VPC. A re-apply that tripped on a config
+	// error would demolish a healthy, running platform that the run had not created and
+	// was never asked to remove.
+	//
+	// That is not hypothetical. A re-apply failed on a ClusterRoleBinding conflict, the
+	// engine began rolling back, and the only reason a 44/44-healthy cluster survived is
+	// that the process happened to be killed mid-teardown.
+	//
+	// NoRollbackError guards one case — a convergence timeout must not destroy the cloud.
+	// This guards the other, and it is the more dangerous one: the operator did not lose a
+	// wait, they lost the platform.
+	//
+	// So: if the cluster was already standing when the run began, never roll back. Report
+	// the failure and leave everything exactly as it was. Tearing a platform down is
+	// `rackctl destroy` — an explicit, separate act.
+	preexisting := PlatformExists(ctx, st)
+	if preexisting && e.Hook == nil {
+		fmt.Fprintln(e.Out, ui.Step("existing platform detected — a failure will NOT roll it back"))
+	}
+
 	total := len(e.Phases)
 	var completed []Phase
 	for i, p := range e.Phases {
@@ -64,7 +109,17 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 			// see NoRollbackError. A workload that has not converged is not a reason to
 			// destroy the cloud it is running on.
 			var noRollback *NoRollbackError
-			if e.CleanOnFail && !errors.As(err, &noRollback) {
+			switch {
+			case preexisting:
+				// The platform was already up before this run touched it. Whatever just
+				// failed, destroying it is not the remedy — this run did not build it.
+				if e.Hook == nil {
+					fmt.Fprintln(e.Out, ui.Warn(
+						"the platform was already provisioned before this run — leaving it standing. "+
+							"Nothing was rolled back. Run `rackctl doctor` to see what is wrong, or "+
+							"`rackctl destroy --apply` to tear it down deliberately."))
+				}
+			case e.CleanOnFail && !errors.As(err, &noRollback):
 				// The phase that FAILED is torn down too. It failed partway, which
 				// means it may have created resources before it died — a terragrunt
 				// apply that errors on one resource has usually already created

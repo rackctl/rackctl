@@ -177,3 +177,77 @@ func TestEngineDoesNotRollBackOnNoRollbackError(t *testing.T) {
 		t.Fatalf("log = %v, want %v — the platform must be left standing", log, want)
 	}
 }
+
+// A failure must NEVER destroy a platform this run did not build.
+//
+// `init --apply` is re-runnable by design: it is how an operator retries after a failure,
+// and how they re-apply a config change to a platform that is already up. Against an
+// existing cluster every earlier phase "succeeds" as a NO-OP — the network is there, the
+// cluster is there, nothing is created — and is recorded as completed all the same.
+//
+// So a failure in any later phase used to tear those phases down, and the cluster phase's
+// teardown destroys the EKS cluster and the VPC. A re-apply that tripped on a config error
+// would demolish a healthy, running platform.
+//
+// Not hypothetical: a re-apply failed on a ClusterRoleBinding conflict, the engine began
+// rolling back, and the only reason a 44/44-healthy cluster survived is that the process
+// happened to be killed mid-teardown.
+//
+// NoRollbackError guards a convergence timeout. This guards the more dangerous case: the
+// operator does not lose a wait, they lose the platform.
+func TestEngineNeverRollsBackAPlatformItDidNotBuild(t *testing.T) {
+	orig := PlatformExists
+	PlatformExists = func(context.Context, *State) bool { return true } // already provisioned
+	defer func() { PlatformExists = orig }()
+
+	var log []string
+	eng := &Engine{
+		Phases: []Phase{
+			recPhase{id: "cluster", enabled: true, log: &log}, // a no-op against existing infra
+			recPhase{id: "gitops", enabled: true, fail: true, log: &log},
+		},
+		Out:         io.Discard,
+		CleanOnFail: true,
+	}
+
+	if err := eng.Run(context.Background(), &State{}); err == nil {
+		t.Fatal("the phase failed; Run must still report the error")
+	}
+	for _, entry := range log {
+		if len(entry) > 9 && entry[:9] == "teardown:" {
+			t.Fatalf("the platform existed BEFORE this run — nothing may be torn down. "+
+				"Destroying a running platform because a re-apply hit a config error is not a "+
+				"rollback, it is a demolition.\ngot: %v", log)
+		}
+	}
+}
+
+// And the converse must still hold: when this run DID build the platform, a failure rolls
+// it back — otherwise a failed fresh install strands billable resources.
+func TestEngineStillRollsBackWhatItBuilt(t *testing.T) {
+	orig := PlatformExists
+	PlatformExists = func(context.Context, *State) bool { return false } // provisioning from zero
+	defer func() { PlatformExists = orig }()
+
+	var log []string
+	eng := &Engine{
+		Phases: []Phase{
+			recPhase{id: "cluster", enabled: true, log: &log},
+			recPhase{id: "gitops", enabled: true, fail: true, log: &log},
+		},
+		Out:         io.Discard,
+		CleanOnFail: true,
+	}
+	_ = eng.Run(context.Background(), &State{})
+
+	want := []string{"run:cluster", "run:gitops", "teardown:gitops", "teardown:cluster"}
+	if len(log) != len(want) {
+		t.Fatalf("a fresh install that fails must roll back what it created, or it strands "+
+			"billable resources.\nwant %v\ngot  %v", want, log)
+	}
+	for i := range want {
+		if log[i] != want[i] {
+			t.Fatalf("want %v, got %v", want, log)
+		}
+	}
+}
