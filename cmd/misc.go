@@ -208,6 +208,15 @@ var destroyCmd = &cobra.Command{
 			c := comps[i]
 			fmt.Println(ui.Step("destroy " + c))
 			dir := fmt.Sprintf("live/aws/workload-%s/%s/%s/%s", env, cfg.Cloud.Region, env, c)
+			// init first — a destroy needs its modules installed exactly as much as an
+			// apply does. A stale .terragrunt-cache (it lives in the checkout and
+			// survives every run) makes tofu fail with "Module not installed" the moment
+			// a component gains a module, and a teardown that cannot run is how a
+			// half-built platform stays billing. See tg() in internal/phases.
+			if err := run.Run(ctx, "terragrunt", "--working-dir", dir,
+				"--non-interactive", "init"); err != nil {
+				return err
+			}
 			if err := run.Run(ctx, "terragrunt", "--working-dir", dir,
 				"--non-interactive", "destroy", "-auto-approve"); err != nil {
 				return err
