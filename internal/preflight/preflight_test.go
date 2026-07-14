@@ -64,9 +64,41 @@ esac
 exit 0`)
 
 	r := CheckStaleState(context.Background(), testEnv())
-	mustFail(t, r, "purge the state objects")
-	if !strings.Contains(r.Detail, "terragrunt destroy") {
-		t.Errorf("must explain WHY `terragrunt destroy` is not the way out:\n%s", r.Detail)
+	mustFail(t, r, "rackctl destroy --apply")
+}
+
+// The remedy must be DESTROY-then-maybe-purge, never purge-first.
+//
+// The first real run proved why: a rollback destroyed the cluster and the VPC, but its
+// teardown of secrets and agent-iam failed — so their state was entirely ACCURATE. An
+// IAM role, two S3 buckets and a KMS key were all still live. An earlier draft of this
+// check inferred "cluster gone ⇒ state stale" and advised purging the state, which would
+// have orphaned every one of them permanently — the exact failure preflight exists to
+// prevent. A missing cluster proves the CLUSTER is gone; it proves nothing about what
+// the other components own.
+func TestCheckStaleState_NeverAdvisesPurgingStateThatMayTrackLiveResources(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "eks describe-cluster") exit 1 ;;
+  "s3 cp")                echo '{"resources":[{"type":"aws_iam_role"},{"type":"aws_s3_bucket"}]}' ;;
+  *)                      echo "" ;;
+esac
+exit 0`)
+
+	r := CheckStaleState(context.Background(), testEnv())
+	mustFail(t, r, "")
+
+	if !strings.Contains(r.Detail, "ONLY") {
+		t.Errorf("purging must be conditional, not the headline remedy:\n%s", r.Detail)
+	}
+	if !strings.Contains(r.Detail, "orphans them permanently") {
+		t.Errorf("must warn that purging live-tracking state orphans the resources:\n%s", r.Detail)
+	}
+	// The dangerous advice: purge, stated unconditionally, ahead of destroy.
+	purge := strings.Index(r.Detail, "Purge")
+	destroy := strings.Index(r.Detail, "rackctl destroy")
+	if destroy == -1 || (purge != -1 && purge < destroy) {
+		t.Errorf("destroy must be offered BEFORE purge — purge-first orphans live resources:\n%s", r.Detail)
 	}
 }
 

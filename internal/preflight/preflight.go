@@ -197,13 +197,28 @@ func CheckStaleState(ctx context.Context, env *Env) doctor.Result {
 		// State AND cluster exist: this is a re-apply, which is legitimate.
 		return ok(name, fmt.Sprintf("%s exists and state tracks it", clusterName(cfg)))
 	default:
+		// The cluster is gone but components still hold state. Do NOT assume the state is
+		// stale and tell the operator to purge it.
+		//
+		// That inference is wrong and dangerous, and the first real run proved it: a
+		// rollback destroyed the cluster and the VPC, but its teardown of secrets and
+		// agent-iam failed — so their state was entirely ACCURATE. The IAM operator role,
+		// two S3 buckets and a KMS key were all still there. Purging that state on the
+		// advice of a preflight would have orphaned every one of them permanently, which
+		// is precisely the failure this command exists to prevent.
+		//
+		// A missing cluster proves the CLUSTER is gone. It proves nothing about what the
+		// other components own. So name the safe remedy: destroy first — it is now
+		// idempotent and inits before it runs — and purge only what destroy leaves behind
+		// with nothing under it.
 		return fail(name, fmt.Sprintf(
-			"state claims resources for a cluster that does not exist — %s. Every component "+
-				"will reconcile against resources that are gone, and `terragrunt destroy` cannot "+
-				"clear it (the cluster state's kubernetes/helm providers cannot initialize "+
-				"without a cluster). Verify the resources are truly absent, then purge the state "+
-				"objects under s3://%s/%s/ — the bucket is versioned, so it is recoverable.",
-			strings.Join(stale, ", "), bucket, envName))
+			"%s is gone, but these components still hold state — %s. This is a partially "+
+				"torn-down platform, not necessarily a stale one: their resources may still "+
+				"exist and still be billing. Run `rackctl destroy --apply` first; it tears "+
+				"down what is actually there. Purge the state objects under s3://%s/%s/ ONLY "+
+				"if destroy leaves state behind with no resources under it — purging state "+
+				"that still tracks live resources orphans them permanently.",
+			clusterName(cfg), strings.Join(stale, ", "), bucket, envName))
 	}
 }
 
