@@ -240,7 +240,8 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir string) error
 	return nil
 }
 
-// forkIfMissing forks the upstream catalog into org, unless the fork already exists.
+// forkOrSync forks the upstream catalog into org, or — if the fork is already there —
+// brings it up to date with upstream.
 //
 // `gh repo fork` returns HTTP 403 "Name already exists on this account" when the fork
 // is there, which is not an error — it is the desired state. Treating it as one meant
@@ -252,14 +253,37 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir string) error
 // And a fork always exists after the first attempt, because the rollback (rightly)
 // does not delete the operator's GitHub repo. So every retry after any failure died
 // here, before touching the cloud.
-func forkIfMissing(ctx context.Context, st *engine.State, org string) error {
-	if _, err := st.Runner.Capture(ctx, "gh", "repo", "view", org+"/eks-gitops", "--json", "name"); err == nil && !st.Runner.DryRun {
-		note(st, "%s/eks-gitops already exists — reusing the fork", org)
-		return nil
+//
+// But "the fork exists" is not "the fork is current" — the same distinction
+// cloneOrUpdate exists to make, and reusing it unsynced is the same bug wearing a
+// different hat. The catalog is the source of truth for everything ArgoCD runs, and
+// the cluster reads it from the FORK, never from upstream. So a fork left at whatever
+// commit it was forked at means a fix merged upstream this morning is simply not in
+// the cluster built this afternoon — and the run meant to prove that fix quietly
+// disproves it. Nothing errors. The catalog is valid; it is just old.
+//
+// So: sync. Fast-forward only — `gh repo sync` hard-resets ONLY with --force, which is
+// deliberately not passed. The org owns this fork and is expected to commit to it; that
+// is the entire point of forking the catalog rather than consuming it. A divergence is
+// therefore legitimate and must never be overwritten. It is reported, and the run
+// continues against the fork as it stands.
+func forkOrSync(ctx context.Context, st *engine.State, org string) error {
+	fork := org + "/eks-gitops"
+
+	if _, err := st.Runner.Capture(ctx, "gh", "repo", "view", fork, "--json", "name"); err != nil || st.Runner.DryRun {
+		note(st, "forking nanohype/eks-gitops → %s (the operator owns the addon catalog for IRSA writeback)", fork)
+		return st.Runner.Run(ctx, "gh", "repo", "fork", "nanohype/eks-gitops",
+			"--org", org, "--fork-name", "eks-gitops", "--clone=false")
 	}
-	note(st, "forking nanohype/eks-gitops → %s/eks-gitops (the operator owns the addon catalog for IRSA writeback)", org)
-	return st.Runner.Run(ctx, "gh", "repo", "fork", "nanohype/eks-gitops",
-		"--org", org, "--fork-name", "eks-gitops", "--clone=false")
+
+	note(st, "%s already exists — syncing it with upstream", fork)
+	if err := st.Runner.Run(ctx, "gh", "repo", "sync", fork,
+		"--source", "nanohype/eks-gitops", "--branch", "main"); err != nil {
+		note(st, "%s: could not fast-forward — it has diverged from nanohype/eks-gitops, and this "+
+			"run will use the catalog as it stands on the fork. If that is not intended, reconcile "+
+			"the fork before re-running.", fork)
+	}
+	return nil
 }
 
 func (acquire) Run(ctx context.Context, st *engine.State) error {
@@ -272,7 +296,7 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 	if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/eks-agent-platform.git", st.Repos.AgentPlatform); err != nil {
 		return err
 	}
-	if err := forkIfMissing(ctx, st, org); err != nil {
+	if err := forkOrSync(ctx, st, org); err != nil {
 		return err
 	}
 	// Clone the fork to the exact path (gh's --clone ignores the target dir).
