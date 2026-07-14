@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -12,6 +13,7 @@ import (
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/phases"
+	"github.com/rackctl/rackctl/internal/preflight"
 	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/ui"
 )
@@ -58,9 +60,20 @@ node pool tuned to evict half the fleet at once.`,
 			fmt.Println(ui.Warn("aws identity unavailable — run `aws sso login`"))
 		}
 
+		// No cluster is a FAILURE, not a warning.
+		//
+		// This used to `return nil`, on the reasoning that "nothing provisioned yet is not
+		// a failure". But doctor's job is to assert that a provisioned platform is healthy,
+		// and it is the thing a deploy gates on — so an empty account exiting 0 means
+		// "nothing exists" reports as HEALTHY to everything downstream. That is the same
+		// green-light-that-means-nothing this command was written to eliminate.
+		//
+		// The pre-provision question — "can this install succeed?" — is `rackctl preflight`,
+		// which needs no cluster and is where that check belongs.
 		if out, err := run.Capture(ctx, "kubectl", "get", "nodes", "--no-headers"); err != nil || out == "" {
-			fmt.Println(ui.Warn("no cluster in kubeconfig — run `rackctl init` first"))
-			return nil // nothing provisioned yet is not a failure
+			fmt.Println(ui.Fail("no cluster in kubeconfig — there is no platform to be healthy. " +
+				"Run `rackctl preflight` to check whether an install can succeed, then `rackctl init --apply`."))
+			return fmt.Errorf("no provisioned platform to diagnose")
 		}
 		fmt.Println(ui.OK("cluster reachable"))
 
@@ -75,19 +88,7 @@ node pool tuned to evict half the fleet at once.`,
 
 		fmt.Println()
 		results := doctor.Run(ctx, &doctor.Env{Cfg: cfg, Run: run})
-		for _, r := range results {
-			line := fmt.Sprintf("%-22s %s", r.Name, r.Detail)
-			switch r.Status {
-			case doctor.OK:
-				fmt.Println(ui.OK(line))
-			case doctor.Warn:
-				fmt.Println(ui.Warn(line))
-			case doctor.Fail:
-				fmt.Println(ui.Fail(line))
-			case doctor.Skip:
-				fmt.Println(ui.Step(line))
-			}
-		}
+		printResults(results)
 
 		if doctor.Failed(results) {
 			fmt.Println()
@@ -97,6 +98,76 @@ node pool tuned to evict half the fleet at once.`,
 		}
 		return nil
 	},
+}
+
+// ---- preflight ----
+
+var preflightConfig string
+
+var preflightCmd = &cobra.Command{
+	Use:   "preflight",
+	Short: "Check whether an install can succeed — before it starts spending money",
+	Long: `Assert, without a cluster, that this install CAN succeed.
+
+doctor needs a live cluster, so it can only say why an install broke — never that
+it was going to. Every failure of the first four provisioning runs was knowable in
+advance and cost a full run to find: a globally-unique S3 bucket name already taken,
+two components claiming one service account's Pod Identity, a fork that could not be
+re-forked, Terraform state still describing a cluster that had been deleted, a KMS
+alias left pointing at a key scheduled for deletion.
+
+None of those are cloud failures. They are collisions with the wreckage of a previous
+attempt, and a machine can enumerate them in seconds.
+
+Read-only, and exits non-zero — so it can gate an init.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := config.Load(preflightConfig)
+		if err != nil {
+			return err
+		}
+		ctx := context.Background()
+		run := exec.New(io.Discard) // checks are queries; their output is the result, not the noise
+		run.Env = []string{"AWS_PROFILE=" + cfg.Cloud.Profile, "AWS_REGION=" + cfg.Cloud.Region}
+
+		fmt.Println(ui.Title(fmt.Sprintf("rackctl preflight — %s · %s · %s",
+			cfg.Org.Name, cfg.Cloud.Region, cfg.Environment)))
+
+		if err := exec.RequireTools("tofu", "terragrunt", "kubectl", "helm", "aws", "git", "gh"); err != nil {
+			fmt.Println(ui.Fail(err.Error()))
+			return err
+		}
+		fmt.Println(ui.OK("required tools present"))
+		fmt.Println()
+
+		results := preflight.Run(ctx, &preflight.Env{Cfg: cfg, Run: run})
+		printResults(results)
+
+		if preflight.Failed(results) {
+			fmt.Println()
+			return fmt.Errorf("preflight failed — this install would not succeed; clear the above first")
+		}
+		fmt.Println()
+		fmt.Println(ui.OK("preflight clear — `rackctl init --apply` can proceed"))
+		return nil
+	},
+}
+
+// printResults renders check results identically for preflight and doctor — they differ
+// in when they run, not in what they are.
+func printResults(results []doctor.Result) {
+	for _, r := range results {
+		line := fmt.Sprintf("%-22s %s", r.Name, r.Detail)
+		switch r.Status {
+		case doctor.OK:
+			fmt.Println(ui.OK(line))
+		case doctor.Warn:
+			fmt.Println(ui.Warn(line))
+		case doctor.Fail:
+			fmt.Println(ui.Fail(line))
+		case doctor.Skip:
+			fmt.Println(ui.Step(line))
+		}
+	}
 }
 
 // ---- destroy ----
@@ -189,6 +260,7 @@ var upgradeCmd = &cobra.Command{
 }
 
 func init() {
+	preflightCmd.Flags().StringVarP(&preflightConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	doctorCmd.Flags().StringVarP(&doctorConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	destroyCmd.Flags().StringVarP(&destroyConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	destroyCmd.Flags().BoolVar(&destroyApply, "apply", false, "actually destroy (default is a dry-run plan)")
