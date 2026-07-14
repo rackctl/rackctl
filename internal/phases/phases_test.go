@@ -72,7 +72,7 @@ func TestCoreComponents_DNSOnlyWithHostedZone(t *testing.T) {
 	}
 }
 
-func TestCoreComponents_NetworkFirstAddonsLast(t *testing.T) {
+func TestCoreComponents_NetworkFirst(t *testing.T) {
 	cfg := baseCfg()
 	cfg.Addons.Observability = true
 	cfg.DNS = &config.DNS{HostedZone: "example.com"}
@@ -81,12 +81,48 @@ func TestCoreComponents_NetworkFirstAddonsLast(t *testing.T) {
 	if comps[0] != "network" {
 		t.Errorf("network must be applied first; got %v", comps)
 	}
-	if comps[len(comps)-1] != "cluster-addons" {
-		t.Errorf("cluster-addons must be applied last; got %v", comps)
-	}
 	// The cluster must exist before anything that talks to its API.
 	if indexOf(comps, "cluster") > indexOf(comps, "cluster-bootstrap") {
 		t.Errorf("cluster must precede cluster-bootstrap; got %v", comps)
+	}
+}
+
+// Pod Identity must exist BEFORE ArgoCD can deploy the pods that need it.
+//
+// This test replaces one that asserted the opposite — "cluster-addons must be applied
+// last" — which pinned the bug rather than the fix.
+//
+// EKS Pod Identity injects credentials at pod ADMISSION. A pod that starts before its
+// association exists does not get them, and does not fail: it falls back to the EC2 node
+// instance role and only fails later, elsewhere, as a permission error naming the NODE
+// role rather than the pod.
+//
+// cluster-addons creates all eleven associations. cluster-bootstrap installs ArgoCD,
+// which immediately begins deploying the very addons those associations are for. With
+// addons last, ArgoCD deployed external-secrets before its identity existed; ESO ran as
+// the node role, every ExternalSecret failed `could not get secret data from provider`,
+// and it cascaded — alloy had no config, so AMP had no metrics, so opencost crash-looped
+// on an empty metrics store. Three Applications Degraded and not one named the cause.
+//
+// cluster-addons touches only AWS, so it has nothing to wait for. Ordering it first
+// removes the race outright.
+func TestCoreComponents_PodIdentityBeforeArgoCD(t *testing.T) {
+	for name, cfg := range map[string]*config.Config{
+		"defaults":      baseCfg(),
+		"observability": func() *config.Config { c := baseCfg(); c.Addons.Observability = true; return c }(),
+		"dns":           func() *config.Config { c := baseCfg(); c.DNS = &config.DNS{HostedZone: "x.com"}; return c }(),
+	} {
+		comps := CoreComponents(cfg)
+		addons, boot := indexOf(comps, "cluster-addons"), indexOf(comps, "cluster-bootstrap")
+		if addons == -1 || boot == -1 {
+			t.Fatalf("%s: both components must be present; got %v", name, comps)
+		}
+		if addons > boot {
+			t.Errorf("%s: cluster-addons must precede cluster-bootstrap — it creates the Pod "+
+				"Identity associations, and ArgoCD (installed by cluster-bootstrap) immediately "+
+				"deploys the pods that need them. A pod admitted before its association exists "+
+				"silently falls back to the NODE ROLE.\ngot: %v", name, comps)
+		}
 	}
 }
 
