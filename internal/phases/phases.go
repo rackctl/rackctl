@@ -53,7 +53,38 @@ func CoreComponents(cfg *config.Config) []string {
 	if cfg.DNS != nil && cfg.DNS.HostedZone != "" {
 		comps = append(comps, "dns")
 	}
-	return append(comps, "cluster-bootstrap", "cluster-addons")
+
+	// cluster-addons BEFORE cluster-bootstrap. This ordering is the fix for a race, and
+	// reversing it reintroduces one of the nastiest failures the platform has had.
+	//
+	// EKS Pod Identity injects credentials at pod ADMISSION. A pod that starts before
+	// its association exists does not get them — and it does not fail. It falls back to
+	// the EC2 node instance role, which has none of the permissions the workload needs,
+	// and only then fails, somewhere else, as a permission error that names the node
+	// role instead of the pod:
+	//
+	//	AccessDeniedException: User: arn:aws:sts::...:assumed-role/dev-system-eks-node-group
+	//
+	// cluster-addons is what creates all eleven Pod Identity associations
+	// (external-secrets, cert-manager, loki, tempo, velero, opencost, keda, the argo
+	// suite, ALB, external-dns). cluster-bootstrap is what installs ArgoCD, which
+	// immediately starts deploying the addons those associations are FOR.
+	//
+	// With addons last, ArgoCD deployed external-secrets before its identity existed.
+	// ESO came up as the node role, every ExternalSecret failed
+	// `could not get secret data from provider`, and the failure cascaded: alloy could
+	// not get its config, so no metrics reached AMP, so opencost crash-looped on an
+	// empty metrics store. Three Applications Degraded, and none of them named the
+	// cause. Restarting the ESO pod fixed it instantly — which is the whole tell.
+	//
+	// cluster-addons touches ONLY AWS (its sole provider is `aws`: IAM roles, Pod
+	// Identity associations, S3 buckets). It does not need ArgoCD, or a namespace, or a
+	// ServiceAccount to exist — an association can be created for a service account that
+	// has not been deployed yet. So it can simply run first, and then no pod can ever
+	// start before its identity is in place.
+	//
+	// Fixing the order removes the race. A restart Job would only paper over it.
+	return append(comps, "cluster-addons", "cluster-bootstrap")
 }
 
 // All returns the ordered bootstrap pipeline. Phases 0–6 are the core

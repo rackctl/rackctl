@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/exec"
@@ -278,11 +279,30 @@ type podList struct {
 					Waiting *struct {
 						Reason string `json:"reason"`
 					} `json:"waiting"`
+					Running *struct {
+						StartedAt time.Time `json:"startedAt"`
+					} `json:"running"`
 				} `json:"state"`
 			} `json:"containerStatuses"`
 		} `json:"status"`
 	} `json:"items"`
 }
+
+// settledFor is how long a container must have been running before a high restart
+// count is treated as history rather than a live failure.
+//
+// A restart count is cumulative and never decreases, so on its own it cannot tell
+// "crashlooping right now" from "had a rough start an hour ago and has been fine
+// since". On a FRESH install the difference is the common case, not the exception:
+// several components legitimately restart while the things they depend on converge —
+// opencost cannot start until AMP has metrics, and AMP has no metrics until the
+// collector is up. By the time the platform is healthy, opencost has eight restarts
+// behind it and has been stable for twenty minutes.
+//
+// Failing the gate on that is a red light that means nothing, which corrodes trust in
+// the gate exactly as fast as a green one that means nothing. So: still restarting is
+// a failure; restarted and settled is a note.
+const settledFor = 15 * time.Minute
 
 // CheckWorkloads looks for pods that are crashlooping or wedged on config.
 //
@@ -300,7 +320,7 @@ func CheckWorkloads(ctx context.Context, env *Env) Result {
 		return fail(name, "cannot read pods")
 	}
 
-	var bad []string
+	var bad, settled []string
 	for _, p := range pods.Items {
 		if p.Status.Phase == "Succeeded" { // completed Jobs are fine
 			continue
@@ -312,20 +332,42 @@ func CheckWorkloads(ctx context.Context, env *Env) Result {
 				bad = append(bad, fmt.Sprintf("%s: %s", ref, w.Reason))
 				break
 			}
-			// Running but repeatedly killed — an OOMKilled collector looks healthy
-			// in `get pods` between restarts.
-			if c.RestartCount >= 5 {
-				bad = append(bad, fmt.Sprintf("%s: %d restarts", ref, c.RestartCount))
+			if c.RestartCount < 5 {
+				continue
+			}
+			// Running but repeatedly killed — an OOMKilled collector looks healthy in
+			// `get pods` between restarts, so the restart count is the tell. But it is
+			// cumulative: it says the pod HAS died, never that it is dying. Ask how long
+			// the current process has been up before calling it a failure.
+			if r := c.State.Running; r != nil && time.Since(r.StartedAt) >= settledFor {
+				settled = append(settled, fmt.Sprintf("%s (%d restarts, stable %s)",
+					ref, c.RestartCount, time.Since(r.StartedAt).Round(time.Minute)))
 				break
 			}
+			bad = append(bad, fmt.Sprintf("%s: %d restarts", ref, c.RestartCount))
+			break
 		}
 	}
 	sort.Strings(bad)
+	sort.Strings(settled)
 
 	if len(bad) > 0 {
 		return fail(name, fmt.Sprintf("%d unhealthy: %s", len(bad), strings.Join(bad, ", ")))
 	}
+	if len(settled) > 0 {
+		// Worth saying, not worth failing: these died while the platform was still
+		// converging and have since stayed up.
+		return warn(name, fmt.Sprintf("%d pods, none crashlooping — %s restarted during convergence: %s",
+			len(pods.Items), plural(len(settled)), strings.Join(settled, ", ")))
+	}
 	return ok(name, fmt.Sprintf("%d pods, none crashlooping", len(pods.Items)))
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return "1 pod"
+	}
+	return fmt.Sprintf("%d pods", n)
 }
 
 // ─────────────────────────── dashboards ───────────────────────────
