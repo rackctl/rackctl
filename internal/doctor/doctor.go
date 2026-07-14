@@ -90,7 +90,97 @@ func Run(ctx context.Context, env *Env) []Result {
 		CheckWorkloads(ctx, env),
 		CheckDashboards(ctx, env),
 		CheckKarpenter(ctx, env),
+		CheckStuckFinalizers(ctx, env),
 	}
+}
+
+// ─────────────────────────── stuck finalizers ───────────────────────────
+
+// stuckFor is how long an object may sit Terminating before it is a wedge rather than a
+// deletion in progress. Ten minutes is generous: a healthy finalizer completes in
+// seconds, and the ones this catches had been stuck for hours.
+const stuckFor = 10 * time.Minute
+
+// terminatingKinds are the kinds whose finalizers have actually wedged a cluster. Kept
+// explicit rather than sweeping every kind: a doctor that lists half the API server on a
+// busy cluster is a doctor nobody reads.
+var terminatingKinds = []string{
+	"platforms.platform.nanohype.dev",
+	"tenants.platform.nanohype.dev",
+	"pvc",
+	"namespaces",
+}
+
+// CheckStuckFinalizers finds objects that are being deleted and cannot finish.
+//
+// This is the check that would have saved the most time of any in this package. An object
+// wedged in Terminating is invisible: `kubectl get` still lists it, its pods still run,
+// and nothing anywhere says "this is stuck". But ArgoCD rates a resource pending deletion
+// as Progressing — so ONE wedged object holds its whole Application at Progressing, which
+// makes rackctl's convergence gate (`wait --for=condition=Healthy applications --all`)
+// unsatisfiable, and the install times out with no indication why.
+//
+// Both of the wedges that produced this check came from a rollback that ran `reap` — it
+// deletes Platform CRs and PVCs so their controllers can release cloud resources before
+// the cluster dies — and was then interrupted before it finished the teardown. The
+// deletions are irreversible; the cluster survived; the objects have been Terminating
+// ever since:
+//
+//   - Platform/ops, on a finalizer that called PutBucketPolicy with an empty statement
+//     list. S3 rejects that (`MalformedPolicy: Statement is empty!`), so it retried
+//     forever.
+//   - PersistentVolumeClaim/kagent-postgresql, on kubernetes.io/pvc-protection, because
+//     ArgoCD's selfHeal kept re-creating the pod that mounts it.
+//
+// Neither was visible in doctor. Both cost hours. So: name the object, name the
+// finalizer, and say how long it has been stuck — that is the whole diagnosis.
+func CheckStuckFinalizers(ctx context.Context, env *Env) Result {
+	const name = "stuck finalizers"
+
+	type item struct {
+		Metadata struct {
+			Name              string     `json:"name"`
+			Namespace         string     `json:"namespace"`
+			DeletionTimestamp *time.Time `json:"deletionTimestamp"`
+			Finalizers        []string   `json:"finalizers"`
+		} `json:"metadata"`
+	}
+
+	var stuck []string
+	for _, kind := range terminatingKinds {
+		var list struct {
+			Items []item `json:"items"`
+		}
+		// A CRD that is not installed is not a failure — the agent platform is optional.
+		if err := env.kubectlJSON(ctx, &list, "get", kind, "-A"); err != nil {
+			continue
+		}
+		for _, it := range list.Items {
+			ts := it.Metadata.DeletionTimestamp
+			if ts == nil || time.Since(*ts) < stuckFor {
+				continue // not deleting, or deleting normally
+			}
+			ref := it.Metadata.Name
+			if ns := it.Metadata.Namespace; ns != "" {
+				ref = ns + "/" + ref
+			}
+			fin := "none"
+			if f := it.Metadata.Finalizers; len(f) > 0 {
+				fin = strings.Join(f, ",")
+			}
+			stuck = append(stuck, fmt.Sprintf("%s %s (Terminating %s, finalizer: %s)",
+				strings.SplitN(kind, ".", 2)[0], ref, time.Since(*ts).Round(time.Minute), fin))
+		}
+	}
+	sort.Strings(stuck)
+
+	if len(stuck) > 0 {
+		return fail(name, fmt.Sprintf(
+			"%d object(s) cannot finish deleting — ArgoCD rates a resource pending deletion as "+
+				"Progressing, so each of these holds its Application at Progressing forever and the "+
+				"convergence gate can never pass: %s", len(stuck), strings.Join(stuck, "; ")))
+	}
+	return ok(name, "nothing wedged in Terminating")
 }
 
 // Failed reports whether any result is a Fail.
