@@ -112,16 +112,28 @@ func TestCoreComponents_PodIdentityBeforeArgoCD(t *testing.T) {
 		"observability": func() *config.Config { c := baseCfg(); c.Addons.Observability = true; return c }(),
 		"dns":           func() *config.Config { c := baseCfg(); c.DNS = &config.DNS{HostedZone: "x.com"}; return c }(),
 	} {
-		comps := CoreComponents(cfg)
-		addons, boot := indexOf(comps, "cluster-addons"), indexOf(comps, "cluster-bootstrap")
-		if addons == -1 || boot == -1 {
-			t.Fatalf("%s: both components must be present; got %v", name, comps)
+		// The check that matters is the ACTUAL APPLY ORDER, which is driven by the phase
+		// that owns each component — NOT by CoreComponents. An earlier fix (#26) reordered
+		// CoreComponents and asserted only that, and it did nothing: the addons phase still
+		// applied cluster-addons AFTER the bootstrap phase applied cluster-bootstrap, so
+		// external-secrets still came up before its Pod Identity association existed.
+		//
+		// The bootstrap phase applies bootstrapComponents in order, and it is the only
+		// phase that applies either of these. So THIS is the sequence a pod actually sees.
+		bc := bootstrapComponents(cfg)
+		addons, boot := indexOf(bc, "cluster-addons"), indexOf(bc, "cluster-bootstrap")
+		if addons == -1 {
+			t.Fatalf("%s: cluster-addons must be applied by the bootstrap phase (it was excluded, "+
+				"and applied later by the addons phase — which is the bug); got %v", name, bc)
+		}
+		if boot == -1 {
+			t.Fatalf("%s: cluster-bootstrap must be in the bootstrap phase; got %v", name, bc)
 		}
 		if addons > boot {
-			t.Errorf("%s: cluster-addons must precede cluster-bootstrap — it creates the Pod "+
-				"Identity associations, and ArgoCD (installed by cluster-bootstrap) immediately "+
+			t.Errorf("%s: cluster-addons must be applied BEFORE cluster-bootstrap — it creates the "+
+				"Pod Identity associations, and ArgoCD (installed by cluster-bootstrap) immediately "+
 				"deploys the pods that need them. A pod admitted before its association exists "+
-				"silently falls back to the NODE ROLE.\ngot: %v", name, comps)
+				"silently falls back to the NODE ROLE.\ngot: %v", name, bc)
 		}
 	}
 }

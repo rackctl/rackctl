@@ -430,9 +430,23 @@ func bootstrapComponents(cfg *config.Config) []string {
 		switch c {
 		case "network", "cluster": // applied by the cluster phase
 			continue
-		case "cluster-addons": // applied by the addons phase
-			continue
 		}
+		// cluster-addons IS applied here, and its position in CoreComponents
+		// (immediately before cluster-bootstrap) is the whole point.
+		//
+		// It used to be excluded and applied by the addons phase AFTER cluster-bootstrap.
+		// But cluster-bootstrap installs ArgoCD, which begins deploying the eleven addons
+		// the instant it is up — and EKS Pod Identity is injected at pod ADMISSION, so a
+		// pod that starts before cluster-addons has created its association silently falls
+		// back to the node role and fails later as a permission error naming the node. On a
+		// fresh install external-secrets came up with no identity, every ExternalSecret
+		// failed, and it cascaded through alloy → opencost → dashboards.
+		//
+		// Reordering CoreComponents alone did NOT fix this: the apply order is driven by
+		// which PHASE owns each component, and the addons phase ran after the bootstrap
+		// phase. So the component has to actually move into the bootstrap phase's sequence,
+		// which is what including it here does. cluster-addons touches only AWS, so it has
+		// nothing to wait for — it can and must precede cluster-bootstrap.
 		out = append(out, c)
 	}
 	return out
@@ -465,9 +479,11 @@ type addons struct{ base }
 
 func (addons) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
-	if err := apply(ctx, st, "cluster-addons"); err != nil {
-		return err
-	}
+	// cluster-addons is NOT applied here anymore — the bootstrap phase applies it before
+	// cluster-bootstrap, so the Pod Identity associations exist before ArgoCD deploys the
+	// pods that need them (see bootstrapComponents). This phase only reads its outputs,
+	// writes the IRSA account id into the fork, and waits for convergence — all of which
+	// depend on cluster-addons being ALREADY applied, which it now is.
 	captureOutputs(ctx, st, "cluster-addons")
 
 	env := string(st.Config.Environment)
@@ -523,8 +539,13 @@ func (addons) Run(ctx context.Context, st *engine.State) error {
 }
 
 func (addons) Teardown(ctx context.Context, st *engine.State) error {
-	st.Runner.Dir = st.Repos.LandingZone
-	return destroy(ctx, st, "cluster-addons")
+	// Nothing to tear down here. cluster-addons is applied by the bootstrap phase now, so
+	// bootstrap.Teardown destroys it — and in the right order: because cluster-addons sits
+	// immediately before cluster-bootstrap in bootstrapComponents, the reverse-order
+	// teardown destroys cluster-bootstrap (ArgoCD) FIRST, then cluster-addons. Stopping
+	// ArgoCD before removing the Pod Identity associations and buckets it depends on is
+	// exactly what you want.
+	return nil
 }
 
 // --- Phase 6: agent-platform substrate, CRDs & operator ---
