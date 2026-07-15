@@ -162,6 +162,15 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 	if st.Runner != nil && e.Out != nil {
 		reap.All(ctx, st.Runner, e.Out)
 
+		// Force-delete the operator-minted IAM roles the finalizer may not have. A rollback
+		// is the worst case for that finalizer — it runs against a half-built cluster where
+		// the operator was very likely never healthy (its Pod Identity association is one of
+		// the things that failed), so the roles almost certainly survived and would stop the
+		// substrate teardown on agent-iam's DeleteConflict. Then free any CR the dead
+		// finalizer left pinned in Terminating (safe once the roles are gone).
+		reap.OperatorRoles(ctx, st.Runner, e.Out)
+		reap.UnstickTerminating(ctx, st.Runner, e.Out)
+
 		// And backstop the NodeClaim reap: a rollback runs against a half-built cluster,
 		// which is exactly the case where Karpenter is not alive to honour a finalizer.
 		// An instance that survives into the component teardown holds the node security

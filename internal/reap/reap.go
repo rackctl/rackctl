@@ -120,6 +120,180 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 	}
 }
 
+// execer is the slice of *exec.Runner that reap's deterministic backstops use. Naming it
+// here is what lets those backstops be unit-tested with a fake — no live cloud, no cluster.
+// *exec.Runner satisfies it; DryRun is passed alongside because it is a field, not a method.
+type execer interface {
+	Run(ctx context.Context, name string, args ...string) error
+	Capture(ctx context.Context, name string, args ...string) (string, error)
+}
+
+// OperatorRoles force-deletes the IAM roles the eks-agent-platform operator mints per
+// Platform. It is the deterministic backstop to the Platform-finalizer reap in All(), and
+// it MUST run before agent-iam is destroyed.
+//
+// The operator's finalizer already deletes these roles itself, synchronously, before it
+// drops the finalizer — so after a HEALTHY teardown All()'s `kubectl delete platforms
+// --wait` has left nothing here to do. But a teardown is frequently run against an operator
+// that is not healthy: crashlooping, already torn down, or — the case that actually bit —
+// running on the EC2 node role because its Pod Identity association never existed, so every
+// IAM call it makes is 403. Then the finalizer never completes, `--wait` times out, and the
+// roles survive, still attached to the tenant baseline policy that agent-iam is about to
+// destroy. terraform then stops the entire teardown dead:
+//
+//	Error: deleting IAM Policy (...): DeleteConflict: Cannot delete a policy attached to entities
+//
+// — with the cluster already half gone. That was cleared by hand, the same way, three times
+// across two days of fresh installs.
+//
+// This is the fix, and it is also why an interrupted teardown no longer wedges (the second
+// half of the same gap): the teardown's success no longer DEPENDS on the operator's
+// finalizer completing. Whether the finalizer ran or not, the roles are gone before
+// agent-iam runs. It reaps them exactly as the operator would — detach managed policies,
+// delete inline policies, delete the role — but does not need the operator, or even a
+// reachable cluster, to do it. IAM is global, so no region is needed either.
+//
+// Enumeration is by IAM path: the operator mints every tenant and session role under
+// /eks-agent-platform/ (its default TenantIAMPath, which the catalog does not override).
+// An org that repoints TenantIAMPath elsewhere would have to widen this prefix to match.
+func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer) {
+	reapOperatorRoles(ctx, run, run.DryRun, out)
+}
+
+func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writer) {
+	const pathPrefix = "/eks-agent-platform/"
+	if dryRun {
+		fmt.Fprintln(out, ui.Step("force-delete operator-minted IAM roles under "+pathPrefix+" (agent-iam DeleteConflict backstop)"))
+		return
+	}
+
+	// --path-prefix is a server-side filter and the CLI auto-paginates, so this returns
+	// every matching role regardless of how many Platforms existed.
+	names, err := run.Capture(ctx, "aws", "iam", "list-roles",
+		"--path-prefix", pathPrefix,
+		"--query", "Roles[].RoleName", "--output", "text")
+	if err != nil {
+		return // no credentials, or IAM unreachable — not a teardown failure
+	}
+	roles := strings.Fields(strings.TrimSpace(names))
+	if len(roles) == 0 {
+		return
+	}
+
+	fmt.Fprintln(out, ui.Step(fmt.Sprintf(
+		"force-deleting %d operator-minted IAM role(s) a finalizer left behind (agent-iam would else fail on DeleteConflict)", len(roles))))
+	for _, name := range roles {
+		if err := forceDeleteRole(ctx, run, name); err != nil {
+			fmt.Fprintln(out, ui.Fail(
+				"could not delete "+name+" — agent-iam may still fail on DeleteConflict: "+err.Error()))
+			continue
+		}
+		fmt.Fprintln(out, ui.OK("deleted "+name))
+	}
+}
+
+// forceDeleteRole detaches everything from a role and deletes it, mirroring the operator's
+// own detachAndDeleteRole so the end state is identical to a clean finalizer run. Order is
+// load-bearing: IAM refuses to delete a role that still has policies attached, exactly as it
+// refuses to delete a policy still attached to a role — detach first, delete last.
+func forceDeleteRole(ctx context.Context, run execer, name string) error {
+	attached, err := run.Capture(ctx, "aws", "iam", "list-attached-role-policies",
+		"--role-name", name, "--query", "AttachedPolicies[].PolicyArn", "--output", "text")
+	if err != nil {
+		return err
+	}
+	for _, arn := range strings.Fields(strings.TrimSpace(attached)) {
+		if err := run.Run(ctx, "aws", "iam", "detach-role-policy",
+			"--role-name", name, "--policy-arn", arn); err != nil {
+			return err
+		}
+	}
+
+	inline, err := run.Capture(ctx, "aws", "iam", "list-role-policies",
+		"--role-name", name, "--query", "PolicyNames[]", "--output", "text")
+	if err != nil {
+		return err
+	}
+	for _, pol := range strings.Fields(strings.TrimSpace(inline)) {
+		if err := run.Run(ctx, "aws", "iam", "delete-role-policy",
+			"--role-name", name, "--policy-name", pol); err != nil {
+			return err
+		}
+	}
+
+	return run.Run(ctx, "aws", "iam", "delete-role", "--role-name", name)
+}
+
+// UnstickTerminating force-removes the finalizers from any Platform or Tenant still pinned in
+// Terminating, so an interrupted or half-finalized teardown does not leave the cluster
+// wedged. It is the companion to OperatorRoles and MUST run after it.
+//
+// A Platform blocks its own deletion with a finalizer that deletes the tenant namespace,
+// revokes the KMS grant, trims the artifacts-bucket policy, and deletes the IAM roles. When
+// the operator cannot finish that — it is crashlooping, or was itself already pruned by the
+// cluster-bootstrap teardown — the CR is pinned in Terminating with nothing left alive to
+// finalize it. On a re-run or a `doctor` afterward that reads as an unrecoverable wedge.
+//
+// In a teardown the finalizer is by then guarding nothing: the namespace and KMS grant die
+// with the cluster, the buckets and roles are destroyed by terraform, and OperatorRoles has
+// already force-deleted the roles. So removing it is safe — and ONLY here. This is called
+// exclusively from the two teardown paths; run anywhere else, dropping a finalizer would
+// orphan live AWS state, which is the precise failure this whole package exists to prevent.
+//
+// Best-effort and cluster-optional: a teardown against an unreachable cluster has no CRs to
+// unstick, which is not an error.
+func UnstickTerminating(ctx context.Context, run *exec.Runner, out io.Writer) {
+	unstickTerminating(ctx, run, run.DryRun, out)
+}
+
+func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Writer) {
+	// Platform is namespaced, Tenant is cluster-scoped — the jsonpath emits the namespace
+	// (empty for Tenant) so the patch can add -n only when there is one.
+	kinds := []string{"platforms.platform.nanohype.dev", "tenants.platform.nanohype.dev"}
+	if dryRun {
+		for _, k := range kinds {
+			fmt.Fprintln(out, ui.Step("(dry-run) unstick any "+k+" pinned in Terminating (finalizer force-removed)"))
+		}
+		return
+	}
+	if _, err := run.Capture(ctx, "kubectl", "get", "--raw", "/readyz"); err != nil {
+		return // no reachable cluster — nothing to unstick
+	}
+
+	for _, kind := range kinds {
+		if _, err := run.Capture(ctx, "kubectl", "get", "crd", kind); err != nil {
+			continue // CRD never installed — this platform did not deploy the operator
+		}
+		// Emit "<namespace> <name>" for every instance carrying a deletionTimestamp, i.e.
+		// every one stuck Terminating. A cluster-scoped Tenant emits a leading space.
+		listed, err := run.Capture(ctx, "kubectl", "get", kind, "--all-namespaces",
+			"-o", `jsonpath={range .items[?(@.metadata.deletionTimestamp)]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}`)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimSpace(listed), "\n") {
+			ns, name, found := strings.Cut(strings.TrimSpace(line), " ")
+			if !found { // cluster-scoped: no namespace, the whole line is the name
+				ns, name = "", strings.TrimSpace(line)
+			}
+			if name == "" {
+				continue
+			}
+			fmt.Fprintln(out, ui.Step("unsticking "+kind+" "+strings.TrimPrefix(ns+"/"+name, "/")+
+				" (finalizer removed; its AWS state is already reaped)"))
+			args := []string{}
+			if ns != "" {
+				args = append(args, "-n", ns)
+			}
+			args = append(args, "patch", kind, name, "--type=json",
+				"-p", `[{"op":"remove","path":"/metadata/finalizers"}]`)
+			if err := run.Run(ctx, "kubectl", args...); err != nil {
+				fmt.Fprintln(out, ui.Fail("could not unstick "+name+": "+err.Error()))
+			}
+		}
+	}
+}
+
 // OrphanedNodes terminates Karpenter's EC2 instances, and must run BEFORE the cluster
 // component is destroyed — unlike OrphanedVolumes, which is a post-destroy sweep.
 //
