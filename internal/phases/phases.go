@@ -54,36 +54,11 @@ func CoreComponents(cfg *config.Config) []string {
 		comps = append(comps, "dns")
 	}
 
-	// cluster-addons BEFORE cluster-bootstrap. This ordering is the fix for a race, and
-	// reversing it reintroduces one of the nastiest failures the platform has had.
-	//
-	// EKS Pod Identity injects credentials at pod ADMISSION. A pod that starts before
-	// its association exists does not get them — and it does not fail. It falls back to
-	// the EC2 node instance role, which has none of the permissions the workload needs,
-	// and only then fails, somewhere else, as a permission error that names the node
-	// role instead of the pod:
-	//
-	//	AccessDeniedException: User: arn:aws:sts::...:assumed-role/dev-system-eks-node-group
-	//
-	// cluster-addons is what creates all eleven Pod Identity associations
-	// (external-secrets, cert-manager, loki, tempo, velero, opencost, keda, the argo
-	// suite, ALB, external-dns). cluster-bootstrap is what installs ArgoCD, which
-	// immediately starts deploying the addons those associations are FOR.
-	//
-	// With addons last, ArgoCD deployed external-secrets before its identity existed.
-	// ESO came up as the node role, every ExternalSecret failed
-	// `could not get secret data from provider`, and the failure cascaded: alloy could
-	// not get its config, so no metrics reached AMP, so opencost crash-looped on an
-	// empty metrics store. Three Applications Degraded, and none of them named the
-	// cause. Restarting the ESO pod fixed it instantly — which is the whole tell.
-	//
-	// cluster-addons touches ONLY AWS (its sole provider is `aws`: IAM roles, Pod
-	// Identity associations, S3 buckets). It does not need ArgoCD, or a namespace, or a
-	// ServiceAccount to exist — an association can be created for a service account that
-	// has not been deployed yet. So it can simply run first, and then no pod can ever
-	// start before its identity is in place.
-	//
-	// Fixing the order removes the race. A restart Job would only paper over it.
+	// cluster-addons before cluster-bootstrap. This documents the order; the two are
+	// APPLIED by different phases (substrate and gitops respectively), and it is that phase
+	// boundary — not this slice — that actually enforces "the AWS substrate exists before
+	// ArgoCD consumes it". See the substrate phase for why that ordering is load-bearing
+	// (Pod Identity is injected at pod admission) and why it must be structural.
 	return append(comps, "cluster-addons", "cluster-bootstrap")
 }
 
@@ -95,8 +70,8 @@ func All() []engine.Phase {
 		acquire{base{id: "acquire", title: "Acquire platform repos (clone + fork)"}},
 		identity{base{id: "identity", title: "Identity & Terraform state backend"}},
 		cluster{base{id: "cluster", title: "Network & EKS cluster"}},
-		bootstrap{base{id: "gitops", title: "Secrets & ArgoCD GitOps bootstrap"}},
-		addons{base{id: "addons", title: "Addon convergence & IRSA writeback"}},
+		substrate{base{id: "substrate", title: "AWS substrate — IAM, Pod Identity, buckets, monitoring"}},
+		gitopsPhase{base{id: "gitops", title: "ArgoCD GitOps & addon convergence"}},
 		platform{base{id: "platform", title: "Agent-platform substrate, CRDs & operator"}},
 		fleet{base{id: "fleet", title: "Cluster control plane (eks-fleet)", optional: true,
 			enabled: func(st *engine.State) bool { return st.Config.ControlPlane.EKSFleet }}},
@@ -124,7 +99,7 @@ func (b base) Enabled(st *engine.State) bool {
 }
 
 // Teardown is a no-op by default; phases that create billable cloud resources
-// override it (cluster, gitops, addons, platform) so the engine's rollback
+// override it (cluster, substrate, gitops, platform) so the engine's rollback
 // actually destroys them.
 func (base) Teardown(context.Context, *engine.State) error { return nil }
 
@@ -416,56 +391,100 @@ func (cluster) Teardown(ctx context.Context, st *engine.State) error {
 // --- Phase 4: secrets & ArgoCD bootstrap ---
 type bootstrap struct{ base }
 
-// bootstrapComponents is the slice of CoreComponents this phase owns: everything
-// from secrets through cluster-bootstrap. It is derived from CoreComponents rather
-// than restated, so the conditional components (agent-iam, managed-monitoring, dns)
-// can only ever be applied in the one order CoreComponents documents. Restating the
-// list here is what let those three go missing in the first place: CoreComponents
-// was only ever read by destroy, while apply walked a hardcoded {"secrets",
-// "cluster-bootstrap"} — so the two paths silently disagreed.
-func bootstrapComponents(cfg *config.Config) []string {
+// substrateComponents is the AWS substrate the GitOps layer consumes: every landing-zone
+// component ArgoCD depends on but that does not itself need ArgoCD. Derived from
+// CoreComponents (never restated) so the conditional components (agent-iam,
+// managed-monitoring, dns) can only ever be applied in the one order CoreComponents
+// documents — restating the list is what let those three silently go missing once.
+//
+// It is CoreComponents minus the components other phases own: network and cluster (the
+// cluster phase), and cluster-bootstrap (the gitops phase — ArgoCD is the CONSUMER of the
+// substrate, not part of it).
+func substrateComponents(cfg *config.Config) []string {
 	all := CoreComponents(cfg)
 	out := make([]string, 0, len(all))
 	for _, c := range all {
 		switch c {
-		case "network", "cluster": // applied by the cluster phase
+		case "network", "cluster": // the cluster phase
+			continue
+		case "cluster-bootstrap": // the gitops phase
 			continue
 		}
-		// cluster-addons IS applied here, and its position in CoreComponents
-		// (immediately before cluster-bootstrap) is the whole point.
-		//
-		// It used to be excluded and applied by the addons phase AFTER cluster-bootstrap.
-		// But cluster-bootstrap installs ArgoCD, which begins deploying the eleven addons
-		// the instant it is up — and EKS Pod Identity is injected at pod ADMISSION, so a
-		// pod that starts before cluster-addons has created its association silently falls
-		// back to the node role and fails later as a permission error naming the node. On a
-		// fresh install external-secrets came up with no identity, every ExternalSecret
-		// failed, and it cascaded through alloy → opencost → dashboards.
-		//
-		// Reordering CoreComponents alone did NOT fix this: the apply order is driven by
-		// which PHASE owns each component, and the addons phase ran after the bootstrap
-		// phase. So the component has to actually move into the bootstrap phase's sequence,
-		// which is what including it here does. cluster-addons touches only AWS, so it has
-		// nothing to wait for — it can and must precede cluster-bootstrap.
 		out = append(out, c)
 	}
 	return out
 }
 
-func (bootstrap) Run(ctx context.Context, st *engine.State) error {
+// --- Phase 4: platform substrate (the AWS layer the catalog consumes) ---
+//
+// Everything ArgoCD will read must exist before ArgoCD does. This phase builds all of it —
+// IAM, Pod Identity associations, S3 buckets, KMS, the AMP/AMG workspaces and their SSM
+// parameters — and then writes the account id into the fork, so the catalog ArgoCD clones
+// in the next phase is already correct.
+//
+// The phase boundary IS the dependency, and that is the point of drawing it here.
+// cluster-addons creates the eleven Pod Identity associations, and EKS injects Pod Identity
+// at pod ADMISSION — so a pod that starts before its association exists silently falls back
+// to the node role and fails later as a permission error naming the node, not the pod. When
+// cluster-addons was applied in the same breath as ArgoCD (or, worse, after it),
+// external-secrets came up on the node role and the failure cascaded through alloy →
+// opencost → dashboards.
+//
+// Substrate first, consumer second, as SEPARATE phases, is what makes that ordering
+// impossible to regress. The bug survived one round of "fixing" precisely because the
+// ordering lived in a component's index within a shared list rather than in the structure;
+// a phase boundary cannot be quietly reordered.
+type substrate struct{ base }
+
+func (substrate) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
-	note(st, "installing ArgoCD + app-of-apps pointing at %s", st.Config.Org.GitOps.GitURL())
-	for _, comp := range bootstrapComponents(st.Config) {
+	note(st, "building the AWS substrate the catalog consumes (IAM, Pod Identity, buckets, monitoring)")
+	for _, comp := range substrateComponents(st.Config) {
 		if err := apply(ctx, st, comp); err != nil {
 			return err
 		}
 	}
+	captureOutputs(ctx, st, "cluster-addons")
+
+	// IRSA writeback belongs HERE — after the substrate is built, before ArgoCD exists.
+	//
+	// It stamps this account's id into the fork's values and pushes, so the catalog ArgoCD
+	// clones in the next phase already resolves to this account's buckets. It is the handoff
+	// from "the AWS substrate is ready" to "the catalog can be pointed at it", which is
+	// exactly this phase's job. Running it AFTER ArgoCD (as the old addons phase did) meant
+	// ArgoCD first synced placeholder values and then had to self-heal after the push; done
+	// here, there is nothing to correct.
+	env := string(st.Config.Environment)
+	if st.Runner.DryRun {
+		note(st, "FOOTGUN GUARD: (apply) substitutes the account id into eks-gitops/addons/*/values-%s.yaml, then commits & pushes the fork", env)
+		return nil
+	}
+	note(st, "IRSA writeback: substituting account id into eks-gitops/addons/*/values-%s.yaml", env)
+	n, changed, err := gitops.WriteBack(st.Repos.EKSGitops, env, st.Config.Cloud.AccountID)
+	if err != nil {
+		return err
+	}
+	note(st, "replaced %d placeholder(s) across %d file(s)", n, len(changed))
+	if len(changed) > 0 {
+		st.Runner.Dir = st.Repos.EKSGitops
+		// Stage by name (never `git add -A`).
+		if err := st.Runner.Run(ctx, "git", append([]string{"add"}, changed...)...); err != nil {
+			return err
+		}
+		if err := st.Runner.Run(ctx, "git", "commit", "-m", "rackctl: substitute IRSA account id ("+env+")"); err != nil {
+			return err
+		}
+		if err := st.Runner.Run(ctx, "git", "push"); err != nil {
+			return err
+		}
+		st.Runner.Dir = st.Repos.LandingZone
+	}
 	return nil
 }
 
-func (bootstrap) Teardown(ctx context.Context, st *engine.State) error {
+func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
-	comps := bootstrapComponents(st.Config)
+	comps := substrateComponents(st.Config)
 	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply
 		if err := destroy(ctx, st, comps[i]); err != nil {
 			return err
@@ -474,42 +493,19 @@ func (bootstrap) Teardown(ctx context.Context, st *engine.State) error {
 	return nil
 }
 
-// --- Phase 5: addon convergence & IRSA writeback ---
-type addons struct{ base }
+// --- Phase 5: ArgoCD GitOps & addon convergence ---
+//
+// Installs ArgoCD + app-of-apps, pointed at the fork the substrate phase already made
+// correct, and waits for the catalog to converge. It creates no AWS resources the addons
+// depend on — the substrate phase built all of those first, which is the whole reason this
+// is a separate, later phase.
+type gitopsPhase struct{ base }
 
-func (addons) Run(ctx context.Context, st *engine.State) error {
+func (gitopsPhase) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
-	// cluster-addons is NOT applied here anymore — the bootstrap phase applies it before
-	// cluster-bootstrap, so the Pod Identity associations exist before ArgoCD deploys the
-	// pods that need them (see bootstrapComponents). This phase only reads its outputs,
-	// writes the IRSA account id into the fork, and waits for convergence — all of which
-	// depend on cluster-addons being ALREADY applied, which it now is.
-	captureOutputs(ctx, st, "cluster-addons")
-
-	env := string(st.Config.Environment)
-	if st.Runner.DryRun {
-		note(st, "FOOTGUN GUARD: (apply) substitutes the account id into eks-gitops/addons/*/values-%s.yaml, then commits & pushes the fork", env)
-	} else {
-		note(st, "IRSA writeback: substituting account id into eks-gitops/addons/*/values-%s.yaml", env)
-		n, changed, err := gitops.WriteBack(st.Repos.EKSGitops, env, st.Config.Cloud.AccountID)
-		if err != nil {
-			return err
-		}
-		note(st, "replaced %d placeholder(s) across %d file(s)", n, len(changed))
-		if len(changed) > 0 {
-			st.Runner.Dir = st.Repos.EKSGitops
-			// Stage by name (never `git add -A`).
-			if err := st.Runner.Run(ctx, "git", append([]string{"add"}, changed...)...); err != nil {
-				return err
-			}
-			if err := st.Runner.Run(ctx, "git", "commit", "-m", "rackctl: substitute IRSA account id ("+env+")"); err != nil {
-				return err
-			}
-			if err := st.Runner.Run(ctx, "git", "push"); err != nil {
-				return err
-			}
-			st.Runner.Dir = st.Repos.LandingZone
-		}
+	note(st, "installing ArgoCD + app-of-apps pointing at %s", st.Config.Org.GitOps.GitURL())
+	if err := apply(ctx, st, "cluster-bootstrap"); err != nil {
+		return err
 	}
 
 	note(st, "waiting for ArgoCD applications to converge (sync-waves 0→52)")
@@ -538,14 +534,12 @@ func (addons) Run(ctx context.Context, st *engine.State) error {
 	return nil
 }
 
-func (addons) Teardown(ctx context.Context, st *engine.State) error {
-	// Nothing to tear down here. cluster-addons is applied by the bootstrap phase now, so
-	// bootstrap.Teardown destroys it — and in the right order: because cluster-addons sits
-	// immediately before cluster-bootstrap in bootstrapComponents, the reverse-order
-	// teardown destroys cluster-bootstrap (ArgoCD) FIRST, then cluster-addons. Stopping
-	// ArgoCD before removing the Pod Identity associations and buckets it depends on is
-	// exactly what you want.
-	return nil
+func (gitopsPhase) Teardown(ctx context.Context, st *engine.State) error {
+	// Just cluster-bootstrap (ArgoCD). The engine tears phases down in reverse, so this runs
+	// BEFORE substrate.Teardown — ArgoCD is stopped before the Pod Identity associations and
+	// buckets it depends on are removed, which is the order you want.
+	st.Runner.Dir = st.Repos.LandingZone
+	return destroy(ctx, st, "cluster-bootstrap")
 }
 
 // --- Phase 6: agent-platform substrate, CRDs & operator ---

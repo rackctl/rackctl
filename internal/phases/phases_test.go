@@ -106,43 +106,56 @@ func TestCoreComponents_NetworkFirst(t *testing.T) {
 //
 // cluster-addons touches only AWS, so it has nothing to wait for. Ordering it first
 // removes the race outright.
-func TestCoreComponents_PodIdentityBeforeArgoCD(t *testing.T) {
+// The substrate (which owns cluster-addons) must run before the gitops phase (which owns
+// cluster-bootstrap = ArgoCD). This is the Pod Identity ordering, and it now lives in the
+// PHASE STRUCTURE — a substrate phase and a gitops phase — not in a component's index in a
+// shared list.
+//
+// That distinction is the whole lesson of #26/#29. #26 "fixed" this by reordering
+// CoreComponents and asserting that list; it did nothing, because the apply order is driven
+// by which phase owns a component. The invariant only became real when cluster-addons and
+// cluster-bootstrap were split across two phases whose order the engine executes literally.
+// So this test asserts the phase order and the ownership, which together ARE the guarantee.
+func TestPhases_SubstrateBeforeGitOps(t *testing.T) {
+	ids := make([]string, 0)
+	for _, p := range All() {
+		ids = append(ids, p.ID())
+	}
+	sub, git := indexOf(ids, "substrate"), indexOf(ids, "gitops")
+	if sub == -1 || git == -1 {
+		t.Fatalf("both the substrate and gitops phases must exist; got %v", ids)
+	}
+	if sub > git {
+		t.Fatalf("the substrate phase must run BEFORE the gitops phase — it creates the Pod "+
+			"Identity associations, and the gitops phase installs the ArgoCD that deploys the pods "+
+			"needing them. A pod admitted before its association exists silently falls back to the "+
+			"NODE ROLE.\nphase order: %v", ids)
+	}
+
+	// And ownership must line up with the split: cluster-addons is the substrate's,
+	// cluster-bootstrap is the gitops phase's. If cluster-bootstrap leaked back into the
+	// substrate set, the substrate phase would install ArgoCD itself and the split would be
+	// meaningless.
 	for name, cfg := range map[string]*config.Config{
 		"defaults":      baseCfg(),
 		"observability": func() *config.Config { c := baseCfg(); c.Addons.Observability = true; return c }(),
 		"dns":           func() *config.Config { c := baseCfg(); c.DNS = &config.DNS{HostedZone: "x.com"}; return c }(),
 	} {
-		// The check that matters is the ACTUAL APPLY ORDER, which is driven by the phase
-		// that owns each component — NOT by CoreComponents. An earlier fix (#26) reordered
-		// CoreComponents and asserted only that, and it did nothing: the addons phase still
-		// applied cluster-addons AFTER the bootstrap phase applied cluster-bootstrap, so
-		// external-secrets still came up before its Pod Identity association existed.
-		//
-		// The bootstrap phase applies bootstrapComponents in order, and it is the only
-		// phase that applies either of these. So THIS is the sequence a pod actually sees.
-		bc := bootstrapComponents(cfg)
-		addons, boot := indexOf(bc, "cluster-addons"), indexOf(bc, "cluster-bootstrap")
-		if addons == -1 {
-			t.Fatalf("%s: cluster-addons must be applied by the bootstrap phase (it was excluded, "+
-				"and applied later by the addons phase — which is the bug); got %v", name, bc)
+		sc := substrateComponents(cfg)
+		if indexOf(sc, "cluster-addons") == -1 {
+			t.Errorf("%s: the substrate phase must apply cluster-addons; got %v", name, sc)
 		}
-		if boot == -1 {
-			t.Fatalf("%s: cluster-bootstrap must be in the bootstrap phase; got %v", name, bc)
-		}
-		if addons > boot {
-			t.Errorf("%s: cluster-addons must be applied BEFORE cluster-bootstrap — it creates the "+
-				"Pod Identity associations, and ArgoCD (installed by cluster-bootstrap) immediately "+
-				"deploys the pods that need them. A pod admitted before its association exists "+
-				"silently falls back to the NODE ROLE.\ngot: %v", name, bc)
+		if indexOf(sc, "cluster-bootstrap") != -1 {
+			t.Errorf("%s: cluster-bootstrap belongs to the gitops phase, not the substrate; got %v", name, sc)
 		}
 	}
 }
 
-// bootstrapComponents must be a faithful SUBSEQUENCE of CoreComponents. This is the
-// invariant that broke: CoreComponents was only read by destroy, while the apply
+// substrateComponents must be a faithful SUBSEQUENCE of CoreComponents. This is the
+// invariant that broke once: CoreComponents was only read by destroy, while the apply
 // path walked its own hardcoded {"secrets","cluster-bootstrap"} — so the two
 // disagreed and agent-iam / managed-monitoring / dns were never applied at all.
-func TestBootstrapComponents_IsSubsequenceOfCore(t *testing.T) {
+func TestSubstrateComponents_IsSubsequenceOfCore(t *testing.T) {
 	for name, cfg := range map[string]*config.Config{
 		"defaults": baseCfg(),
 		"all-on": func() *config.Config {
@@ -154,25 +167,25 @@ func TestBootstrapComponents_IsSubsequenceOfCore(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			core := CoreComponents(cfg)
-			boot := bootstrapComponents(cfg)
+			sub := substrateComponents(cfg)
 
-			// every bootstrap component appears in core, in the same relative order
+			// every substrate component appears in core, in the same relative order
 			prev := -1
-			for _, c := range boot {
+			for _, c := range sub {
 				i := indexOf(core, c)
 				if i < 0 {
-					t.Fatalf("bootstrapComponents has %q which is not in CoreComponents %v", c, core)
+					t.Fatalf("substrateComponents has %q which is not in CoreComponents %v", c, core)
 				}
 				if i <= prev {
-					t.Fatalf("bootstrapComponents order diverges from CoreComponents: %v vs %v", boot, core)
+					t.Fatalf("substrateComponents order diverges from CoreComponents: %v vs %v", sub, core)
 				}
 				prev = i
 			}
-			// it owns everything except what the cluster and addons phases apply
+			// it owns everything except what the cluster and gitops phases apply
 			for _, c := range core {
-				owned := c != "network" && c != "cluster" && c != "cluster-addons"
-				if owned && indexOf(boot, c) < 0 {
-					t.Errorf("component %q is in CoreComponents but no phase applies it; got %v", c, boot)
+				owned := c != "network" && c != "cluster" && c != "cluster-bootstrap"
+				if owned && indexOf(sub, c) < 0 {
+					t.Errorf("component %q is in CoreComponents but no phase applies it; got %v", c, sub)
 				}
 			}
 		})
