@@ -204,6 +204,18 @@ var destroyCmd = &cobra.Command{
 
 		env := string(cfg.Environment)
 
+		// Force-delete the IAM roles the operator mints per Platform, in case its
+		// finalizer did not (a crashlooping or already-pruned operator, or one stuck on
+		// the node role). agent-iam destroys the tenant baseline policy those roles
+		// attach; a survivor stops the whole teardown on DeleteConflict. This runs before
+		// the component loop reaches agent-iam, and needs no cluster. See reap.go.
+		reap.OperatorRoles(ctx, run, os.Stdout)
+
+		// With the roles gone, any Platform/Tenant still pinned in Terminating is
+		// guarding nothing — free it, so an interrupted teardown does not wedge. Must
+		// follow OperatorRoles (never orphan AWS state), and runs while the API is up.
+		reap.UnstickTerminating(ctx, run, os.Stdout)
+
 		// Backstop the NodeClaim reap above. It needs a reachable cluster and a live
 		// Karpenter; a teardown is often run against neither. Any instance Karpenter
 		// launched that survives into the component destroy holds the node security
