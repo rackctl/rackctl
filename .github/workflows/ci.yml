@@ -19,8 +19,16 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - run: go test -race ./...
-      # govulncheck is the estate's sanctioned Go-side supply-chain gate:
-      # Go-native and reachability-aware, the counterpart to osv-scanner for JS.
-      # Pinned to a released tag for reproducible CI.
+      # Two-layer supply-chain gate. govulncheck is Go-native and
+      # reachability-aware (flags only vulnerabilities reachable in the call
+      # graph); osv-scanner is the estate-wide OSV-database gate every JS repo
+      # runs, here broadening coverage to the whole module graph. Both are pinned
+      # for reproducible CI and both fail the build.
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+      - name: osv-scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: |-
+            --recursive
+            ./
