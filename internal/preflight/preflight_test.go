@@ -158,9 +158,10 @@ exit 0`)
 // ─────────────────────────── soft-deleted secrets ───────────────────────────
 
 // A soft-deleted secret holds its NAME for the whole recovery window, so terraform
-// cannot recreate it — and the error says nothing about a recovery window.
+// cannot recreate it — and the error says nothing about a recovery window. The name checked
+// is the cluster-keyed one managed-monitoring actually creates (<cluster>-grafana-token).
 func TestCheckSoftDeletedSecrets_FailsOnAPendingDeletion(t *testing.T) {
-	fakeBin(t, "aws", `echo "eks-grafana-token"`)
+	fakeBin(t, "aws", `echo "development-platform-grafana-token"`)
 
 	r := CheckSoftDeletedSecrets(context.Background(), testEnv())
 	mustFail(t, r, "--force-delete-without-recovery")
@@ -172,6 +173,27 @@ func TestCheckSoftDeletedSecrets_IgnoresUnrelatedPendingSecrets(t *testing.T) {
 	if r := CheckSoftDeletedSecrets(context.Background(), testEnv()); r.Status != doctor.OK {
 		t.Fatalf("only the names the platform creates can block it: %s — %s", r.Status, r.Detail)
 	}
+}
+
+// The names are DERIVED from the cluster name, not pinned literals. managed-monitoring keys
+// both secrets on the full cluster name (<environment>-<base>-...), so a hardcoded name
+// stops matching the moment the cluster is named anything else — and the check then passes
+// vacuously against a substrate whose secrets it never inspected. Two things must hold: the
+// pre-rename literal (eks-grafana-token) is NOT one of this cluster's names, and a cluster
+// named differently is tracked under its own name.
+func TestCheckSoftDeletedSecrets_DerivesNamesFromClusterNotStaleLiteral(t *testing.T) {
+	// The pre-rename literal is not a name development-platform creates — must not be flagged.
+	fakeBin(t, "aws", `echo "eks-grafana-token"`)
+	if r := CheckSoftDeletedSecrets(context.Background(), testEnv()); r.Status != doctor.OK {
+		t.Fatalf("the stale literal is not a name this cluster creates — it must not block: %s — %s", r.Status, r.Detail)
+	}
+
+	// A differently named cluster keys its secrets differently; the check must follow.
+	env := testEnv()
+	env.Cfg.Cluster.Name = "apex"
+	fakeBin(t, "aws", `echo "development-apex-managed-monitoring-endpoints"`)
+	r := CheckSoftDeletedSecrets(context.Background(), env)
+	mustFail(t, r, "development-apex-managed-monitoring-endpoints")
 }
 
 // ─────────────────────────── catalog fork ───────────────────────────

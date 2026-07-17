@@ -1,0 +1,62 @@
+# rackctl full-provision config — AWS, development.
+# `rackctl init -c examples/rackctl.yaml` (dry-run) then add --apply.
+org:
+  name: acme
+  gitops:
+    eksGitopsRepo: github.com/acme/eks-gitops   # operator's fork of nanohype/eks-gitops
+    # clustersRepo/tenantsRepo only needed when controlPlane.eksFleet/portal are true
+
+cloud:
+  provider: aws
+  accountId: "111111111111"
+  region: us-west-2
+  profile: workload-development  # AWS SSO profile
+  identityCenter:
+    manage: true
+    adminUser: jane-admin
+
+environment: development         # development | staging | production
+
+cluster:
+  name: platform                 # cluster base; the EKS cluster is <environment>-<name> (development-platform). Required, unique per account+env, must != environment
+  version: "1.35"
+  endpointPublicAccess: true     # prod MUST be false (needs bastion/VPN). landing-zone is private-by-default; rackctl supplies this posture at apply time
+  endpointAllowlist: []          # CIDRs allowed to reach the public API endpoint. Empty + public => rackctl auto-detects this host's egress IP as <ip>/32 (never 0.0.0.0/0). Explicit entries win, e.g. [203.0.113.4/32]
+  systemNodes:
+    instanceTypes: [m7g.xlarge]
+    minSize: 2
+    maxSize: 6
+    desiredSize: 2
+  network:
+    vpcCidr: 10.0.0.0/16
+    natGateways: 1
+  ttlDays: 0                      # eks-fleet auto-reap; 0 = persistent
+
+quotas:
+  autoRequest: true               # file L-1216C47A (EC2 vCPU) etc. before provisioning
+  vcpu: 256
+
+addons:
+  observability: true             # managed-monitoring (AMP+AMG)
+  druid: false
+  accelerators: false             # gpu-operator / neuron
+
+dns:
+  hostedZone: acme.example.com
+
+agentPlatform:
+  enable: true
+  bedrockModelFamilies: [anthropic, amazon-nova]
+  compliance:
+    soc2: true
+    hipaa: false
+
+controlPlane:
+  eksFleet: false                 # opt-in: Crossplane cluster control plane
+  portal: false                   # opt-in: day-2 operator UI
+
+firstTenant:                      # optional smoke test
+  name: blank
+  persona: generic
+  tenant: example
+  monthlyBudgetUsd: 100

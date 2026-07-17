@@ -370,6 +370,19 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 	// inputs, so this TF_VAR is what names the cluster and its VPC subnet-discovery tags;
 	// network and cluster must agree on it or Karpenter/ELB discovery breaks.
 	st.Runner.Env = append(st.Runner.Env, "TF_VAR_cluster_name="+st.Config.Cluster.Name)
+
+	// The endpoint posture rides the same seam. landing-zone's committed cluster tree is
+	// private-by-default and fail-closed — a public API endpoint with no allow-list is
+	// rejected at plan time. rackctl owns the fragile per-run input: it supplies the bool
+	// and, when public, the CIDR allow-list (auto-detecting the operator's egress IP when
+	// none is given). Both are cluster-component variables, so they belong here, layered
+	// over the generic committed tree exactly like TF_VAR_cluster_name.
+	endpointEnv, err := clusterEndpointEnv(ctx, st)
+	if err != nil {
+		return err
+	}
+	st.Runner.Env = append(st.Runner.Env, endpointEnv...)
+
 	note(st, "provisioning VPC then EKS control plane (network → cluster; strict ordering)")
 	for _, comp := range []string{"network", "cluster"} {
 		if err := apply(ctx, st, comp); err != nil {

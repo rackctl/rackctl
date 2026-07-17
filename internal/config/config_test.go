@@ -27,6 +27,8 @@ func TestValidate(t *testing.T) {
 		"cluster.name too long":    func(c *Config) { c.Cluster.Name = "thirteenchars" }, // 13 > 12 char cap
 		"cluster.name == env":      func(c *Config) { c.Cluster.Name = string(c.Environment) },
 		"prod public endpoint":     func(c *Config) { c.Environment = EnvProduction; c.Cluster.EndpointPublicAccess = true },
+		"bad cidr in allowlist":    func(c *Config) { c.Cluster.EndpointAllowlist = []string{"10.0.0.0"} }, // no mask
+		"bare ip in allowlist":     func(c *Config) { c.Cluster.EndpointAllowlist = []string{"203.0.113.4"} },
 		"eksFleet no clustersRepo": func(c *Config) { c.ControlPlane.EKSFleet = true },
 		"portal no tenantsRepo":    func(c *Config) { c.ControlPlane.Portal = true },
 	}
@@ -36,6 +38,26 @@ func TestValidate(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: expected validation error, got nil", name)
 		}
+	}
+}
+
+// A well-formed CIDR allow-list validates; a malformed entry is rejected before it can be
+// injected verbatim onto the public API endpoint. The empty allow-list (autodetect) is fine.
+func TestValidate_EndpointAllowlistCIDRs(t *testing.T) {
+	c := valid()
+	c.Cluster.EndpointAllowlist = []string{"203.0.113.4/32", "10.0.0.0/16"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a well-formed CIDR allow-list must validate: %v", err)
+	}
+
+	c.Cluster.EndpointAllowlist = []string{"203.0.113.4/32", "not-a-cidr"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("a malformed allow-list entry must be rejected — it would otherwise land verbatim on the public API endpoint")
+	}
+
+	c.Cluster.EndpointAllowlist = nil
+	if err := c.Validate(); err != nil {
+		t.Fatalf("an empty allow-list (the autodetect case) must validate: %v", err)
 	}
 }
 
