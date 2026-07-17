@@ -46,7 +46,7 @@ var PlatformExists = func(ctx context.Context, st *State) bool {
 		return false
 	}
 	_, err := st.Runner.Capture(ctx, "aws", "eks", "describe-cluster",
-		"--name", string(st.Config.Environment)+"-eks",
+		"--name", st.Config.ClusterName(),
 		"--region", st.Config.Cloud.Region,
 		"--query", "cluster.status", "--output", "text")
 	return err == nil
@@ -177,8 +177,7 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 		// group, and Terraform cannot delete one that is in use — the rollback then
 		// stops with the cluster gone and the instance still billing.
 		if st.Config != nil {
-			env := string(st.Config.Environment)
-			reap.OrphanedNodes(ctx, st.Runner, e.Out, env+"-eks", st.Config.Cloud.Region)
+			reap.OrphanedNodes(ctx, st.Runner, e.Out, st.Config.ClusterName(), st.Config.Cloud.Region)
 		}
 	}
 	for i := len(completed) - 1; i >= 0; i-- {

@@ -6,7 +6,8 @@ func valid() *Config {
 	c := Default()
 	c.Org.Name = "acme"
 	c.Cloud.AccountID = "111111111111"
-	c.Cloud.Profile = "workload-dev"
+	c.Cloud.Profile = "workload-development"
+	c.Cluster.Name = "platform"
 	c.ApplyDefaults()
 	return c
 }
@@ -21,6 +22,10 @@ func TestValidate(t *testing.T) {
 		"short account id":         func(c *Config) { c.Cloud.AccountID = "123" },
 		"non-aws provider":         func(c *Config) { c.Cloud.Provider = ProviderAzure },
 		"bad environment":          func(c *Config) { c.Environment = "qa" },
+		"missing cluster.name":     func(c *Config) { c.Cluster.Name = "" },
+		"bad cluster.name":         func(c *Config) { c.Cluster.Name = "Platform_1" },
+		"cluster.name too long":    func(c *Config) { c.Cluster.Name = "thirteenchars" }, // 13 > 12 char cap
+		"cluster.name == env":      func(c *Config) { c.Cluster.Name = string(c.Environment) },
 		"prod public endpoint":     func(c *Config) { c.Environment = EnvProduction; c.Cluster.EndpointPublicAccess = true },
 		"eksFleet no clustersRepo": func(c *Config) { c.ControlPlane.EKSFleet = true },
 		"portal no tenantsRepo":    func(c *Config) { c.ControlPlane.Portal = true },
@@ -41,7 +46,7 @@ func TestApplyDefaults(t *testing.T) {
 		t.Errorf("region default = %q, want us-west-2", c.Cloud.Region)
 	}
 	if c.Environment != EnvDev {
-		t.Errorf("environment default = %q, want dev", c.Environment)
+		t.Errorf("environment default = %q, want development", c.Environment)
 	}
 	if c.Org.GitOps.EKSGitopsRepo != "github.com/acme/eks-gitops" {
 		t.Errorf("eksGitopsRepo = %q, want derived from org", c.Org.GitOps.EKSGitopsRepo)

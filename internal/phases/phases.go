@@ -109,7 +109,7 @@ func note(st *engine.State, format string, a ...any) {
 
 // componentDir is the landing-zone Terragrunt path for a component. The live
 // layout is live/aws/<account>/<region>/<env>/<component>, where the account
-// dir is workload-<env> (e.g. live/aws/workload-dev/us-west-2/dev/network).
+// dir is workload-<env> (e.g. live/aws/workload-development/us-west-2/development/network).
 func componentDir(st *engine.State, component string) string {
 	env := string(st.Config.Environment)
 	return fmt.Sprintf("live/aws/workload-%s/%s/%s/%s", env, st.Config.Cloud.Region, env, component)
@@ -364,6 +364,12 @@ type cluster struct{ base }
 
 func (cluster) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
+	// The cluster base rides TF_VAR_cluster_name into landing-zone's network + cluster
+	// modules (their var.cluster_name), which compose <environment>-<cluster_name> — the
+	// same string ClusterName() returns. network.hcl no longer pins cluster_name in its
+	// inputs, so this TF_VAR is what names the cluster and its VPC subnet-discovery tags;
+	// network and cluster must agree on it or Karpenter/ELB discovery breaks.
+	st.Runner.Env = append(st.Runner.Env, "TF_VAR_cluster_name="+st.Config.Cluster.Name)
 	note(st, "provisioning VPC then EKS control plane (network → cluster; strict ordering)")
 	for _, comp := range []string{"network", "cluster"} {
 		if err := apply(ctx, st, comp); err != nil {
@@ -371,7 +377,7 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 		}
 	}
 	captureOutputs(ctx, st, "cluster")
-	return st.Runner.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", string(st.Config.Environment)+"-eks")
+	return st.Runner.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", st.Config.ClusterName())
 }
 
 func (cluster) Teardown(ctx context.Context, st *engine.State) error {
@@ -384,7 +390,7 @@ func (cluster) Teardown(ctx context.Context, st *engine.State) error {
 	// The cluster is gone, so nothing of its can still be attached. Anything still
 	// tagged for it is an orphan by definition — sweep it, or it bills forever.
 	reap.OrphanedVolumes(ctx, st.Runner, os.Stdout,
-		string(st.Config.Environment)+"-eks", st.Config.Cloud.Region)
+		st.Config.ClusterName(), st.Config.Cloud.Region)
 	return nil
 }
 

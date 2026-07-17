@@ -222,7 +222,7 @@ var destroyCmd = &cobra.Command{
 		// group, and Terraform cannot delete a security group that is in use — the
 		// teardown then stops with the cluster already gone and the instance still
 		// billing. Runs BEFORE the components, unlike the volume sweep.
-		reap.OrphanedNodes(ctx, run, os.Stdout, env+"-eks", cfg.Cloud.Region)
+		reap.OrphanedNodes(ctx, run, os.Stdout, cfg.ClusterName(), cfg.Cloud.Region)
 
 		comps := phases.CoreComponents(cfg)
 		for i := len(comps) - 1; i >= 0; i-- {
@@ -244,7 +244,7 @@ var destroyCmd = &cobra.Command{
 			}
 		}
 		// The cluster is gone; anything still tagged for it is an orphan by definition.
-		reap.OrphanedVolumes(ctx, run, os.Stdout, env+"-eks", cfg.Cloud.Region)
+		reap.OrphanedVolumes(ctx, run, os.Stdout, cfg.ClusterName(), cfg.Cloud.Region)
 		fmt.Println(ui.OK("platform destroyed"))
 		return nil
 	},
