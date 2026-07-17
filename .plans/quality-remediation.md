@@ -9,7 +9,7 @@ in its target 24, which depends on this one shipping first).
 
 | # | target | status |
 |---|---|---|
-| 23 | Endpoint knob wiring + preflight secret names | ☐ |
+| 23 | Endpoint knob wiring + preflight secret names | ✅ #34 |
 
 ---
 
