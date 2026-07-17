@@ -31,25 +31,25 @@ func TestWriteBack(t *testing.T) {
 	if err := os.MkdirAll(addon, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	dev := filepath.Join(addon, "values-dev.yaml")
+	dev := filepath.Join(addon, "values-development.yaml")
 	if err := os.WriteFile(dev, []byte("arn: arn:aws:iam::000000000000:role/cm"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// A different env's file must NOT be touched.
-	prod := filepath.Join(addon, "values-prod.yaml")
+	prod := filepath.Join(addon, "values-production.yaml")
 	if err := os.WriteFile(prod, []byte("arn: arn:aws:iam::000000000000:role/cm"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	n, changed, err := WriteBack(dir, "dev", "123456789012")
+	n, changed, err := WriteBack(dir, "development", "123456789012")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
 		t.Fatalf("replacements = %d, want 1", n)
 	}
-	if len(changed) != 1 || filepath.Base(changed[0]) != "values-dev.yaml" {
-		t.Fatalf("changed = %v, want [values-dev.yaml]", changed)
+	if len(changed) != 1 || filepath.Base(changed[0]) != "values-development.yaml" {
+		t.Fatalf("changed = %v, want [values-development.yaml]", changed)
 	}
 
 	got, _ := os.ReadFile(dev)

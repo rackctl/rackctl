@@ -33,6 +33,7 @@ func testEnv() *Env {
 			Org:         config.Org{Name: "acme"},
 			Cloud:       config.Cloud{AccountID: "111122223333", Region: "us-west-2", Profile: "acme"},
 			Environment: config.EnvDev,
+			Cluster:     config.Cluster{Name: "platform"},
 		},
 		Run: exec.New(io.Discard),
 	}
@@ -133,7 +134,7 @@ esac
 exit 0`)
 
 	r := CheckCollisions(context.Background(), testEnv())
-	mustFail(t, r, "alias/eks/dev-eks")
+	mustFail(t, r, "alias/eks/development-platform")
 	if !strings.Contains(r.Detail, "does NOT free its alias") {
 		t.Errorf("must name the alias trap explicitly — it is the non-obvious half:\n%s", r.Detail)
 	}

@@ -75,7 +75,7 @@ func Run(ctx context.Context, env *Env) []doctor.Result {
 func Failed(rs []doctor.Result) bool { return doctor.Failed(rs) }
 
 // clusterName is the name every component derives its resources from.
-func clusterName(cfg *config.Config) string { return string(cfg.Environment) + "-eks" }
+func clusterName(cfg *config.Config) string { return cfg.ClusterName() }
 
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)

@@ -6,8 +6,13 @@ package config
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// rfc1123Label is the shape a cluster base name must take (a lowercase DNS label):
+// it becomes part of the EKS cluster name and the AWS resource names derived from it.
+var rfc1123Label = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$`)
 
 // Provider is the target cloud. v1 supports AWS only.
 type Provider string
@@ -21,7 +26,7 @@ const (
 type Environment string
 
 const (
-	EnvDev        Environment = "dev"
+	EnvDev        Environment = "development"
 	EnvStaging    Environment = "staging"
 	EnvProduction Environment = "production"
 )
@@ -95,11 +100,26 @@ type IdentityCenter struct {
 }
 
 type Cluster struct {
+	// Name is the cluster base; the EKS cluster is <environment>-<Name> (see
+	// Config.ClusterName). Required and unique per (account, region, environment) —
+	// no default, because a shared default collides the moment a second cluster lands
+	// in one account and environment. Must not equal the environment token. Mirrors
+	// eks-fleet's Cluster.spec.clusterName and landing-zone's var.cluster_name.
+	Name                 string     `json:"name"`
 	Version              string     `json:"version"`
 	EndpointPublicAccess bool       `json:"endpointPublicAccess"` // prod should be false (needs bastion/VPN)
 	SystemNodes          NodeGroup  `json:"systemNodes"`
 	Network              ClusterNet `json:"network"`
 	TTLDays              int        `json:"ttlDays"` // eks-fleet auto-reap; 0 = persistent
+}
+
+// ClusterName is the resolved EKS cluster name, <environment>-<cluster.name> — the
+// single source of truth every component derives its resources from. landing-zone's
+// cluster module composes the same string from var.environment + var.cluster_name, so
+// rackctl passes cluster.name as TF_VAR_cluster_name and reads this value back for
+// describe-cluster / kubeconfig / reap.
+func (c *Config) ClusterName() string {
+	return string(c.Environment) + "-" + c.Cluster.Name
 }
 
 type NodeGroup struct {
@@ -160,7 +180,7 @@ type FirstTenant struct {
 
 func boolPtr(b bool) *bool { return &b }
 
-// Default returns a Config populated with the sane dev defaults.
+// Default returns a Config populated with the sane development defaults.
 func Default() *Config {
 	return &Config{
 		Cloud:       Cloud{Provider: ProviderAWS, Region: "us-west-2"},
@@ -238,7 +258,17 @@ func (c *Config) Validate() error {
 	switch c.Environment {
 	case EnvDev, EnvStaging, EnvProduction:
 	default:
-		errs = append(errs, fmt.Sprintf("environment must be dev|staging|production, got %q", c.Environment))
+		errs = append(errs, fmt.Sprintf("environment must be development|staging|production, got %q", c.Environment))
+	}
+	switch {
+	case c.Cluster.Name == "":
+		errs = append(errs, "cluster.name is required (the cluster base; the EKS cluster is <environment>-<name>)")
+	case !rfc1123Label.MatchString(c.Cluster.Name):
+		errs = append(errs, fmt.Sprintf("cluster.name %q must be a lowercase RFC-1123 label", c.Cluster.Name))
+	case len(c.Cluster.Name) > 12:
+		errs = append(errs, fmt.Sprintf("cluster.name %q must be <= 12 chars: the derived <environment>-<name> feeds cluster-scoped S3/IAM names; the tightest (agent-iam's account+region-qualified model-artifacts bucket) fits within S3's 63-char limit in us-west-2", c.Cluster.Name))
+	case c.Cluster.Name == string(c.Environment):
+		errs = append(errs, fmt.Sprintf("cluster.name must not equal environment (the cluster name would double, e.g. %[1]s-%[1]s)", c.Environment))
 	}
 	if c.Environment == EnvProduction && c.Cluster.EndpointPublicAccess {
 		errs = append(errs, "cluster.endpointPublicAccess should be false for production (requires bastion/VPN)")
