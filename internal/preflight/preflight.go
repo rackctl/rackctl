@@ -313,9 +313,15 @@ func CheckCollisions(ctx context.Context, env *Env) doctor.Result {
 func CheckSoftDeletedSecrets(ctx context.Context, env *Env) doctor.Result {
 	const name = "soft-deleted secrets"
 
-	// The names the platform will create. A soft-deleted secret under any of them blocks
-	// the component that owns it.
-	want := []string{"eks-grafana-token", "eks-managed-monitoring-endpoints"}
+	// The names the platform will create. managed-monitoring names both secrets after the
+	// full cluster name (<environment>-<base>-grafana-token,
+	// <environment>-<base>-managed-monitoring-endpoints), so derive them from the config
+	// rather than pinning literals — a hardcoded name silently stops matching the moment the
+	// cluster is named anything but the default, and the check would then pass vacuously
+	// against a substrate whose secrets it never looked at. A soft-deleted secret under
+	// either name blocks the component that owns it.
+	cluster := clusterName(env.Cfg)
+	want := []string{cluster + "-grafana-token", cluster + "-managed-monitoring-endpoints"}
 
 	out, err := env.Run.Capture(ctx, "aws", "secretsmanager", "list-secrets",
 		"--include-planned-deletion",

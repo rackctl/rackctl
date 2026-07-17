@@ -51,6 +51,7 @@ down in reverse so a half-failed init never leaves billable resources.
 ### Footguns rackctl exists to kill
 
 - **IRSA ARN substitution** — the `000000000000` placeholders in `eks-gitops/addons/*/values-<env>.yaml` (phase 5).
+- **EKS endpoint posture** — landing-zone's committed tree is private-by-default and fail-closed: a public API endpoint with no allow-list is rejected at plan time (no `0.0.0.0/0` fallback). rackctl owns the fragile per-run input. `cluster.endpointPublicAccess` and `cluster.endpointAllowlist` ride `TF_VAR_cluster_endpoint_public_access(_cidrs)` into the cluster component (phase 3); a public endpoint with an empty allow-list auto-scopes to the operator's detected egress IP (`<ip>/32`), printed before it lands, and an explicit allow-list always wins.
 - **Service-quota deadlock** — fresh accounts cap ~32 vCPU (phase 0).
 - **Operator OCI chicken-and-egg** — empty chart registry on a fresh org (phase 6).
 - **Tenant app-seam ordering** — the 5-step `extraPolicyArns` dance (phase 9).

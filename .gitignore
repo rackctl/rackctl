@@ -3,4 +3,5 @@
 *.exe
 *.test
 .env
-rackctl.yaml
+# The operator's own live config at the repo root — NOT the committed examples/ template.
+/rackctl.yaml

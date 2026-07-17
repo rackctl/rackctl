@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 )
@@ -105,12 +106,20 @@ type Cluster struct {
 	// no default, because a shared default collides the moment a second cluster lands
 	// in one account and environment. Must not equal the environment token. Mirrors
 	// eks-fleet's Cluster.spec.clusterName and landing-zone's var.cluster_name.
-	Name                 string     `json:"name"`
-	Version              string     `json:"version"`
-	EndpointPublicAccess bool       `json:"endpointPublicAccess"` // prod should be false (needs bastion/VPN)
-	SystemNodes          NodeGroup  `json:"systemNodes"`
-	Network              ClusterNet `json:"network"`
-	TTLDays              int        `json:"ttlDays"` // eks-fleet auto-reap; 0 = persistent
+	Name                 string `json:"name"`
+	Version              string `json:"version"`
+	EndpointPublicAccess bool   `json:"endpointPublicAccess"` // prod should be false (needs bastion/VPN)
+	// EndpointAllowlist is the set of CIDR blocks permitted to reach the public EKS API
+	// endpoint. It rides TF_VAR_cluster_endpoint_public_access_cidrs into landing-zone's
+	// cluster component, whose committed tree is private-by-default and fail-closed: a
+	// public endpoint with no allow-list is rejected at plan time — there is no 0.0.0.0/0
+	// fallback. When EndpointPublicAccess is true and this is empty, the cluster phase
+	// auto-detects the operator's public egress IP and scopes the endpoint to <ip>/32.
+	// An explicit allow-list always wins over autodetection.
+	EndpointAllowlist []string   `json:"endpointAllowlist,omitempty"`
+	SystemNodes       NodeGroup  `json:"systemNodes"`
+	Network           ClusterNet `json:"network"`
+	TTLDays           int        `json:"ttlDays"` // eks-fleet auto-reap; 0 = persistent
 }
 
 // ClusterName is the resolved EKS cluster name, <environment>-<cluster.name> — the
@@ -272,6 +281,16 @@ func (c *Config) Validate() error {
 	}
 	if c.Environment == EnvProduction && c.Cluster.EndpointPublicAccess {
 		errs = append(errs, "cluster.endpointPublicAccess should be false for production (requires bastion/VPN)")
+	}
+	// Every allow-list entry must parse as a CIDR block: a malformed entry (a bare IP, a
+	// typo'd mask) would otherwise fail landing-zone's plan late and opaquely, or worse be
+	// injected verbatim onto the control plane's public endpoint. Catch it here. Entries are
+	// validated whenever present, regardless of endpointPublicAccess — an allow-list that is
+	// wrong is wrong even while it is unused.
+	for i, cidr := range c.Cluster.EndpointAllowlist {
+		if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
+			errs = append(errs, fmt.Sprintf("cluster.endpointAllowlist[%d] %q must be a CIDR block, e.g. 203.0.113.4/32", i, cidr))
+		}
 	}
 	if c.ControlPlane.EKSFleet && c.Org.GitOps.ClustersRepo == "" {
 		errs = append(errs, "org.gitops.clustersRepo is required when controlPlane.eksFleet is true")
