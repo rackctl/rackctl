@@ -1,11 +1,20 @@
 package phases
 
 import (
+	"io"
 	"slices"
 	"testing"
 
 	"github.com/rackctl/rackctl/internal/config"
+	"github.com/rackctl/rackctl/internal/engine"
+	"github.com/rackctl/rackctl/internal/exec"
 )
+
+// testState wraps a config in an engine.State whose runner discards notes, so the
+// TF_VAR builders (which print operator-facing notes) can be exercised without output.
+func testState(cfg *config.Config) *engine.State {
+	return &engine.State{Config: cfg, Runner: exec.New(io.Discard)}
+}
 
 // indexOf returns the position of c, or -1.
 func indexOf(comps []string, c string) int { return slices.Index(comps, c) }
@@ -189,6 +198,41 @@ func TestSubstrateComponents_IsSubsequenceOfCore(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The create-mode network levers ride TF_VAR_* onto landing-zone's network component,
+// same seam as TF_VAR_cluster_name — the committed live tree stays generic and rackctl
+// layers the per-run choice over it. When set, each lever must appear in the injected
+// env; IPAM pool id and netmask travel together.
+func TestClusterNetworkEnv_InjectsLeversWhenSet(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Cluster.Network = config.ClusterNet{
+		IPAMPoolID:        "ipam-pool-0abc123",
+		IPAMNetmaskLength: 18,
+		TransitGatewayID:  "tgw-0abc123",
+		CentralizedEgress: true,
+	}
+	env := clusterNetworkEnv(testState(cfg))
+	for _, want := range []string{
+		"TF_VAR_ipam_pool_id=ipam-pool-0abc123",
+		"TF_VAR_ipam_netmask_length=18",
+		"TF_VAR_transit_gateway_id=tgw-0abc123",
+		"TF_VAR_centralized_egress=true",
+	} {
+		if !slices.Contains(env, want) {
+			t.Errorf("network levers set but %q not injected; got %v", want, env)
+		}
+	}
+}
+
+// A day-0 hub with no levers set injects nothing — the committed tree's plain
+// literal-CIDR VPC with local NAT is left exactly as it stands.
+func TestClusterNetworkEnv_EmptyWhenLeversOff(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Cluster.Network = config.ClusterNet{VPCCIDR: "10.0.0.0/16", NATGateways: 1}
+	if env := clusterNetworkEnv(testState(cfg)); len(env) != 0 {
+		t.Errorf("no levers set, but TF_VARs were injected: %v", env)
 	}
 }
 

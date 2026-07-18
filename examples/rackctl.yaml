@@ -30,6 +30,18 @@ cluster:
   network:
     vpcCidr: 10.0.0.0/16
     natGateways: 1
+    # Create-mode levers, all off by default. Day-0 bootstrap is create mode only — the
+    # hub mints its own VPC (adopt is a spoke/eks-fleet concern, not rackctl's). These
+    # ride TF_VAR_* onto landing-zone's private-by-default network component at apply
+    # time, layered over the generic committed tree exactly like the endpoint posture.
+    # rackctl validates the combination up front, so a contradiction fails in a second
+    # here instead of ~20 minutes into a tofu apply. Uncomment to opt into the org's
+    # IPAM / transit-gateway topology:
+    #
+    # ipamPoolId: ipam-pool-0abc123   # draw the VPC CIDR from an IPAM pool instead of vpcCidr; leave vpcCidr at its default (mutually exclusive with a non-default vpcCidr)
+    # ipamNetmaskLength: 18           # netmask of the CIDR carved from the pool, 16–20 (required with ipamPoolId; subnets carve 8 bits smaller, so /20 is the smallest that clears AWS's /28 minimum)
+    # transitGatewayId: tgw-0abc123   # attach the VPC to a transit gateway (10.0.0.0/8 → TGW); requires an IPAM-allocated CIDR so prefixes never overlap
+    # centralizedEgress: true         # private default route via the TGW to a central egress VPC, zero local NAT gateways; requires transitGatewayId
   ttlDays: 0                      # eks-fleet auto-reap; 0 = persistent
 
 quotas:

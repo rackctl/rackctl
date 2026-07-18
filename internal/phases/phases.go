@@ -383,6 +383,12 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 	}
 	st.Runner.Env = append(st.Runner.Env, endpointEnv...)
 
+	// The create-mode network levers ride the same seam into landing-zone's network
+	// component (applied first, below). Off by default — a day-0 hub owns a plain
+	// literal-CIDR VPC unless the config opts it into IPAM / transit-gateway / centralized
+	// egress. Config validation has already rejected any contradictory combination.
+	st.Runner.Env = append(st.Runner.Env, clusterNetworkEnv(st)...)
+
 	note(st, "provisioning VPC then EKS control plane (network → cluster; strict ordering)")
 	for _, comp := range []string{"network", "cluster"} {
 		if err := apply(ctx, st, comp); err != nil {
