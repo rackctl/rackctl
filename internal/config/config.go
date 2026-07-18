@@ -15,6 +15,13 @@ import (
 // it becomes part of the EKS cluster name and the AWS resource names derived from it.
 var rfc1123Label = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$`)
 
+// defaultVPCCIDR is the literal CIDR a create-mode VPC uses when it is not drawn from an
+// IPAM pool. It doubles as the sentinel for "unset" in the ipamPoolId ⇄ vpcCidr mutual
+// exclusion: an IPAM-allocated VPC leaves vpcCidr at this default (the CIDR comes from the
+// pool, not the literal). landing-zone's network component defaults var.vpc_cidr to the
+// same value, so the two agree on what "not overridden" means.
+const defaultVPCCIDR = "10.0.0.0/16"
+
 // Provider is the target cloud. v1 supports AWS only.
 type Provider string
 
@@ -141,6 +148,38 @@ type NodeGroup struct {
 type ClusterNet struct {
 	VPCCIDR     string `json:"vpcCidr"`
 	NATGateways int    `json:"natGateways"`
+
+	// The four fields below are the create-mode network levers. They opt a day-0 hub out
+	// of the committed live tree's plain literal-CIDR VPC with local NAT and into the
+	// org's IPAM / transit-gateway topology. Each rides a TF_VAR_* onto landing-zone's
+	// network component at apply time (see internal/phases/network.go), same idiom as
+	// TF_VAR_cluster_name — the committed tree stays generic, rackctl layers the per-run
+	// choice over it. All default off (empty / 0 / false); day-0 bootstrap is create mode
+	// by definition (the hub mints its own VPC), so these are the only network levers, and
+	// the adopt path is an eks-fleet/spoke concern, out of rackctl's scope.
+	//
+	// Validate mirrors landing-zone's own create-mode preconditions so a contradictory
+	// combination fails here, in a second, instead of ~20 minutes into a tofu apply.
+
+	// IPAMPoolID draws the VPC CIDR from an IPAM pool instead of the literal VPCCIDR
+	// (cross-account, the org IPAM env sub-pool shared in over RAM). Empty = literal
+	// allocation. Mutually exclusive with a non-default VPCCIDR; requires
+	// IPAMNetmaskLength.
+	IPAMPoolID string `json:"ipamPoolId,omitempty"`
+	// IPAMNetmaskLength is the netmask of the CIDR allocated from IPAMPoolID (e.g. 16 for
+	// a /16). Between 16 and 20 when a pool is set — subnets are carved 8 bits smaller
+	// than the VPC block, so a /20 base is the smallest that still yields AWS's /28
+	// minimum subnet. 0 (default) when no pool is set.
+	IPAMNetmaskLength int `json:"ipamNetmaskLength,omitempty"`
+	// TransitGatewayID attaches the VPC to a transit gateway and routes 10.0.0.0/8 to it,
+	// so the VPC reaches the rest of the org's address space. Empty = no attachment,
+	// local NAT egress only. Requires an IPAM-allocated CIDR (IPAMPoolID) — a TGW route
+	// domain needs non-overlapping, IPAM-governed prefixes.
+	TransitGatewayID string `json:"transitGatewayId,omitempty"`
+	// CentralizedEgress routes the private default route (0.0.0.0/0) through the transit
+	// gateway to a central egress VPC instead of a local NAT gateway (zero NAT gateways).
+	// Requires TransitGatewayID — there is nothing to route egress to without one.
+	CentralizedEgress bool `json:"centralizedEgress,omitempty"`
 }
 
 type Quotas struct {
@@ -198,7 +237,7 @@ func Default() *Config {
 			Version:              "1.35",
 			EndpointPublicAccess: true,
 			SystemNodes:          NodeGroup{InstanceTypes: []string{"m7g.xlarge"}, MinSize: 2, MaxSize: 6, DesiredSize: 2},
-			Network:              ClusterNet{VPCCIDR: "10.0.0.0/16", NATGateways: 1},
+			Network:              ClusterNet{VPCCIDR: defaultVPCCIDR, NATGateways: 1},
 		},
 		Quotas: Quotas{AutoRequest: true, VCPU: 256},
 		Addons: Addons{Observability: true},
@@ -228,8 +267,15 @@ func (c *Config) ApplyDefaults() {
 	if len(c.Cluster.SystemNodes.InstanceTypes) == 0 {
 		c.Cluster.SystemNodes = d.Cluster.SystemNodes
 	}
+	// Default the two base fields individually, never the whole struct — replacing
+	// ClusterNet wholesale would wipe an IPAM/transit-gateway/egress lever set without a
+	// vpcCidr, which is exactly the natural IPAM config (the CIDR comes from the pool, so
+	// vpcCidr is left at its default).
 	if c.Cluster.Network.VPCCIDR == "" {
-		c.Cluster.Network = d.Cluster.Network
+		c.Cluster.Network.VPCCIDR = d.Cluster.Network.VPCCIDR
+	}
+	if c.Cluster.Network.NATGateways == 0 {
+		c.Cluster.Network.NATGateways = d.Cluster.Network.NATGateways
 	}
 	if c.Quotas.VCPU == 0 {
 		c.Quotas = d.Quotas
@@ -291,6 +337,40 @@ func (c *Config) Validate() error {
 		if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
 			errs = append(errs, fmt.Sprintf("cluster.endpointAllowlist[%d] %q must be a CIDR block, e.g. 203.0.113.4/32", i, cidr))
 		}
+	}
+	// create-mode network levers. rackctl day-0 bootstrap is always create mode (the hub
+	// mints its own VPC), so only landing-zone's create-mode preconditions apply — mirror
+	// them here so a contradictory combination fails in a second rather than ~20 minutes
+	// into a tofu apply, where the same conditions live as variable preconditions on
+	// landing-zone's network component.
+	n := c.Cluster.Network
+	switch {
+	case n.IPAMPoolID == "":
+		// No IPAM pool ⇒ literal allocation, which must not carry a netmask.
+		if n.IPAMNetmaskLength != 0 {
+			errs = append(errs, fmt.Sprintf("cluster.network.ipamNetmaskLength (%d) applies only with cluster.network.ipamPoolId set — leave it 0 for a literal-CIDR VPC", n.IPAMNetmaskLength))
+		}
+	default:
+		// A VPC CIDR comes from exactly one source: an IPAM pool OR a literal vpcCidr,
+		// never both. With a pool set, vpcCidr must stay at its default.
+		if n.VPCCIDR != "" && n.VPCCIDR != defaultVPCCIDR {
+			errs = append(errs, fmt.Sprintf("cluster.network.ipamPoolId and a non-default cluster.network.vpcCidr (%q) are mutually exclusive — with an IPAM pool the CIDR is drawn from the pool, so leave vpcCidr unset", n.VPCCIDR))
+		}
+		// An IPAM allocation needs a netmask, bounded 16–20: subnets are carved 8 bits
+		// smaller than the VPC block, so a /20 base is the smallest that still yields
+		// AWS's /28 minimum subnet.
+		if n.IPAMNetmaskLength < 16 || n.IPAMNetmaskLength > 20 {
+			errs = append(errs, fmt.Sprintf("cluster.network.ipamNetmaskLength must be between 16 and 20 when cluster.network.ipamPoolId is set, got %d — subnets are carved 8 bits smaller than the VPC block, so a base longer than /20 falls below AWS's /28 minimum", n.IPAMNetmaskLength))
+		}
+	}
+	// A transit-gateway attachment requires an IPAM-allocated CIDR — a raw literal vpcCidr
+	// can overlap another attached VPC and break TGW routing.
+	if n.TransitGatewayID != "" && n.IPAMPoolID == "" {
+		errs = append(errs, "cluster.network.transitGatewayId requires an IPAM-allocated CIDR (set cluster.network.ipamPoolId) — a literal vpcCidr can overlap another attached VPC and break transit-gateway routing")
+	}
+	// Centralized egress has nothing to route the default egress to without a TGW.
+	if n.CentralizedEgress && n.TransitGatewayID == "" {
+		errs = append(errs, "cluster.network.centralizedEgress requires cluster.network.transitGatewayId — there is nothing to route the private default egress to without a transit gateway")
 	}
 	if c.ControlPlane.EKSFleet && c.Org.GitOps.ClustersRepo == "" {
 		errs = append(errs, "org.gitops.clustersRepo is required when controlPlane.eksFleet is true")
