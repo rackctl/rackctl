@@ -1,7 +1,18 @@
 /rackctl
+/bin/
 /dist/
 *.exe
 *.test
 .env
 # The operator's own live config at the repo root — NOT the committed examples/ template.
 /rackctl.yaml
+
+# Local planning notes.
+#
+# Org-wide convention (nanohype/CLAUDE.md): a repo holds shipped artifacts, not working
+# notes. Campaign status, audit grades and remediation ledgers never live in a repo — a
+# committed record of what a repo scored and how it got fixed is exactly the accretion
+# evidence the greenfield doctrine exists to prevent. Every other org repo ignores this
+# path; rackctl did not, and had three plan files tracked. They now live outside the repo
+# with the rest of the corpus.
+.plans/
