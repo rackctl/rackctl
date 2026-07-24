@@ -59,6 +59,18 @@ dns:
 agentPlatform:
   enable: true
   bedrockModelFamilies: [anthropic, amazon-nova]
+  modelImport: false            # off by default. Applies landing-zone's model-import component, which provisions
+                                # ONLY the Bedrock Custom Model Import substrate for this account+region: the S3
+                                # staging bucket <account>-<region>-model-import, the import service role
+                                # model-import-<region>, and the SSM discovery parameters
+                                # /eks-agent-platform/model-import/{staging_bucket_name,import_role_arn}.
+                                # It imports NO model — that is a deliberate, infrequent, out-of-band human act
+                                # (eks-agent-platform/docs/runbooks/import-open-weight-model.md). Requires
+                                # agentPlatform.enable and a region where Custom Model Import runs (us-west-2,
+                                # us-east-1, us-east-2, eu-central-1); rackctl rejects the rest at validation,
+                                # because the component applies cleanly elsewhere and is silently unusable.
+                                # rackctl APPLIES this component but never DESTROYS it: it is account-scoped
+                                # substrate that outlives any one cluster.
   compliance:
     soc2: true
     hipaa: false
@@ -67,7 +79,12 @@ controlPlane:
   eksFleet: false                 # opt-in: Crossplane cluster control plane
   portal: false                   # opt-in: day-2 operator UI
 
-firstTenant:                      # optional smoke test
+firstTenant:                      # optional smoke test (phase 9). Vends this tenant from
+                                  # eks-agent-platform/charts/tenant into the eks-agent-platform namespace and
+                                  # waits for status.phase: Ready. It proves the vending + identity path only —
+                                  # charts/tenant cannot express spec.datastores, spec.identity.capabilities or
+                                  # spec.identity.directSecretReads, which is where a tenant's AWS grants now
+                                  # come from.
   name: blank
   persona: generic
   tenant: example

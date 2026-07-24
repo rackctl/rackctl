@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -227,8 +228,21 @@ var destroyCmd = &cobra.Command{
 		comps := phases.CoreComponents(cfg)
 		for i := len(comps) - 1; i >= 0; i-- {
 			c := comps[i]
-			fmt.Println(ui.Step("destroy " + c))
 			dir := fmt.Sprintf("live/aws/workload-%s/%s/%s/%s", env, cfg.Cloud.Region, env, c)
+			// Some components are applied but never destroyed — see phases.KeepOnDestroy.
+			// One behaviour, three call sites (this loop, substrate.Teardown, and
+			// preflight's stale-state check); the predicate is shared so the exclusion
+			// cannot be applied at one and forgotten at the others.
+			if phases.KeepOnDestroy(c) {
+				fmt.Println(ui.Skip("keep " + c + " — account+region-scoped Bedrock Custom Model Import substrate " +
+					"that outlives this cluster. Destroying it would delete a model another cluster may be serving, " +
+					"and its versioned bucket has no force_destroy so the destroy would fail on BucketNotEmpty and " +
+					"halt this teardown with the cluster still standing. Remove it deliberately: delete the imported " +
+					"model, empty the bucket, then `terragrunt --working-dir " +
+					filepath.Join(run.Dir, dir) + " destroy`"))
+				continue
+			}
+			fmt.Println(ui.Step("destroy " + c))
 			// init first — a destroy needs its modules installed exactly as much as an
 			// apply does. A stale .terragrunt-cache (it lives in the checkout and
 			// survives every run) makes tofu fail with "Module not installed" the moment

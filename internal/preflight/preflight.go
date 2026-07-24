@@ -174,6 +174,18 @@ func CheckStaleState(ctx context.Context, env *Env) doctor.Result {
 
 	var stale []string
 	for _, comp := range phases.CoreComponents(cfg) {
+		// A component rackctl deliberately never destroys will ALWAYS still hold state
+		// after a teardown — that is the entire point of it. Counting it as evidence of a
+		// partially torn-down platform would make this check fail forever after the first
+		// `rackctl destroy`, and because init --apply runs the preflight as a gate, it
+		// would refuse to provision ever again over a bucket it was designed to keep.
+		//
+		// CoreComponents is now read by three call sites (this one, substrate.Teardown,
+		// and cmd/misc.go's destroy loop); the keep-set has to reach all three, which is
+		// why it is a shared predicate and not a list restated per consumer.
+		if phases.KeepOnDestroy(comp) {
+			continue
+		}
 		key := fmt.Sprintf("%s/aws/workload-%s/%s/%s/%s/terraform.tfstate",
 			envName, envName, cfg.Cloud.Region, envName, comp)
 

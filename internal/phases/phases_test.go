@@ -81,6 +81,71 @@ func TestCoreComponents_DNSOnlyWithHostedZone(t *testing.T) {
 	}
 }
 
+func TestCoreComponents_ModelImportIsOptIn(t *testing.T) {
+	// It provisions account+region-scoped substrate an org may never want, and it is the
+	// one component rackctl applies but never destroys. It must never appear unasked.
+	if comps := CoreComponents(baseCfg()); indexOf(comps, "model-import") >= 0 {
+		t.Fatalf("model-import must be opt-in; got %v", comps)
+	}
+}
+
+func TestCoreComponents_ModelImportRequiresTheAgentPlatform(t *testing.T) {
+	// With the platform off there is no operator to reconcile a ModelGateway route, so
+	// the staging bucket, import role and SSM parameters would be dead weight. Config
+	// validation rejects the combination; CoreComponents must not build it either.
+	cfg := baseCfg()
+	cfg.AgentPlatform.ModelImport = true
+	if comps := CoreComponents(cfg); indexOf(comps, "model-import") < 0 {
+		t.Fatalf("model-import must be applied when agentPlatform.modelImport is set; got %v", comps)
+	}
+
+	off := false
+	cfg.AgentPlatform.Enable = &off
+	if comps := CoreComponents(cfg); indexOf(comps, "model-import") >= 0 {
+		t.Fatalf("model-import must not be applied when the agent platform is off; got %v", comps)
+	}
+}
+
+// The apply/destroy asymmetry, asserted in both directions.
+//
+// TestSubstrateComponents_IsSubsequenceOfCore covers the APPLY lists only and
+// structurally cannot catch a mistake here, so this is the only guard on the keep-set.
+//
+// model-import must be applied and never destroyed: it is account+region-scoped substrate
+// other clusters depend on, and its versioned bucket has no force_destroy, so a destroy
+// after any weights are staged fails BucketNotEmpty and halts the reverse teardown with
+// the cluster still standing and billing.
+//
+// And nothing else may join it. If `cluster` or `network` ever entered the keep-set, a
+// failed init would leave a VPC and an EKS control plane billing forever — which is the
+// exact outcome the reverse teardown exists to prevent.
+func TestModelImport_IsAppliedButNeverDestroyed(t *testing.T) {
+	cfg := baseCfg()
+	cfg.AgentPlatform.ModelImport = true
+
+	if indexOf(substrateComponents(cfg), "model-import") < 0 {
+		t.Fatalf("the substrate phase must apply model-import; got %v", substrateComponents(cfg))
+	}
+	if !KeepOnDestroy("model-import") {
+		t.Error("model-import must survive teardown: it is account+region-scoped substrate that outlives " +
+			"any one cluster, and its versioned bucket would wedge the destroy on BucketNotEmpty")
+	}
+
+	all := baseCfg()
+	all.Addons.Observability = true
+	all.DNS = &config.DNS{HostedZone: "example.com"}
+	all.AgentPlatform.ModelImport = true
+	for _, c := range CoreComponents(all) {
+		if c == "model-import" {
+			continue
+		}
+		if KeepOnDestroy(c) {
+			t.Errorf("%q must NOT be in the keep-set — a component rackctl builds and refuses to destroy "+
+				"strands billable resources after a failed init", c)
+		}
+	}
+}
+
 func TestCoreComponents_NetworkFirst(t *testing.T) {
 	cfg := baseCfg()
 	cfg.Addons.Observability = true
@@ -149,6 +214,7 @@ func TestPhases_SubstrateBeforeGitOps(t *testing.T) {
 		"defaults":      baseCfg(),
 		"observability": func() *config.Config { c := baseCfg(); c.Addons.Observability = true; return c }(),
 		"dns":           func() *config.Config { c := baseCfg(); c.DNS = &config.DNS{HostedZone: "x.com"}; return c }(),
+		"model-import":  func() *config.Config { c := baseCfg(); c.AgentPlatform.ModelImport = true; return c }(),
 	} {
 		sc := substrateComponents(cfg)
 		if indexOf(sc, "cluster-addons") == -1 {
@@ -171,6 +237,7 @@ func TestSubstrateComponents_IsSubsequenceOfCore(t *testing.T) {
 			c := baseCfg()
 			c.Addons.Observability = true
 			c.DNS = &config.DNS{HostedZone: "example.com"}
+			c.AgentPlatform.ModelImport = true
 			return c
 		}(),
 	} {
