@@ -37,6 +37,14 @@ func TestValidate(t *testing.T) {
 			c.Cluster.Network.IPAMNetmaskLength = 16
 			c.Cluster.Network.VPCCIDR = "10.20.0.0/16"
 		},
+		"modelImport in a region without Custom Model Import": func(c *Config) {
+			c.AgentPlatform.ModelImport = true
+			c.Cloud.Region = "eu-west-1"
+		},
+		"modelImport with the agent platform off": func(c *Config) {
+			c.AgentPlatform.ModelImport = true
+			c.AgentPlatform.Enable = boolPtr(false)
+		},
 	}
 	for name, mutate := range cases {
 		c := valid()
@@ -128,6 +136,42 @@ func TestValidate_NetworkLevers(t *testing.T) {
 				t.Errorf("%s: expected validation error, got nil", name)
 			}
 		})
+	}
+}
+
+// The model-import gate mirrors the runbook's regional precondition, so a staging bucket
+// and an import role that no CreateModelImportJob could ever use fail in rackctl's
+// validation in a second — rather than applying perfectly cleanly and being discovered
+// dead by a human halfway through an import, which is what Terraform would do.
+func TestValidate_ModelImport(t *testing.T) {
+	// The supported case: the gate on, in a region where Custom Model Import runs.
+	c := valid() // Default() puts the region at us-west-2
+	c.AgentPlatform.ModelImport = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("modelImport in a Custom Model Import region must validate: %v", err)
+	}
+
+	c = valid()
+	c.AgentPlatform.ModelImport = true
+	c.Cloud.Region = "eu-west-1"
+	if err := c.Validate(); err == nil {
+		t.Error("modelImport outside a Custom Model Import region must be rejected — the component applies " +
+			"cleanly there and is permanently unusable")
+	}
+
+	c = valid()
+	c.AgentPlatform.ModelImport = true
+	c.AgentPlatform.Enable = boolPtr(false)
+	if err := c.Validate(); err == nil {
+		t.Error("modelImport with the agent platform off must be rejected — nothing would consume the substrate")
+	}
+
+	// The region rule must bite ONLY when the gate is on. An org that runs in a region
+	// without Custom Model Import must never be blocked by a feature it did not ask for.
+	c = valid()
+	c.Cloud.Region = "eu-west-1"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a region without Custom Model Import must validate when modelImport is off: %v", err)
 	}
 }
 

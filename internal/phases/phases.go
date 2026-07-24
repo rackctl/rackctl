@@ -23,8 +23,8 @@ import (
 // CoreComponents returns the landing-zone apply order for the core path; destroy
 // runs it in reverse.
 //
-// The list is derived from the config rather than fixed, because three components
-// are conditional and the old fixed list omitted all three — so a config that asked
+// The list is derived from the config rather than fixed, because four components
+// are conditional and the old fixed list omitted three of them — so a config that asked
 // for them applied nothing, and the cluster came up subtly broken:
 //
 //   - agent-iam creates the eks-agent-platform operator's IAM role. Without it the
@@ -40,8 +40,22 @@ import (
 //
 //   - dns creates the hosted zone + external-dns identity; gated on a dns block.
 //
-// Ordering is load-bearing and is NOT enforced by terragrunt (these roots declare
-// no dependency blocks) — this slice is the only thing that sequences them.
+//   - model-import provisions the account+region substrate for Bedrock Custom Model
+//     Import — an S3 staging bucket and the IAM role Bedrock assumes during a
+//     CreateModelImportJob. Unlike managed-monitoring, its POSITION here is not
+//     load-bearing: its live leaf declares no terragrunt dependency, the component reads
+//     only aws_caller_identity and aws_partition, and nothing on the platform resolves
+//     its SSM parameters programmatically (only the human import runbook does). It sits
+//     last among the conditionals for readability, and a future reader may move it. It is
+//     gated because it is account-scoped substrate an org may never want — and it is the
+//     one component here that rackctl applies but must never destroy (see KeepOnDestroy).
+//
+// Ordering is load-bearing and terragrunt's own dependency graph does not express it:
+// the orderings that matter here are substrate-before-consumer (cluster-addons' Pod
+// Identity associations before ArgoCD deploys the pods that need them; managed-monitoring's
+// SSM parameters before cluster-bootstrap reads them), and no `dependency` block in these
+// roots encodes that. This slice, plus the phase boundary that splits it, is what
+// sequences them.
 func CoreComponents(cfg *config.Config) []string {
 	comps := []string{"network", "cluster", "secrets"}
 	if cfg.AgentPlatform.Enabled() {
@@ -53,6 +67,9 @@ func CoreComponents(cfg *config.Config) []string {
 	if cfg.DNS != nil && cfg.DNS.HostedZone != "" {
 		comps = append(comps, "dns")
 	}
+	if cfg.AgentPlatform.Enabled() && cfg.AgentPlatform.ModelImport {
+		comps = append(comps, "model-import")
+	}
 
 	// cluster-addons before cluster-bootstrap. This documents the order; the two are
 	// APPLIED by different phases (substrate and gitops respectively), and it is that phase
@@ -61,6 +78,34 @@ func CoreComponents(cfg *config.Config) []string {
 	// (Pod Identity is injected at pod admission) and why it must be structural.
 	return append(comps, "cluster-addons", "cluster-bootstrap")
 }
+
+// keepOnDestroy is the set of landing-zone components rackctl applies but must never
+// destroy. It is the one place the apply path and the destroy path deliberately
+// disagree, and it exists because two distinct things go wrong otherwise.
+//
+// The first is a contract violation. model-import is account-and-region scoped, not
+// cluster scoped, and its component header says so outright: an imported Bedrock model
+// is an account+region resource that outlives any one cluster, and "tearing a cluster
+// down must not orphan or destroy a model another cluster is serving". A rollback of a
+// failed init would delete the staging bucket, the import role, and the two SSM
+// parameters every future import job resolves — for the whole account, including for
+// clusters rackctl never built.
+//
+// The second is worse, because it strands money. The staging bucket is versioned and
+// carries no force_destroy, so the moment any weights are staged `terragrunt destroy`
+// fails with BucketNotEmpty. In a reverse teardown that error HALTS the loop partway,
+// leaving the EKS cluster, the VPC and its NAT gateways standing and billing — the exact
+// outcome the reverse teardown exists to prevent.
+//
+// This is the same judgement as NoRollbackError: some things must not be demolished by
+// an automated unwind. And because CoreComponents is read by the destroy path as well as
+// the apply path, the exclusion lives here and is consulted by both call sites rather
+// than being restated in either — restating a component list is what let three
+// conditional components silently go unapplied once.
+var keepOnDestroy = map[string]bool{"model-import": true}
+
+// KeepOnDestroy reports whether a component must survive rackctl's teardown.
+func KeepOnDestroy(component string) bool { return keepOnDestroy[component] }
 
 // All returns the ordered bootstrap pipeline. Phases 0–6 are the core
 // 0→running path (AWS-only, v1); 7–9 are opt-in layers.
@@ -307,7 +352,7 @@ func forkOrSync(ctx context.Context, st *engine.State, org string) error {
 	fork := org + "/eks-gitops"
 
 	if _, err := st.Runner.Capture(ctx, "gh", "repo", "view", fork, "--json", "name"); err != nil || st.Runner.DryRun {
-		note(st, "forking nanohype/eks-gitops → %s (the operator owns the addon catalog for IRSA writeback)", fork)
+		note(st, "forking nanohype/eks-gitops → %s (ArgoCD syncs the catalog from the org's fork, never upstream)", fork)
 		return st.Runner.Run(ctx, "gh", "repo", "fork", "nanohype/eks-gitops",
 			"--org", org, "--fork-name", "eks-gitops", "--clone=false")
 	}
@@ -344,9 +389,14 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 	// phase can install from the local chart (mirrors the operator fallback).
 	if st.Config.ControlPlane.Portal {
 		note(st, "cloning nanohype/portal (day-2 UI) for its local chart")
-		return cloneOrUpdate(ctx, st, "https://github.com/nanohype/portal.git", st.Repos.Portal)
+		if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/portal.git", st.Repos.Portal); err != nil {
+			return err
+		}
 	}
-	return nil
+	// Every component this config will apply must have a live root in the tree just
+	// cloned. This is the first phase at which a tree exists to check, and the last
+	// before anything is provisioned.
+	return assertComponentRoots(st)
 }
 
 // --- Phase 2: identity & state backend ---
@@ -355,7 +405,8 @@ type identity struct{ base }
 func (identity) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	c := st.Config
-	note(st, "generating account.hcl (account %s) and the versioned S3 tfstate backend", c.Cloud.AccountID)
+	note(st, "creating the versioned, encrypted, public-access-blocked S3 tfstate backend %s-%s-tfstate",
+		c.Cloud.AccountID, c.Cloud.Region)
 	return st.Runner.Run(ctx, "scripts/init-backend-aws.sh", c.Cloud.AccountID, c.Cloud.Region)
 }
 
@@ -419,8 +470,10 @@ type bootstrap struct{ base }
 // substrateComponents is the AWS substrate the GitOps layer consumes: every landing-zone
 // component ArgoCD depends on but that does not itself need ArgoCD. Derived from
 // CoreComponents (never restated) so the conditional components (agent-iam,
-// managed-monitoring, dns) can only ever be applied in the one order CoreComponents
-// documents — restating the list is what let those three silently go missing once.
+// managed-monitoring, dns, model-import) can only ever be applied in the one order
+// CoreComponents documents — restating the list is what let three of them silently go
+// missing once. model-import is the one member of this set excluded from the reverse
+// teardown; see KeepOnDestroy.
 //
 // It is CoreComponents minus the components other phases own: network and cluster (the
 // cluster phase), and cluster-bootstrap (the gitops phase — ArgoCD is the CONSUMER of the
@@ -464,6 +517,30 @@ type substrate struct{ base }
 func (substrate) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	note(st, "building the AWS substrate the catalog consumes (IAM, Pod Identity, buckets, monitoring)")
+
+	// Say exactly what model-import provisions, and — more importantly — what it does
+	// not. It is easy to read "model import is on" as "an open-weight model will work",
+	// and three separate things stand between here and that. The import itself is an
+	// out-of-band human act. landing-zone's agent-iam expands a tenant's Bedrock grant
+	// only to foundation-model and inference-profile ARNs, and its own variable doc says
+	// custom/imported models are not matched. And independently, the operator's
+	// bedrock-model-scoping inline policy is a Deny whose NotResource is that same
+	// expanded list, so it excludes an imported-model ARN even if the baseline allowed
+	// it. An `imported` ModelGateway route therefore gets AccessDenied at InvokeModel
+	// until BOTH repos change — which is why the note names both rather than implying
+	// one upstream fix is enough.
+	if st.Config.AgentPlatform.ModelImport {
+		note(st, "model-import: provisioning the Bedrock Custom Model Import substrate for account %s / %s only — "+
+			"the S3 staging bucket %s-%s-model-import, the import service role model-import-%s, and the SSM discovery "+
+			"parameters /eks-agent-platform/model-import/{staging_bucket_name,import_role_arn}. It imports NO model: that "+
+			"is a deliberate out-of-band step (eks-agent-platform/docs/runbooks/import-open-weight-model.md). Nor does a "+
+			"tenant reach an imported model yet — landing-zone's agent-iam baseline cannot express an imported-model ARN, "+
+			"and the operator's own bedrock-model-scoping policy denies everything outside the foundation-model and "+
+			"inference-profile ARNs it expands, so an imported route needs a coordinated change in both repos",
+			st.Config.Cloud.AccountID, st.Config.Cloud.Region,
+			st.Config.Cloud.AccountID, st.Config.Cloud.Region, st.Config.Cloud.Region)
+	}
+
 	for _, comp := range substrateComponents(st.Config) {
 		if err := apply(ctx, st, comp); err != nil {
 			return err
@@ -481,15 +558,32 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 	// here, there is nothing to correct.
 	env := string(st.Config.Environment)
 	if st.Runner.DryRun {
-		note(st, "FOOTGUN GUARD: (apply) substitutes the account id into eks-gitops/addons/*/values-%s.yaml, then commits & pushes the fork", env)
+		note(st, "account-id writeback: (apply) scans eks-gitops/addons/**/values-%s.yaml for %s placeholders and, "+
+			"if any are found, commits & pushes the fork. The current catalog carries none — it is public, so addons "+
+			"bind their IAM roles through EKS Pod Identity and the one ApplicationSet that needs a role ARN reads it "+
+			"from an annotation on the ArgoCD cluster Secret", env, gitops.Placeholder)
 		return nil
 	}
-	note(st, "IRSA writeback: substituting account id into eks-gitops/addons/*/values-%s.yaml", env)
+	note(st, "account-id writeback: scanning eks-gitops/addons/**/values-%s.yaml", env)
 	n, changed, err := gitops.WriteBack(st.Repos.EKSGitops, env, st.Config.Cloud.AccountID)
 	if err != nil {
 		return err
 	}
-	note(st, "replaced %d placeholder(s) across %d file(s)", n, len(changed))
+	// Zero matches is the NORMAL case against the current catalog, and saying "replaced 0
+	// placeholder(s)" invites the reader to think something went wrong. Nothing did: the
+	// catalog is public, so it commits no account id at all. Almost every addon binds its
+	// IAM role through EKS Pod Identity, which needs no ARN in the values; the one that
+	// does need an ARN reads it from an annotation cluster-bootstrap stamps on the ArgoCD
+	// cluster Secret. The writeback substitutes into whatever DOES carry a placeholder,
+	// which against this catalog is nothing.
+	if n == 0 {
+		note(st, "no %s placeholders in the fork — the current catalog commits no account id: addons bind their "+
+			"IAM roles through EKS Pod Identity, and the one ApplicationSet that needs a role ARN templates it from "+
+			"an annotation cluster-bootstrap stamps on the ArgoCD cluster Secret. Nothing to write back, nothing to "+
+			"push", gitops.Placeholder)
+	} else {
+		note(st, "replaced %d placeholder(s) across %d file(s)", n, len(changed))
+	}
 	if len(changed) > 0 {
 		st.Runner.Dir = st.Repos.EKSGitops
 		// Stage by name (never `git add -A`).
@@ -511,7 +605,17 @@ func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	comps := substrateComponents(st.Config)
 	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply
-		if err := destroy(ctx, st, comps[i]); err != nil {
+		c := comps[i]
+		if KeepOnDestroy(c) {
+			note(st, "keeping %s — it is account+region-scoped substrate (the Bedrock Custom Model Import staging "+
+				"bucket, import role and SSM discovery parameters) that outlives any one cluster. Destroying it here "+
+				"would delete a model another cluster may be serving, and the versioned bucket has no force_destroy so "+
+				"the destroy would fail on BucketNotEmpty and halt this teardown with the cluster still standing. To "+
+				"remove it deliberately: delete the imported model, empty the bucket, then "+
+				"`terragrunt --working-dir %s destroy`", c, filepath.Join(st.Repos.LandingZone, componentDir(st, c)))
+			continue
+		}
+		if err := destroy(ctx, st, c); err != nil {
 			return err
 		}
 	}
@@ -662,18 +766,92 @@ func (portal) Teardown(ctx context.Context, st *engine.State) error {
 }
 
 // --- Phase 9 (optional): first-tenant smoke test ---
+
+// tenantControlPlaneNamespace is where charts/tenant plants a tenant's control-plane CRs.
+//
+// It is the chart's `controlPlaneNamespace` VALUE that decides this — not the Helm
+// release namespace. The Platform, BudgetPolicy, ModelGateway, AgentFleet and EvalSuite
+// templates all set `namespace: {{ .Values.controlPlaneNamespace | default
+// .Release.Namespace }}`, and the value defaults to eks-agent-platform. So rackctl
+// passes the same string as `--namespace` AND as `--set controlPlaneNamespace=`: pinning
+// only one leaves the other free to drift, and the two disagreeing is precisely how a
+// namespace-blind `kubectl wait` ends up looking for a Platform in the kubeconfig's
+// current namespace and failing NotFound against a tenant that is up and healthy.
+const tenantControlPlaneNamespace = "eks-agent-platform"
+
+// smoke vends the first tenant from eks-agent-platform's charts/tenant and waits for the
+// operator to reconcile it. It is the end-to-end proof that the platform can actually
+// take a tenant, which is the thing every earlier phase was building toward.
+//
+// Two traps live in these three lines, and this phase fell into both.
+//
+// The chart's values are nested under `platform.` — platform.name, platform.tenant,
+// platform.persona. rackctl used to pass bare `tenant=` and `persona=`, and never passed
+// platform.name at all. Helm accepts unknown --set paths silently, so those became three
+// orphan values no template reads, and the render died on the chart's own
+// `fail "platform.name is required"` guard before a single object was created. Silence is
+// why it survived: --set on a path nothing reads produces no warning, and the phase is
+// opt-in, so an install that never enabled a firstTenant looked entirely healthy.
+//
+// And a Platform never gets a `Ready` CONDITION. The operator reports readiness as
+// status.phase == "Ready" (that is what the CRD's printcolumn reads); the only conditions
+// it ever writes are Suspended, ModelAccessScoped, NamespaceReady and VClusterReady.
+// `kubectl wait --for=condition=Ready` therefore cannot ever be satisfied — it blocks for
+// the entire 15-minute timeout and then fails the phase against a tenant that came up
+// fine, which is the worst possible shape for a failure: the platform works, and the tool
+// that just built it says it does not.
 type smoke struct{ base }
 
 func (smoke) Run(ctx context.Context, st *engine.State) error {
 	ft := st.Config.FirstTenant
+	ns := tenantControlPlaneNamespace
 	st.Runner.Dir = st.Repos.AgentPlatform
-	note(st, "installing first tenant %q (persona=%s) from charts/tenant, then waiting for Ready", ft.Name, ft.Persona)
-	if err := st.Runner.Run(ctx, "helm", "upgrade", "--install", ft.Name, "charts/tenant",
-		"--set", "tenant="+ft.Tenant,
-		"--set", "persona="+ft.Persona,
-		"--set", fmt.Sprintf("budget.monthlyUsd=%d", ft.MonthlyBudgetUSD)); err != nil {
+
+	note(st, "vending first tenant %q (tenant=%s persona=%s, $%d/mo) from charts/tenant into %s",
+		ft.Name, ft.Tenant, ft.Persona, ft.MonthlyBudgetUSD, ns)
+	note(st, "this proves the vending + identity path only: charts/tenant emits displayName/persona/tenant/"+
+		"isolation/budget/identity.{allowedModelFamilies,extraPolicyArns}/compliance, and cannot express "+
+		"spec.datastores, spec.identity.capabilities or spec.identity.directSecretReads — so the tenant's AWS "+
+		"datastore and capability grants are not exercised here")
+
+	// The config's model boundary and compliance flags must reach the tenant, not just
+	// the operator's IAM. charts/tenant exposes exactly the matching paths, and passing
+	// neither would vend the first tenant against the chart's own defaults — so a config
+	// declaring `hipaa: true` or a narrowed model family would produce a Platform that
+	// silently contradicts it. Rendering a tenant that disagrees with the config that
+	// asked for it is the failure class this repo exists to kill, and it is worse here
+	// than anywhere: phase 9 is the run's proof that vending works.
+	args := []string{"upgrade", "--install", ft.Name, "charts/tenant",
+		"--namespace", ns,
+		"--set", "controlPlaneNamespace=" + ns,
+		"--set", "platform.name=" + ft.Name,
+		"--set", "platform.tenant=" + ft.Tenant,
+		"--set", "platform.persona=" + ft.Persona,
+		"--set", fmt.Sprintf("budget.monthlyUsd=%d", ft.MonthlyBudgetUSD),
+		"--set", fmt.Sprintf("platform.compliance.soc2=%t", st.Config.AgentPlatform.Compliance.SOC2),
+		"--set", fmt.Sprintf("platform.compliance.hipaa=%t", st.Config.AgentPlatform.Compliance.HIPAA),
+	}
+	// helm's --set parses commas as list separators, so a families list rides the
+	// {a,b} literal form rather than repeated --set calls.
+	if fams := st.Config.AgentPlatform.BedrockModelFamilies; len(fams) > 0 {
+		args = append(args, "--set", "identity.allowedModelFamilies={"+strings.Join(fams, ",")+"}")
+	}
+	if err := st.Runner.Run(ctx, "helm", args...); err != nil {
 		return err
 	}
-	return st.Runner.Run(ctx, "kubectl", "wait", "--for=condition=Ready",
-		"platform/"+ft.Name, "--timeout=15m")
+	return st.Runner.Run(ctx, "kubectl", "-n", ns, "wait",
+		"--for=jsonpath={.status.phase}=Ready", "platform/"+ft.Name, "--timeout=15m")
+}
+
+// Teardown removes the tenant BEFORE the substrate underneath it goes away.
+//
+// This is load-bearing, not tidiness. The engine tears completed phases down in reverse,
+// so deleting the Platform here happens while the operator is still running — which is
+// the only time its finalizer can drop the per-tenant IAM role. If that role survives,
+// the substrate phase's `terragrunt destroy` of agent-iam fails on DeleteConflict trying
+// to delete the tenant baseline policy the role attaches, and a teardown that cannot run
+// is how a half-built platform stays billing. Mirrors portal.Teardown.
+func (smoke) Teardown(ctx context.Context, st *engine.State) error {
+	return st.Runner.Run(ctx, "helm", "uninstall", st.Config.FirstTenant.Name,
+		"-n", tenantControlPlaneNamespace, "--ignore-not-found")
 }

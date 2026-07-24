@@ -103,6 +103,52 @@ exit 0`)
 	}
 }
 
+// A component rackctl never destroys must never count as evidence of a partial teardown.
+//
+// model-import is applied but excluded from every destroy path (phases.KeepOnDestroy),
+// because it is account+region-scoped substrate that outlives any one cluster. So after a
+// perfectly clean `rackctl destroy --apply` its tfstate is still there, holding real
+// resources, with no cluster — which is exactly the shape this check fails on.
+//
+// Without the filter that is not a one-off warning: `init --apply` runs the preflight as
+// a gate and refuses to provision when it fails, so rackctl would have permanently
+// refused to build another platform in that account over a bucket it was designed to
+// keep. This test is the only thing standing between the keep-set and that state; the
+// two other CoreComponents consumers (substrate.Teardown, cmd/misc.go) are covered by
+// TestModelImport_IsAppliedButNeverDestroyed in internal/phases.
+func TestCheckStaleState_IgnoresComponentsThatAreNeverDestroyed(t *testing.T) {
+	// Every s3 cp returns state holding resources, and the cluster is gone — so the
+	// verdict turns entirely on WHICH components the check walks.
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "eks describe-cluster") exit 1 ;;
+  "s3 cp")                echo '{"resources":[{"type":"aws_s3_bucket"},{"type":"aws_iam_role"}]}' ;;
+  *)                      echo "" ;;
+esac
+exit 0`)
+
+	env := testEnv()
+	env.Cfg.AgentPlatform.Enable = boolPtrT(false) // strip every other component from the list
+	env.Cfg.AgentPlatform.ModelImport = false
+	if r := CheckStaleState(context.Background(), env); r.Status != doctor.Fail {
+		t.Fatalf("precondition: with real components holding state and no cluster the check must fail; got %s", r.Status)
+	}
+
+	// Now the ONLY component whose state is found is one that is never destroyed.
+	if strings.Contains(CheckStaleState(context.Background(), env).Detail, "model-import") {
+		t.Fatal("precondition: model-import must not be in the component list yet")
+	}
+	env.Cfg.AgentPlatform.Enable = nil // agent platform back on
+	env.Cfg.AgentPlatform.ModelImport = true
+	if d := CheckStaleState(context.Background(), env).Detail; strings.Contains(d, "model-import") {
+		t.Errorf("model-import is never destroyed, so its surviving state is expected and must not be "+
+			"reported as a partially torn-down platform — this failure gates init --apply, so it would "+
+			"block every future provision in the account:\n%s", d)
+	}
+}
+
+func boolPtrT(b bool) *bool { return &b }
+
 // The same state is correct when the cluster exists — that is a re-apply, not a bug.
 // Without this, preflight would block every legitimate update.
 func TestCheckStaleState_OKWhenTheClusterIsLive(t *testing.T) {

@@ -1,6 +1,14 @@
 // Package gitops implements the file-level rewrites rackctl performs against the
-// operator's eks-gitops fork — most importantly the IRSA account-id writeback,
-// the single biggest manual footgun in the current install flow.
+// operator's eks-gitops fork — the account-id writeback into the addon values files.
+//
+// The upstream catalog commits no account id at all: it is public, addons bind their
+// IAM roles through EKS Pod Identity (which needs no ARN in the values), and the one
+// ApplicationSet that does need a role ARN templates it from an annotation
+// cluster-bootstrap stamps on the ArgoCD cluster Secret. So against upstream this
+// writeback substitutes nothing, and the substrate phase says so rather than reporting
+// a bare zero. It rewrites whatever DOES carry a placeholder, which is what makes a
+// fork the org has taken ownership of — the entire reason rackctl forks the catalog —
+// safe to hand-edit with a literal account id.
 package gitops
 
 import (
@@ -10,9 +18,10 @@ import (
 	"strings"
 )
 
-// Placeholder is the dummy account id that landing-zone leaves in the eks-gitops
-// addon values files (e.g. arn:aws:iam::000000000000:role/...). rackctl replaces
-// it with the real account id after the cluster-addons apply.
+// Placeholder is the dummy account id an addon values file uses to stand in for the
+// real one (e.g. arn:aws:iam::000000000000:role/...). rackctl replaces it with the
+// account id after the cluster-addons apply, so the catalog ArgoCD clones in the next
+// phase already resolves to this account.
 const Placeholder = "000000000000"
 
 // SubstituteAccountID replaces every Placeholder occurrence with accountID and

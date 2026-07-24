@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -21,6 +22,20 @@ var rfc1123Label = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$`)
 // pool, not the literal). landing-zone's network component defaults var.vpc_cidr to the
 // same value, so the two agree on what "not overridden" means.
 const defaultVPCCIDR = "10.0.0.0/16"
+
+// bedrockCustomModelImportRegions are the regions Bedrock Custom Model Import runs in.
+//
+// This mirrors eks-agent-platform/docs/runbooks/import-open-weight-model.md
+// ("Prerequisites"). An imported model is an account+region resource that must be
+// imported into the region it is served from, so a staging bucket and an import role
+// provisioned anywhere else are permanently unusable — and, critically, provisioning
+// them there APPLIES CLEANLY. Terraform has no opinion about which regions Bedrock
+// offers the feature in; the failure surfaces much later, at CreateModelImportJob, to
+// a human following the runbook.
+//
+// The list is an AWS-side moving target. If AWS adds a region, update the runbook
+// first — it is the source of truth — and then this list.
+var bedrockCustomModelImportRegions = []string{"us-west-2", "us-east-1", "us-east-2", "eu-central-1"}
 
 // Provider is the target cloud. v1 supports AWS only.
 type Provider string
@@ -200,9 +215,31 @@ type DNS struct {
 type AgentPlatform struct {
 	// Enable installs the agent platform. Omitted (nil) defaults to true — it is
 	// the whole point of the platform; set it false to explicitly opt out.
-	Enable               *bool      `json:"enable,omitempty"`
-	BedrockModelFamilies []string   `json:"bedrockModelFamilies"`
-	Compliance           Compliance `json:"compliance"`
+	Enable               *bool    `json:"enable,omitempty"`
+	BedrockModelFamilies []string `json:"bedrockModelFamilies"`
+
+	// ModelImport applies landing-zone's model-import component: the account+region
+	// substrate Bedrock Custom Model Import needs, and nothing else. That is the S3
+	// staging bucket <account>-<region>-model-import where Hugging Face-format weights
+	// land, the IAM service role model-import-<region> that Bedrock assumes to read them
+	// during a CreateModelImportJob, and two SSM discovery parameters under
+	// /eks-agent-platform/model-import/.
+	//
+	// It imports NO model. Importing is a deliberate, infrequent, account-level act run
+	// out of band by a human (eks-agent-platform/docs/runbooks/import-open-weight-model.md),
+	// and rackctl deliberately does not automate it: the Concurrent-model-import-jobs
+	// quota is a hard 1 and is not adjustable, and a freshly created import role fails
+	// CreateModelImportJob with the misleading "The provided role ARN is invalid" for
+	// several minutes while its trust propagates. Neither fits a day-0 installer's
+	// failure model — but pre-provisioning the substrate takes that propagation window
+	// off the human's path later, which is exactly what a day-0 installer is for.
+	//
+	// Off by default: it is account-scoped substrate an org may never want. And because
+	// the substrate outlives any one cluster, rackctl applies it but NEVER destroys it —
+	// see phases.KeepOnDestroy.
+	ModelImport bool `json:"modelImport"`
+
+	Compliance Compliance `json:"compliance"`
 }
 
 // Enabled reports whether the agent platform should be installed. An omitted
@@ -371,6 +408,26 @@ func (c *Config) Validate() error {
 	// Centralized egress has nothing to route the default egress to without a TGW.
 	if n.CentralizedEgress && n.TransitGatewayID == "" {
 		errs = append(errs, "cluster.network.centralizedEgress requires cluster.network.transitGatewayId — there is nothing to route the private default egress to without a transit gateway")
+	}
+	// model-import. Both rules exist for the same reason the network levers above do:
+	// the component APPLIES CLEANLY in either wrong configuration and is silently
+	// useless afterwards, so the only place the mistake can be caught cheaply is here.
+	if c.AgentPlatform.ModelImport {
+		if !c.AgentPlatform.Enabled() {
+			errs = append(errs, "agentPlatform.modelImport requires the agent platform, but agentPlatform.enable is false — "+
+				"the model-import substrate exists so a ModelGateway route can reference an imported-model ARN, and its "+
+				"discovery parameters live under /eks-agent-platform/model-import/. With the platform off there is no "+
+				"operator to reconcile that route, so the staging bucket, the import role and the two SSM parameters would "+
+				"be account substrate nothing on this platform can consume")
+		}
+		if !slices.Contains(bedrockCustomModelImportRegions, c.Cloud.Region) {
+			errs = append(errs, fmt.Sprintf("agentPlatform.modelImport is set but cloud.region %q is not one of %s — Bedrock "+
+				"Custom Model Import runs only in those regions, and an imported model is an account+region resource that "+
+				"must be imported into the region it is served from. Applying model-import elsewhere SUCCEEDS in Terraform "+
+				"and silently produces a staging bucket and an import service role that no CreateModelImportJob can ever "+
+				"use (region list mirrors eks-agent-platform/docs/runbooks/import-open-weight-model.md; update the runbook "+
+				"first)", c.Cloud.Region, strings.Join(bedrockCustomModelImportRegions, ", ")))
+		}
 	}
 	if c.ControlPlane.EKSFleet && c.Org.GitOps.ClustersRepo == "" {
 		errs = append(errs, "org.gitops.clustersRepo is required when controlPlane.eksFleet is true")
