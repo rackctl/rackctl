@@ -273,8 +273,9 @@ type Addons struct {
 
 // ObservabilityTier selects which observability substrate a cluster runs. It mirrors
 // landing-zone's cluster-bootstrap var.observability_tier, which publishes it as the
-// `observability/tier` label on the ArgoCD cluster Secret — and eight eks-gitops
-// ApplicationSet generators select on that label.
+// `observability/tier` label on the ArgoCD cluster Secret, which the tier-aware eks-gitops
+// ApplicationSets select on — and which several of them also derive Helm parameters from,
+// so the label decides more than which Applications exist.
 type ObservabilityTier string
 
 const (

@@ -84,7 +84,8 @@ quotas:
 
 observability:
   tier: full                      # full | floor. Published as the observability/tier label on the ArgoCD cluster
-                                  # Secret; eight eks-gitops ApplicationSet generators select on it.
+                                  # Secret, which the tier-aware eks-gitops ApplicationSets select on (and a few
+                                  # derive Helm parameters from).
                                   #   full  (default) — the in-cluster LGTM stack (Loki, Tempo, kube-state-metrics,
                                   #                     grafana-operator) plus Amazon Managed Prometheus / Grafana.
                                   #                     rackctl applies managed-monitoring, which is what publishes
@@ -100,7 +101,16 @@ observability:
 
 addons:
   druid: false                    # per-tenant analytics substrate (Aurora Serverless, optionally MSK). Real money;
-                                  # its live leaf carries its own tenant sizing map
+                                  # its live leaf carries its own tenant sizing map.
+                                  #
+                                  # WARNING: turning this on makes the cluster impossible to tear down cleanly, in
+                                  # EVERY environment including development. druid's Aurora cluster cannot be
+                                  # destroyed by terraform — its module sets no final-snapshot identifier and the
+                                  # `tenants` input cannot supply one — and its three per-tenant buckets have no
+                                  # force-destroy escape, with deepstorage never empty on a working cluster.
+                                  # `rackctl destroy` halts there while the VPC, NAT gateways and control plane keep
+                                  # billing, until Aurora is cleared by hand. This is a landing-zone limitation and
+                                  # a fix is filed; every other component rackctl applies, it also destroys.
   accelerators: false             # label the cluster so the accelerators ApplicationSet (gpu-operator,
                                   # nvidia-dra-driver) targets it. Leave false without GPU nodes — the driver
                                   # cannot pull its image without an NGC key and has nothing to schedule on

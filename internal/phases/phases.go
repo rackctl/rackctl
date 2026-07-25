@@ -86,6 +86,19 @@ func CoreComponents(cfg *config.Config) []string {
 	// because it is real money and most platforms never need it. Its live leaf is
 	// self-sufficient — it carries its own `tenants` sizing map — and it depends on network and
 	// cluster, both of which the cluster phase applied before this one.
+	//
+	// It is also, today, the one component here that CANNOT be destroyed — in any environment,
+	// including development. modules/tenant/aurora.tf sets neither skip_final_snapshot nor
+	// final_snapshot_identifier, so the aws_rds_cluster delete errors demanding a snapshot
+	// identifier, and neither field exists on the `tenants` object type — so no TF_VAR shape
+	// reaches them, not even one reproducing the whole sizing map. Its three per-tenant buckets
+	// also have no force_destroy_buckets input and no development carve-out, and `deepstorage`
+	// has neither versioning nor expiry, so on a working cluster it is never empty.
+	//
+	// That breaks the rule the rest of this list keeps — rackctl destroys everything it brings
+	// in — so applying it is disclosed at the point of use rather than left to be discovered at
+	// teardown. The fix is a landing-zone change (shared ledger, item O1); when it lands, the
+	// disclosure in substrate.Run comes out.
 	if cfg.Addons.Druid {
 		comps = append(comps, "druid")
 	}
@@ -605,6 +618,26 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 			"logs to CloudWatch Logs, traces to X-Ray. On a cluster that previously ran full this PRUNES Loki, "+
 			"Tempo, grafana-operator and the dashboards, with a telemetry gap while it converges — see "+
 			"eks-gitops/docs/runbooks/observability-tier.md")
+	}
+
+	// druid is a one-way door today, and that is the opposite of every other component here,
+	// so it is said out loud at the point of use. See CoreComponents for the mechanism: the
+	// Aurora delete demands a final-snapshot identifier the `tenants` object type cannot
+	// express, so no TF_VAR reaches it, and the three per-tenant buckets have no
+	// force_destroy escape and no development carve-out.
+	//
+	// Printed rather than refused: an operator who genuinely wants druid can still have it,
+	// and can clear Aurora by hand at teardown. Refusing would be rackctl deciding a
+	// landing-zone limitation is a policy. But it must not be a surprise discovered halfway
+	// through a destroy, with the cluster already half gone.
+	if st.Config.Addons.Druid {
+		note(st, "addons.druid: true — WARNING, this cluster will not tear down cleanly. druid's Aurora "+
+			"cluster cannot be destroyed by terraform in ANY environment (its module sets no "+
+			"final-snapshot identifier and the tenants input cannot supply one), and its three "+
+			"per-tenant buckets have no force-destroy escape, with deepstorage never empty on a "+
+			"working cluster. `rackctl destroy` will halt there and the VPC, NAT gateways and "+
+			"control plane keep billing until Aurora is cleared by hand. Every other component "+
+			"rackctl applies, it also destroys")
 	}
 
 	// Say exactly what model-import provisions, and — more importantly — what it does
