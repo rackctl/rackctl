@@ -47,8 +47,10 @@ import (
 //     only aws_caller_identity and aws_partition, and nothing on the platform resolves
 //     its SSM parameters programmatically (only the human import runbook does). It sits
 //     last among the conditionals for readability, and a future reader may move it. It is
-//     gated because it is account-scoped substrate an org may never want — and it is the
-//     one component here that rackctl applies but must never destroy (see KeepOnDestroy).
+//     gated because it is per-environment substrate an org may never want, and it is
+//     destroyed with everything else — landing-zone scopes it by environment and gives it a
+//     teardown posture (force_destroy unconditional in development, opt-in elsewhere), so
+//     there is nothing here that has to outlive the cluster that asked for it.
 //
 // Ordering is load-bearing and terragrunt's own dependency graph does not express it:
 // the orderings that matter here are substrate-before-consumer (cluster-addons' Pod
@@ -78,34 +80,6 @@ func CoreComponents(cfg *config.Config) []string {
 	// (Pod Identity is injected at pod admission) and why it must be structural.
 	return append(comps, "cluster-addons", "cluster-bootstrap")
 }
-
-// keepOnDestroy is the set of landing-zone components rackctl applies but must never
-// destroy. It is the one place the apply path and the destroy path deliberately
-// disagree, and it exists because two distinct things go wrong otherwise.
-//
-// The first is a contract violation. model-import is account-and-region scoped, not
-// cluster scoped, and its component header says so outright: an imported Bedrock model
-// is an account+region resource that outlives any one cluster, and "tearing a cluster
-// down must not orphan or destroy a model another cluster is serving". A rollback of a
-// failed init would delete the staging bucket, the import role, and the two SSM
-// parameters every future import job resolves — for the whole account, including for
-// clusters rackctl never built.
-//
-// The second is worse, because it strands money. The staging bucket is versioned and
-// carries no force_destroy, so the moment any weights are staged `terragrunt destroy`
-// fails with BucketNotEmpty. In a reverse teardown that error HALTS the loop partway,
-// leaving the EKS cluster, the VPC and its NAT gateways standing and billing — the exact
-// outcome the reverse teardown exists to prevent.
-//
-// This is the same judgement as NoRollbackError: some things must not be demolished by
-// an automated unwind. And because CoreComponents is read by the destroy path as well as
-// the apply path, the exclusion lives here and is consulted by both call sites rather
-// than being restated in either — restating a component list is what let three
-// conditional components silently go unapplied once.
-var keepOnDestroy = map[string]bool{"model-import": true}
-
-// KeepOnDestroy reports whether a component must survive rackctl's teardown.
-func KeepOnDestroy(component string) bool { return keepOnDestroy[component] }
 
 // All returns the ordered bootstrap pipeline. Phases 0–6 are the core
 // 0→running path (AWS-only, v1); 7–9 are opt-in layers.
@@ -160,15 +134,87 @@ func componentDir(st *engine.State, component string) string {
 	return fmt.Sprintf("live/aws/workload-%s/%s/%s/%s", env, st.Config.Cloud.Region, env, component)
 }
 
-// apply / destroy run a landing-zone Terragrunt component for the current env.
+// apply / destroy run a landing-zone Terragrunt component for the current env, with the
+// TF_VARs that component declares and no others.
+//
+// Scoping is the point. The Runner is shared by every phase for the whole run, so the old
+// idiom — `st.Runner.Env = append(st.Runner.Env, ...)` in the cluster phase — did not
+// configure the cluster component, it configured EVERY terragrunt invocation that followed
+// it. TF_VAR_cluster_name reached secrets, agent-iam, managed-monitoring, dns, cluster-addons
+// and cluster-bootstrap, whose own envcommon simultaneously hands them
+// `cluster_name = <environment>-<base>`. And an ambient TF_VAR beats a terragrunt `inputs`
+// value, so the leaked base name won that argument silently.
+//
+// A variable is scoped to the invocation that needs it, or it is a global — there is no
+// third thing, and `cmd/tgenv.go` is where the genuine globals live.
 func apply(ctx context.Context, st *engine.State, component string) error {
-	return tg(ctx, st, "apply", component)
+	env, err := componentEnv(ctx, st, component)
+	if err != nil {
+		return err
+	}
+	return tg(ctx, st, "apply", component, env...)
 }
+
 func destroy(ctx context.Context, st *engine.State, component string) error {
-	return tg(ctx, st, "destroy", component)
+	env, err := componentEnv(ctx, st, component)
+	if err != nil {
+		return err
+	}
+	return tg(ctx, st, "destroy", component, env...)
 }
-func tg(ctx context.Context, st *engine.State, verb, component string) error {
+
+// Destroy runs one component's teardown with its scoped env. Exported for `rackctl destroy`,
+// which walks CoreComponents in reverse outside the phase engine.
+//
+// It exists so that path cannot drift from this one. It used to restate the init+destroy
+// sequence itself and build its env from tgEnv alone — so a standalone `rackctl destroy`
+// passed none of the per-component variables the apply had, and the cluster component fell
+// back to its own default name. Restating what a shared helper already does is the mistake
+// substrateComponents was written to prevent; this is the same mistake one layer down.
+func Destroy(ctx context.Context, st *engine.State, component string) error {
+	return destroy(ctx, st, component)
+}
+
+// componentEnv returns the TF_VARs a single landing-zone component declares. Components not
+// named here take nothing beyond the globals in tgEnv.
+//
+// Every entry must correspond to a variable that component actually declares. TF_VAR_cluster_name
+// used to be injected into `network` as well, on the stated grounds that "network and cluster
+// must agree on it or Karpenter/ELB discovery breaks" — but components/aws/network declares no
+// cluster_name variable at all, and its own comment says the cluster-ownership and
+// Karpenter-discovery tags are per-cluster and applied by the CLUSTER component via
+// aws_ec2_tag, precisely because the VPC is shared per environment and cluster-agnostic.
+// The injection was inert and the reasoning was backwards.
+func componentEnv(ctx context.Context, st *engine.State, component string) ([]string, error) {
+	switch component {
+	case "network":
+		// The create-mode levers are network variables: ipam_pool_id, ipam_netmask_length,
+		// transit_gateway_id, centralized_egress.
+		return clusterNetworkEnv(st), nil
+	case "cluster":
+		// cluster_name plus the endpoint posture, all three cluster variables. The endpoint
+		// builder may detect this host's egress IP, so it can fail and must be able to say so.
+		env := []string{"TF_VAR_cluster_name=" + st.Config.Cluster.Name}
+		endpointEnv, err := clusterEndpointEnv(ctx, st)
+		if err != nil {
+			return nil, err
+		}
+		return append(env, endpointEnv...), nil
+	default:
+		return nil, nil
+	}
+}
+
+func tg(ctx context.Context, st *engine.State, verb, component string, extraEnv ...string) error {
 	dir := componentDir(st, component)
+
+	// Scope extraEnv to this invocation — both commands below, then restored. Copied rather
+	// than appended in place so the restore cannot be defeated by a shared backing array.
+	if len(extraEnv) > 0 {
+		prev := st.Runner.Env
+		st.Runner.Env = append(append([]string(nil), prev...), extraEnv...)
+		defer func() { st.Runner.Env = prev }()
+	}
 
 	// Always init first.
 	//
@@ -415,31 +461,17 @@ type cluster struct{ base }
 
 func (cluster) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
-	// The cluster base rides TF_VAR_cluster_name into landing-zone's network + cluster
-	// modules (their var.cluster_name), which compose <environment>-<cluster_name> — the
-	// same string ClusterName() returns. network.hcl no longer pins cluster_name in its
-	// inputs, so this TF_VAR is what names the cluster and its VPC subnet-discovery tags;
-	// network and cluster must agree on it or Karpenter/ELB discovery breaks.
-	st.Runner.Env = append(st.Runner.Env, "TF_VAR_cluster_name="+st.Config.Cluster.Name)
 
-	// The endpoint posture rides the same seam. landing-zone's committed cluster tree is
+	// Both components' per-run inputs are supplied by componentEnv, scoped to the one
+	// invocation that declares them: the create-mode levers to `network`, and cluster_name
+	// plus the endpoint posture to `cluster`. landing-zone's committed cluster tree is
 	// private-by-default and fail-closed — a public API endpoint with no allow-list is
-	// rejected at plan time. rackctl owns the fragile per-run input: it supplies the bool
-	// and, when public, the CIDR allow-list (auto-detecting the operator's egress IP when
-	// none is given). Both are cluster-component variables, so they belong here, layered
-	// over the generic committed tree exactly like TF_VAR_cluster_name.
-	endpointEnv, err := clusterEndpointEnv(ctx, st)
-	if err != nil {
-		return err
-	}
-	st.Runner.Env = append(st.Runner.Env, endpointEnv...)
-
-	// The create-mode network levers ride the same seam into landing-zone's network
-	// component (applied first, below). Off by default — a day-0 hub owns a plain
-	// literal-CIDR VPC unless the config opts it into IPAM / transit-gateway / centralized
-	// egress. Config validation has already rejected any contradictory combination.
-	st.Runner.Env = append(st.Runner.Env, clusterNetworkEnv(st)...)
-
+	// rejected at plan time — and rackctl owns that fragile input, auto-detecting the
+	// operator's egress IP when the allow-list is empty. Config validation has already
+	// rejected any contradictory network combination.
+	//
+	// This phase deliberately sets nothing on st.Runner.Env. It used to, and those variables
+	// then rode into every phase after it; see the comment on apply().
 	note(st, "provisioning VPC then EKS control plane (network → cluster; strict ordering)")
 	for _, comp := range []string{"network", "cluster"} {
 		if err := apply(ctx, st, comp); err != nil {
@@ -472,8 +504,7 @@ type bootstrap struct{ base }
 // CoreComponents (never restated) so the conditional components (agent-iam,
 // managed-monitoring, dns, model-import) can only ever be applied in the one order
 // CoreComponents documents — restating the list is what let three of them silently go
-// missing once. model-import is the one member of this set excluded from the reverse
-// teardown; see KeepOnDestroy.
+// missing once.
 //
 // It is CoreComponents minus the components other phases own: network and cluster (the
 // cluster phase), and cluster-bootstrap (the gitops phase — ArgoCD is the CONSUMER of the
@@ -530,15 +561,18 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 	// until BOTH repos change — which is why the note names both rather than implying
 	// one upstream fix is enough.
 	if st.Config.AgentPlatform.ModelImport {
-		note(st, "model-import: provisioning the Bedrock Custom Model Import substrate for account %s / %s only — "+
-			"the S3 staging bucket %s-%s-model-import, the import service role model-import-%s, and the SSM discovery "+
-			"parameters /eks-agent-platform/model-import/{staging_bucket_name,import_role_arn}. It imports NO model: that "+
+		note(st, "model-import: provisioning the Bedrock Custom Model Import substrate for %s in account %s / %s — "+
+			"the S3 staging bucket %s-%s-%s-model-import, the import service role model-import-%s-%s, and the SSM "+
+			"discovery parameters /eks-agent-platform/%s/model-import/{staging_bucket_name,import_role_arn}. It imports "+
+			"NO model: that "+
 			"is a deliberate out-of-band step (eks-agent-platform/docs/runbooks/import-open-weight-model.md). Nor does a "+
 			"tenant reach an imported model yet — landing-zone's agent-iam baseline cannot express an imported-model ARN, "+
 			"and the operator's own bedrock-model-scoping policy denies everything outside the foundation-model and "+
 			"inference-profile ARNs it expands, so an imported route needs a coordinated change in both repos",
-			st.Config.Cloud.AccountID, st.Config.Cloud.Region,
-			st.Config.Cloud.AccountID, st.Config.Cloud.Region, st.Config.Cloud.Region)
+			st.Config.Environment, st.Config.Cloud.AccountID, st.Config.Cloud.Region,
+			st.Config.Environment, st.Config.Cloud.AccountID, st.Config.Cloud.Region,
+			st.Config.Environment, st.Config.Cloud.Region,
+			st.Config.Environment)
 	}
 
 	for _, comp := range substrateComponents(st.Config) {
@@ -604,18 +638,8 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	comps := substrateComponents(st.Config)
-	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply
-		c := comps[i]
-		if KeepOnDestroy(c) {
-			note(st, "keeping %s — it is account+region-scoped substrate (the Bedrock Custom Model Import staging "+
-				"bucket, import role and SSM discovery parameters) that outlives any one cluster. Destroying it here "+
-				"would delete a model another cluster may be serving, and the versioned bucket has no force_destroy so "+
-				"the destroy would fail on BucketNotEmpty and halt this teardown with the cluster still standing. To "+
-				"remove it deliberately: delete the imported model, empty the bucket, then "+
-				"`terragrunt --working-dir %s destroy`", c, filepath.Join(st.Repos.LandingZone, componentDir(st, c)))
-			continue
-		}
-		if err := destroy(ctx, st, c); err != nil {
+	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply, no exceptions
+		if err := destroy(ctx, st, comps[i]); err != nil {
 			return err
 		}
 	}

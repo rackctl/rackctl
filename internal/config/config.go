@@ -218,12 +218,12 @@ type AgentPlatform struct {
 	Enable               *bool    `json:"enable,omitempty"`
 	BedrockModelFamilies []string `json:"bedrockModelFamilies"`
 
-	// ModelImport applies landing-zone's model-import component: the account+region
-	// substrate Bedrock Custom Model Import needs, and nothing else. That is the S3
-	// staging bucket <account>-<region>-model-import where Hugging Face-format weights
-	// land, the IAM service role model-import-<region> that Bedrock assumes to read them
-	// during a CreateModelImportJob, and two SSM discovery parameters under
-	// /eks-agent-platform/model-import/.
+	// ModelImport applies landing-zone's model-import component: the substrate Bedrock
+	// Custom Model Import needs for this environment, and nothing else. That is the S3
+	// staging bucket <environment>-<account>-<region>-model-import where Hugging Face-format
+	// weights land, the IAM service role model-import-<environment>-<region> that Bedrock
+	// assumes to read them during a CreateModelImportJob, and two SSM discovery parameters
+	// under /eks-agent-platform/<environment>/model-import/.
 	//
 	// It imports NO model. Importing is a deliberate, infrequent, account-level act run
 	// out of band by a human (eks-agent-platform/docs/runbooks/import-open-weight-model.md),
@@ -234,9 +234,9 @@ type AgentPlatform struct {
 	// failure model — but pre-provisioning the substrate takes that propagation window
 	// off the human's path later, which is exactly what a day-0 installer is for.
 	//
-	// Off by default: it is account-scoped substrate an org may never want. And because
-	// the substrate outlives any one cluster, rackctl applies it but NEVER destroys it —
-	// see phases.KeepOnDestroy.
+	// Off by default: it is per-environment substrate an org may never want. It is torn
+	// down with everything else — landing-zone scopes the bucket and role by environment
+	// and gives them a teardown posture, so nothing here has to outlive its cluster.
 	ModelImport bool `json:"modelImport"`
 
 	Compliance Compliance `json:"compliance"`
@@ -416,7 +416,8 @@ func (c *Config) Validate() error {
 		if !c.AgentPlatform.Enabled() {
 			errs = append(errs, "agentPlatform.modelImport requires the agent platform, but agentPlatform.enable is false — "+
 				"the model-import substrate exists so a ModelGateway route can reference an imported-model ARN, and its "+
-				"discovery parameters live under /eks-agent-platform/model-import/. With the platform off there is no "+
+				"discovery parameters live under /eks-agent-platform/<environment>/model-import/. With the platform off there is "+
+				"no "+
 				"operator to reconcile that route, so the staging bucket, the import role and the two SSM parameters would "+
 				"be account substrate nothing on this platform can consume")
 		}
