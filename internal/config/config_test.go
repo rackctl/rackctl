@@ -221,7 +221,7 @@ func TestApplyDefaults(t *testing.T) {
 // opt-down for a cluster that should not carry AMP/AMG cost.
 //
 // The enum must be closed because the value is published as the observability/tier label on
-// the ArgoCD cluster Secret and eight eks-gitops ApplicationSet generators select on it. A
+// the ArgoCD cluster Secret, which the tier-aware eks-gitops ApplicationSets select on. A
 // typo does not fail anything — it produces a label that matches no generator, so the
 // cluster comes up with the OTel node agent and nothing else. That is the quietest possible
 // failure, which is exactly why it is rejected here.
