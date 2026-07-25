@@ -112,7 +112,7 @@ func TestOperatorRoles_ForceDeletesEachRole(t *testing.T) {
 	f.inline["dev-ops-tenant"] = []string{"session-inline"}
 	f.attached["dev-ops-session"] = []string{"arn:aws:iam::1:policy/attribution"}
 
-	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{})
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "dev")
 
 	for _, r := range []string{"dev-ops-tenant", "dev-ops-session"} {
 		if !f.deleted[r] {
@@ -130,7 +130,7 @@ func TestOperatorRoles_OneFailureDoesNotAbortTheRest(t *testing.T) {
 	f.detachFails["dev-wedged-tenant"] = true
 	f.attached["dev-ok-session"] = []string{"arn:aws:iam::1:policy/y"}
 
-	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{})
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "dev")
 
 	if f.deleted["dev-wedged-tenant"] {
 		t.Errorf("a role whose detach failed must not be deleted (it would DeleteConflict)")
@@ -143,7 +143,7 @@ func TestOperatorRoles_OneFailureDoesNotAbortTheRest(t *testing.T) {
 func TestOperatorRoles_NoRolesIsClean(t *testing.T) {
 	f := newFakeIAM()
 	buf := &bytes.Buffer{}
-	reapOperatorRoles(context.Background(), f, false, buf)
+	reapOperatorRoles(context.Background(), f, false, buf, "dev")
 	if len(f.runs) != 0 {
 		t.Fatalf("no roles under the prefix => no mutations; got %v", f.runs)
 	}
@@ -152,7 +152,7 @@ func TestOperatorRoles_NoRolesIsClean(t *testing.T) {
 func TestOperatorRoles_DryRunTouchesNothing(t *testing.T) {
 	f := newFakeIAM()
 	f.attached["dev-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
-	reapOperatorRoles(context.Background(), f, true, &bytes.Buffer{})
+	reapOperatorRoles(context.Background(), f, true, &bytes.Buffer{}, "dev")
 	if len(f.runs) != 0 {
 		t.Fatalf("dry-run must not mutate; got %v", f.runs)
 	}
@@ -260,4 +260,88 @@ func TestUnstickTerminating_NoClusterIsClean(t *testing.T) {
 	if len(k.patched) != 0 {
 		t.Fatalf("unreachable cluster => nothing to do; got %v", k.patched)
 	}
+}
+
+// The sweep is account-wide by construction — IAM is global, and the operator's tenant path
+// carries neither an environment nor a cluster segment — so the ONLY thing keeping it inside
+// the cluster being torn down is the name filter.
+//
+// An account hosting development and staging has both clusters' tenant roles under
+// /eks-agent-platform/tenants/. Without the filter, `rackctl destroy` against staging
+// force-detaches and deletes development's live tenant roles: the agent pods there keep
+// running with cached credentials until they rotate, then start failing AssumeRole with
+// nothing in the cluster to explain why, because the thing that deleted their role was a
+// teardown of a different cluster in a different environment.
+func TestOperatorRoles_LeavesAnotherClustersRolesAlone(t *testing.T) {
+	f := newFakeIAM()
+	f.attached["staging-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+	f.attached["development-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "staging-ops")
+
+	if !f.deleted["staging-ops-tenant"] {
+		t.Errorf("the torn-down cluster's own role must still be reaped; runs=%v", f.runs)
+	}
+	if f.deleted["development-ops-tenant"] {
+		t.Fatalf("destroying staging deleted a DEVELOPMENT tenant role — the sweep is scoped by "+
+			"name because the IAM path is shared across every cluster in the account; runs=%v", f.runs)
+	}
+	for _, r := range f.runs {
+		if flag(r, "--role-name") == "development-ops-tenant" {
+			t.Fatalf("no mutation may touch another cluster's role, not even a detach; got %v", r)
+		}
+	}
+}
+
+// A cluster name of "" would make `HasPrefix(name, "-")`… match nothing by luck, but
+// `HasPrefix(name, cluster+"-")` with an empty cluster is one edit away from matching
+// everything, and a teardown is the wrong place to rely on luck. There is no cluster whose
+// roles could be named for an empty name, so the correct behaviour is to do nothing at all —
+// not to enumerate and filter.
+func TestOperatorRoles_BlankClusterReapsNothing(t *testing.T) {
+	f := newFakeIAM()
+	f.attached["development-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "")
+
+	if len(f.runs) != 0 {
+		t.Fatalf("a blank cluster name must reap nothing, not everything; got %v", f.runs)
+	}
+}
+
+// agent-iam's own terraform owns three roles at the SHALLOWER path /eks-agent-platform/ —
+// <cluster>-operator, <cluster>-tenant-boundary and <cluster>-tenant-baseline — and destroys
+// them in the ordinary way moments later. They are named for the cluster, so the name filter
+// does not exclude them; the PATH is what does.
+//
+// This asserts the path, because the two filters protect against different things and passing
+// on the name alone would leave terraform planning a delete for a role rackctl already
+// force-deleted. The fake serves list-roles for one prefix only, so seeding a role and
+// asserting the query is the way to pin it.
+func TestOperatorRoles_QueriesOnlyTheTenantPath(t *testing.T) {
+	f := &recordingIAM{fakeIAM: newFakeIAM()}
+	f.attached["development-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "development-ops")
+
+	if got := flag(f.listArgs, "--path-prefix"); got != "/eks-agent-platform/tenants/" {
+		t.Fatalf("list-roles asked for --path-prefix %q; the operator mints tenant and session "+
+			"roles under /eks-agent-platform/tenants/, while the shallower /eks-agent-platform/ "+
+			"also holds the three roles agent-iam's terraform owns and is about to destroy itself",
+			got)
+	}
+}
+
+// recordingIAM captures the list-roles argv so a test can assert the path prefix, which is
+// otherwise invisible: the fake answers every prefix identically.
+type recordingIAM struct {
+	*fakeIAM
+	listArgs []string
+}
+
+func (r *recordingIAM) Capture(ctx context.Context, name string, args ...string) (string, error) {
+	if len(args) > 1 && args[1] == "list-roles" {
+		r.listArgs = append([]string{name}, args...)
+	}
+	return r.fakeIAM.Capture(ctx, name, args...)
 }

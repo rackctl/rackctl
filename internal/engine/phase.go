@@ -24,6 +24,20 @@ type State struct {
 	Runner  *exec.Runner
 	Repos   Repos
 	Outputs map[string]string // captured terragrunt/aws outputs (IRSA ARNs, bucket names, ...)
+
+	// KubeconfigCluster is the cluster the ambient kubeconfig points at, set by the
+	// cluster phase once `aws eks update-kubeconfig` has succeeded — and empty until
+	// then, which is the fact the rollback's reap sweep is gated on.
+	//
+	// Everything that sweep does is aimed at whatever context kubectl currently
+	// resolves, and rackctl repoints that in exactly one place. Before it runs, the
+	// kubeconfig still belongs to whatever the operator was doing beforehand, so
+	// "did this run build a cluster?" and "is it safe to delete every Platform and PVC
+	// kubectl can see?" are the same question. Recording it here rather than inferring
+	// it from the completed-phase list is deliberate: a cluster phase that fails AFTER
+	// update-kubeconfig has still repointed the kubeconfig and still has a real cluster
+	// to reap, and that is precisely the case a rollback exists for.
+	KubeconfigCluster string
 }
 
 // Phase is one ordered step of the 0→running bootstrap.

@@ -207,7 +207,12 @@ var destroyCmd = &cobra.Command{
 		// the node role). agent-iam destroys the tenant baseline policy those roles
 		// attach; a survivor stops the whole teardown on DeleteConflict. This runs before
 		// the component loop reaches agent-iam, and needs no cluster. See reap.go.
-		reap.OperatorRoles(ctx, run, os.Stdout)
+		//
+		// Scoped to this cluster's roles by name. IAM is global and the operator's tenant
+		// path carries no cluster segment, so an account running more than one cluster has
+		// them all under one prefix — an unscoped sweep tears down a sibling cluster's live
+		// tenant roles as a side effect of destroying this one.
+		reap.OperatorRoles(ctx, run, os.Stdout, cfg.ClusterName())
 
 		// With the roles gone, any Platform/Tenant still pinned in Terminating is
 		// guarding nothing — free it, so an interrupted teardown does not wedge. Must

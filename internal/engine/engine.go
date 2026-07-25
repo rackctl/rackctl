@@ -159,7 +159,28 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 	// live PVCs and Platform CRs, orphaning EBS volumes and IAM roles that nothing
 	// will ever clean up. `rackctl destroy` already did this; the rollback did not,
 	// and a failed install left three unattached volumes behind.
-	if st.Runner != nil && e.Out != nil {
+	//
+	// But ONLY once this run actually built the cluster, and that condition is the whole
+	// point rather than a tidy-up. Every call below acts on ambient state: reap.All and
+	// reap.UnstickTerminating run `kubectl delete platforms|tenants|nodeclaims|pvc --all
+	// -A` and patch finalizers off CRs against WHATEVER the kubeconfig currently points
+	// at, and the cluster phase is the only place rackctl ever repoints it. So a failure
+	// in preflight, acquire or identity — none of which create a cluster, and identity is
+	// not wrapped in NoRollbackError — used to reach this code with the kubeconfig still
+	// aimed at the operator's previous context. Bootstrapping staging from a laptop
+	// pointed at a healthy development cluster meant a failed `scripts/init-backend-aws.sh`
+	// deleted every Platform and PVC in development.
+	//
+	// This is the same invariant assertComponentRoots holds with NoRollbackError, and the
+	// reason it cannot be left to callers to remember: a precondition failure must never
+	// be able to demolish something it exists to protect. NoRollbackError opts a single
+	// error out; this makes the sweep structurally unreachable for every phase before the
+	// cluster exists, including ones nobody has written yet.
+	//
+	// The component teardowns below are unaffected and still run for every completed
+	// phase. They address terraform state, which is scoped by the state key rather than
+	// by ambient context, so they can only ever destroy what this run created.
+	if st.Runner != nil && e.Out != nil && st.KubeconfigCluster != "" {
 		reap.All(ctx, st.Runner, e.Out)
 
 		// Force-delete the operator-minted IAM roles the finalizer may not have. A rollback
@@ -168,7 +189,7 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 		// the things that failed), so the roles almost certainly survived and would stop the
 		// substrate teardown on agent-iam's DeleteConflict. Then free any CR the dead
 		// finalizer left pinned in Terminating (safe once the roles are gone).
-		reap.OperatorRoles(ctx, st.Runner, e.Out)
+		reap.OperatorRoles(ctx, st.Runner, e.Out, st.KubeconfigCluster)
 		reap.UnstickTerminating(ctx, st.Runner, e.Out)
 
 		// And backstop the NodeClaim reap: a rollback runs against a half-built cluster,

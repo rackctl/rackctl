@@ -153,17 +153,43 @@ type execer interface {
 // delete inline policies, delete the role — but does not need the operator, or even a
 // reachable cluster, to do it. IAM is global, so no region is needed either.
 //
-// Enumeration is by IAM path: the operator mints every tenant and session role under
-// /eks-agent-platform/ (its default TenantIAMPath, which the catalog does not override).
-// An org that repoints TenantIAMPath elsewhere would have to widen this prefix to match.
-func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer) {
-	reapOperatorRoles(ctx, run, run.DryRun, out)
+// Enumeration is by IAM path AND by cluster name, and BOTH halves are load-bearing.
+//
+// The path is /eks-agent-platform/tenants/, not /eks-agent-platform/. The operator mints
+// every tenant and session role under the deeper path (its TenantIAMPath default, which the
+// catalog does not override — operators/internal/controller/platform_iam.go and
+// platform_session_iam.go). The shallower prefix ALSO matches three roles agent-iam's own
+// terraform owns and is about to destroy in the ordinary way: <cluster>-operator,
+// <cluster>-tenant-boundary and <cluster>-tenant-baseline, all at path
+// /eks-agent-platform/ (components/aws/agent-iam/main.tf). Sweeping those force-deletes
+// resources terraform still holds in state, so the subsequent destroy plans a delete for a
+// role that no longer exists. This function exists to make a teardown succeed; deleting
+// terraform's own resources out from under it is the opposite.
+//
+// The cluster-name filter is what keeps the sweep inside the cluster being torn down. IAM is
+// global and the path carries neither an environment nor a cluster segment, so an account
+// hosting development and staging clusters has every cluster's tenant roles under one prefix.
+// Every operator-minted name begins with the cluster name — tenantRoleName and
+// sessionRoleName both compose `clusterName + "-" + platform + suffix`, and their >64-char
+// truncation branch keeps that same `clusterName + "-"` prefix — so matching on it is exact
+// rather than heuristic. Without it, tearing down staging deletes development's live tenant
+// roles, and the agent pods there start failing AssumeRole with nothing to explain why.
+func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer, cluster string) {
+	reapOperatorRoles(ctx, run, run.DryRun, out, cluster)
 }
 
-func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writer) {
-	const pathPrefix = "/eks-agent-platform/"
+func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster string) {
+	const pathPrefix = "/eks-agent-platform/tenants/"
 	if dryRun {
-		fmt.Fprintln(out, ui.Step("force-delete operator-minted IAM roles under "+pathPrefix+" (agent-iam DeleteConflict backstop)"))
+		fmt.Fprintln(out, ui.Step("force-delete operator-minted IAM roles under "+pathPrefix+
+			" named "+cluster+"-* (agent-iam DeleteConflict backstop)"))
+		return
+	}
+
+	// A blank cluster name would make the prefix filter below match everything, turning the
+	// scoping this function documents into an account-wide sweep. There is no cluster whose
+	// roles could be named for it, so there is nothing to reap.
+	if cluster == "" {
 		return
 	}
 
@@ -175,7 +201,12 @@ func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writ
 	if err != nil {
 		return // no credentials, or IAM unreachable — not a teardown failure
 	}
-	roles := strings.Fields(strings.TrimSpace(names))
+	var roles []string
+	for _, name := range strings.Fields(strings.TrimSpace(names)) {
+		if strings.HasPrefix(name, cluster+"-") {
+			roles = append(roles, name)
+		}
+	}
 	if len(roles) == 0 {
 		return
 	}
