@@ -286,7 +286,31 @@ var destroyCmd = &cobra.Command{
 		// development, opt-in elsewhere via force_destroy_buckets), so the carve-out is gone.
 		// rackctl destroys everything it builds — if something must outlive a cluster, rackctl
 		// should not be the thing creating it.
-		st := &engine.State{Config: cfg, Runner: run, Repos: engine.RepoPaths(cfg.Org.Name)}
+		st := &engine.State{
+			Config:  cfg,
+			Runner:  run,
+			Repos:   engine.RepoPaths(cfg.Org.Name),
+			Outputs: map[string]string{},
+		}
+
+		// The agent-platform terraform tree comes down FIRST, before any landing-zone
+		// component. Its components resolve landing-zone's SSM parameters — agent-iam's
+		// operator role and tenant paths, observability's alert topic ARNs — through unguarded
+		// data blocks, and Terraform evaluates data sources during a DESTROY plan too. Tearing
+		// landing-zone down first leaves them unable to plan their own teardown at all.
+		//
+		// Its inputs are re-read here because a standalone destroy starts cold: nothing
+		// populated State.Outputs. The values are still present — network, secrets and cluster
+		// are precisely what the teardown has not reached yet — so this reads them back rather
+		// than guessing or skipping.
+		if cfg.AgentPlatform.Enabled() {
+			phases.CaptureLandingZoneOutputs(ctx, st)
+			fmt.Println(ui.Step("destroy agent-platform substrate"))
+			if err := phases.DestroyAgentPlatform(ctx, st); err != nil {
+				return err
+			}
+		}
+
 		comps := phases.CoreComponents(cfg)
 		for i := len(comps) - 1; i >= 0; i-- {
 			c := comps[i]
