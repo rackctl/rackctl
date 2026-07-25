@@ -214,10 +214,18 @@ type ClusterNet struct {
 	// cluster is a supported adopt shape. Rejected under create.
 	//
 	// Leaving it empty has a consequence worth knowing: cluster-bootstrap publishes the
-	// public subnet list as an annotation for the Kyverno rule that injects load-balancer
-	// subnets, and that rule guards on a non-empty list. So an internet-facing Service or
-	// Ingress on a private-only adopt cluster gets no subnet annotation and does not
-	// provision. Internal load balancers are unaffected.
+	// public subnet list into the kube-system/network-config ConfigMap, and the Kyverno rule
+	// that injects load-balancer subnets guards on that entry being non-empty. So an
+	// internet-facing Service or Ingress on a private-only adopt cluster gets no subnet
+	// annotation and does not provision. Internal load balancers are unaffected.
+	//
+	// The ConfigMap is the artifact to check — `kubectl -n kube-system get cm network-config
+	// -o jsonpath='{.data.public_subnet_ids}'`. cluster-bootstrap ALSO stamps a
+	// network/public-subnet-ids annotation on the ArgoCD cluster Secret, for ApplicationSet
+	// generators that cannot see in-cluster resources, and under adopt that annotation is
+	// present-but-empty. Nothing reads it. Someone debugging a load balancer finds a key that
+	// looks like the right lever and is empty, which reads as confirmation rather than as a
+	// wrong turn.
 	AdoptPublicSubnetIDs []string `json:"adoptPublicSubnetIds,omitempty"`
 
 	// The four fields below are the create-mode network levers. They opt a day-0 hub out
@@ -499,14 +507,24 @@ func (c *Config) Validate() error {
 	n := c.Cluster.Network
 	errs = append(errs, validateNetworkMode(n)...)
 	switch {
-	case n.Adopt():
-		// The create-mode relationship checks below are vacuous under adopt: every lever they
-		// relate has already been rejected outright. Running them anyway produces a second,
-		// misleading error — "ipamNetmaskLength must be between 16 and 20" alongside
-		// "ipamPoolId does not apply under adopt" reads as though setting a netmask would
-		// help. landing-zone emits one error here for the same reason: its
+	case n.Adopt() && n.IPAMPoolID != "":
+		// A pool under adopt has already been rejected outright, so the relationship checks
+		// below would add a second, misleading error — "ipamNetmaskLength must be between 16
+		// and 20" alongside "ipamPoolId does not apply under adopt" reads as though setting a
+		// netmask would help. landing-zone emits one error here for the same reason: its
 		// ipam_netmask_length validation references only ipam_pool_id, never network_mode, so
 		// a pool set under adopt fails on ipam_pool_id alone.
+		//
+		// The condition is `adopt AND a pool`, not `adopt`, and the difference is a real hole
+		// rather than a refinement. Skipping the whole switch under adopt made adopt strictly
+		// MORE permissive than create for one field: `mode: adopt` with `ipamNetmaskLength: 18`
+		// and no pool validated clean, while the identical create config was rejected — and
+		// adoptEnv never injects that variable, so the value was dropped invisibly, absent even
+		// from a dry-run. An operator converting a create config to adopt comments out
+		// ipamPoolId, forgets the netmask beside it, and keeps a line in their committed
+		// rackctl.yaml that looks load-bearing and is not. With a pool required to take this
+		// arm, that config falls through to the `IPAMPoolID == ""` case and is rejected in both
+		// modes, with one error either way.
 	case n.IPAMPoolID == "":
 		// No IPAM pool ⇒ literal allocation, which must not carry a netmask.
 		if n.IPAMNetmaskLength != 0 {

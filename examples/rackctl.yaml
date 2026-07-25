@@ -42,7 +42,9 @@ cluster:
                                   # neutralize the create-mode values the staging and production leaves pin (3 and
                                   # true), which landing-zone rejects under adopt. Both are the owner's concern for
                                   # a VPC this platform does not own, so overriding them changes nothing real.
-    vpcCidr: 10.0.0.0/16          # create mode only; rejected under adopt (the CIDR is the owner's)
+    vpcCidr: 10.0.0.0/16          # create mode only. The DEFAULT shown here is accepted under adopt — it is the
+                                  # sentinel for "not overridden", so adopt does not make you delete this line — but
+                                  # any OTHER value is rejected there, because an adopted VPC's CIDR is the owner's
     natGateways: 1                # create mode only; 1 (shared NAT) or equal to the AZ count (per-AZ HA).
                                   # NOTE rackctl does not inject this — staging and production pin 3 in their own
                                   # leaves for per-AZ redundancy, and an injected TF_VAR would silently override it
