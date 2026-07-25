@@ -117,8 +117,8 @@ var terminatingKinds = []string{
 // wedged in Terminating is invisible: `kubectl get` still lists it, its pods still run,
 // and nothing anywhere says "this is stuck". But ArgoCD rates a resource pending deletion
 // as Progressing — so ONE wedged object holds its whole Application at Progressing, which
-// makes rackctl's convergence gate (`wait --for=condition=Healthy applications --all`)
-// unsatisfiable, and the install times out with no indication why.
+// makes rackctl's convergence gate (`wait --for=jsonpath={.status.health.status}=Healthy
+// applications --all`) unsatisfiable, and the install times out with no indication why.
 //
 // Both of the wedges that produced this check came from a rollback that ran `reap` — it
 // deletes Platform CRs and PVCs so their controllers can release cloud resources before

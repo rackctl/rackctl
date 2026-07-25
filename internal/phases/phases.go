@@ -637,8 +637,26 @@ func (gitopsPhase) Run(ctx context.Context, st *engine.State) error {
 		return err
 	}
 
+	// Wait on the health STATUS, not on a condition. ArgoCD publishes no `Healthy`
+	// condition — `ApplicationConditionType` carries only error and warning types
+	// (InvalidSpecError, ComparisonError, SyncError, SharedResourceWarning,
+	// OrphanedResourceWarning, …). Health lives at `.status.health.status`, which is
+	// exactly what the diagnostic below already reads.
+	//
+	// So `--for=condition=Healthy` could never be satisfied: every install, including a
+	// perfect one, burned the full 30 minutes and then failed. That is the worst shape a
+	// failure can take — the platform is up and converged, and the tool that built it
+	// reports otherwise after half an hour of silence.
+	//
+	// This is the same bug as phase 9's `--for=condition=Ready` on a Platform, and it was
+	// written twice in one file. `kubectl wait --for=condition=X` is only ever valid when
+	// something actually writes a condition of type X; a status field that happens to be
+	// spelled like a condition is not one. The other two waits in this phase pipeline are
+	// fine because they name real built-in conditions — `Established` on a CRD and
+	// `Available` on a Deployment are both written by Kubernetes itself.
 	note(st, "waiting for ArgoCD applications to converge (sync-waves 0→52)")
-	if err := st.Runner.Run(ctx, "kubectl", "-n", "argocd", "wait", "--for=condition=Healthy",
+	if err := st.Runner.Run(ctx, "kubectl", "-n", "argocd", "wait",
+		"--for=jsonpath={.status.health.status}=Healthy",
 		"applications", "--all", "--timeout=30m"); err != nil {
 		// The cloud is provisioned. ArgoCD is running and has generated the catalog.
 		// Something on the cluster has not settled — which is NOT a reason to destroy
