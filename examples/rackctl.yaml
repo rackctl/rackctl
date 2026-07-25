@@ -60,17 +60,17 @@ agentPlatform:
   enable: true
   bedrockModelFamilies: [anthropic, amazon-nova]
   modelImport: false            # off by default. Applies landing-zone's model-import component, which provisions
-                                # ONLY the Bedrock Custom Model Import substrate for this account+region: the S3
-                                # staging bucket <account>-<region>-model-import, the import service role
-                                # model-import-<region>, and the SSM discovery parameters
-                                # /eks-agent-platform/model-import/{staging_bucket_name,import_role_arn}.
+                                # ONLY the Bedrock Custom Model Import substrate for this environment: the S3
+                                # staging bucket <environment>-<account>-<region>-model-import, the import service
+                                # role model-import-<environment>-<region>, and the SSM discovery parameters
+                                # /eks-agent-platform/<environment>/model-import/{staging_bucket_name,import_role_arn}.
                                 # It imports NO model — that is a deliberate, infrequent, out-of-band human act
                                 # (eks-agent-platform/docs/runbooks/import-open-weight-model.md). Requires
                                 # agentPlatform.enable and a region where Custom Model Import runs (us-west-2,
                                 # us-east-1, us-east-2, eu-central-1); rackctl rejects the rest at validation,
                                 # because the component applies cleanly elsewhere and is silently unusable.
-                                # rackctl APPLIES this component but never DESTROYS it: it is account-scoped
-                                # substrate that outlives any one cluster.
+                                # Destroyed with everything else — landing-zone scopes it by environment and gives
+                                # it a teardown posture, so nothing here outlives its cluster.
   compliance:
     soc2: true
     hipaa: false

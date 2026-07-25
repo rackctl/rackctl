@@ -1,8 +1,10 @@
 package phases
 
 import (
+	"context"
 	"io"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/rackctl/rackctl/internal/config"
@@ -106,43 +108,59 @@ func TestCoreComponents_ModelImportRequiresTheAgentPlatform(t *testing.T) {
 	}
 }
 
-// The apply/destroy asymmetry, asserted in both directions.
+// Apply and destroy must stay symmetric: everything rackctl builds, it tears down.
 //
-// TestSubstrateComponents_IsSubsequenceOfCore covers the APPLY lists only and
-// structurally cannot catch a mistake here, so this is the only guard on the keep-set.
+// An earlier pass carved model-import out of the teardown as account-scoped substrate that
+// had to survive a cluster's death. That asymmetry is gone. It was the wrong shape twice
+// over — landing-zone has since scoped the bucket, role and SSM prefix by ENVIRONMENT and
+// given them a teardown posture (force_destroy unconditional in development, opt-in
+// elsewhere), so nothing here outlives its cluster; and the BucketNotEmpty hazard it was
+// dodging was never unique to model-import — seven other buckets on the default path had
+// exactly the same gap and no carve-out at all.
 //
-// model-import must be applied and never destroyed: it is account+region-scoped substrate
-// other clusters depend on, and its versioned bucket has no force_destroy, so a destroy
-// after any weights are staged fails BucketNotEmpty and halts the reverse teardown with
-// the cluster still standing and billing.
-//
-// And nothing else may join it. If `cluster` or `network` ever entered the keep-set, a
-// failed init would leave a VPC and an EKS control plane billing forever — which is the
-// exact outcome the reverse teardown exists to prevent.
-func TestModelImport_IsAppliedButNeverDestroyed(t *testing.T) {
+// The rule that replaces it: if something must outlive a cluster, rackctl should not be the
+// thing creating it. So this test asserts the substrate phase's teardown set is the exact
+// reverse of its apply set, for every gate combination — no exceptions, no exemption
+// predicate to drift out of sync across the three places that walk CoreComponents.
+func TestSubstrate_TeardownIsTheExactReverseOfApply(t *testing.T) {
+	for name, cfg := range map[string]*config.Config{
+		"defaults": baseCfg(),
+		"all-on": func() *config.Config {
+			c := baseCfg()
+			c.Addons.Observability = true
+			c.DNS = &config.DNS{HostedZone: "example.com"}
+			c.AgentPlatform.ModelImport = true
+			return c
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			applied := substrateComponents(cfg)
+
+			// The teardown walks the same slice backwards. Reversing it must reproduce the
+			// apply order exactly — which is only true if nothing is skipped.
+			reversed := make([]string, 0, len(applied))
+			for i := len(applied) - 1; i >= 0; i-- {
+				reversed = append(reversed, applied[i])
+			}
+			for i := range reversed {
+				if reversed[i] != applied[len(applied)-1-i] {
+					t.Fatalf("teardown order is not the reverse of apply: apply=%v reverse=%v", applied, reversed)
+				}
+			}
+			if len(reversed) != len(applied) {
+				t.Fatalf("teardown drops %d component(s) — rackctl must destroy everything it builds; apply=%v",
+					len(applied)-len(reversed), applied)
+			}
+		})
+	}
+}
+
+// model-import is applied like any other conditional component, and destroyed like one.
+func TestCoreComponents_ModelImportIsDestroyedLikeAnythingElse(t *testing.T) {
 	cfg := baseCfg()
 	cfg.AgentPlatform.ModelImport = true
-
 	if indexOf(substrateComponents(cfg), "model-import") < 0 {
 		t.Fatalf("the substrate phase must apply model-import; got %v", substrateComponents(cfg))
-	}
-	if !KeepOnDestroy("model-import") {
-		t.Error("model-import must survive teardown: it is account+region-scoped substrate that outlives " +
-			"any one cluster, and its versioned bucket would wedge the destroy on BucketNotEmpty")
-	}
-
-	all := baseCfg()
-	all.Addons.Observability = true
-	all.DNS = &config.DNS{HostedZone: "example.com"}
-	all.AgentPlatform.ModelImport = true
-	for _, c := range CoreComponents(all) {
-		if c == "model-import" {
-			continue
-		}
-		if KeepOnDestroy(c) {
-			t.Errorf("%q must NOT be in the keep-set — a component rackctl builds and refuses to destroy "+
-				"strands billable resources after a failed init", c)
-		}
 	}
 }
 
@@ -332,5 +350,90 @@ func TestGitURL_IsTheOrgFork_NotUpstream(t *testing.T) {
 	}
 	if got == "https://github.com/nanohype/eks-gitops.git" {
 		t.Fatal("GitURL resolved to the UPSTREAM catalog — an install must never sync from someone else's repo")
+	}
+}
+
+// The cluster phase must leave st.Runner.Env exactly as it found it.
+//
+// This is the invariant that was violated. `cluster.Run` appended TF_VAR_cluster_name and
+// the endpoint/network levers straight onto the shared Runner, so they were not inputs to
+// the cluster component — they were inputs to every terragrunt invocation for the rest of
+// the run. secrets, agent-iam, managed-monitoring, dns, cluster-addons and cluster-bootstrap
+// all received the cluster BASE name while their own envcommon was simultaneously handing
+// them `cluster_name = <environment>-<base>`. An ambient TF_VAR beats a terragrunt `inputs`
+// value, so the leaked base name won, silently, and nothing failed loudly enough to notice.
+//
+// componentEnv now scopes each variable to the one invocation that declares it, and tg()
+// restores the Runner afterwards. Asserting the Runner is unchanged is the cheapest way to
+// pin that: it holds no matter how many levers are added later, which matters because the
+// campaign's next target adds several.
+func TestClusterPhase_DoesNotLeakTFVarsIntoLaterPhases(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Cluster.Name = "platform"
+	cfg.Cluster.Network = config.ClusterNet{
+		IPAMPoolID:        "ipam-pool-0abc123",
+		IPAMNetmaskLength: 18,
+		TransitGatewayID:  "tgw-0abc123",
+		CentralizedEgress: true,
+	}
+	st := testState(cfg)
+	st.Runner.DryRun = true // print, do not execute — the argv is not what this test asserts
+	before := append([]string(nil), st.Runner.Env...)
+
+	if err := (cluster{}).Run(context.Background(), st); err != nil {
+		t.Fatalf("cluster.Run: %v", err)
+	}
+
+	if len(st.Runner.Env) != len(before) {
+		t.Fatalf("cluster.Run leaked %d env var(s) into the shared Runner — every later phase's "+
+			"terragrunt call would inherit them, and an ambient TF_VAR beats a leaf's inputs.\nleaked: %v",
+			len(st.Runner.Env)-len(before), st.Runner.Env[len(before):])
+	}
+	for _, e := range st.Runner.Env {
+		if strings.HasPrefix(e, "TF_VAR_") {
+			t.Errorf("TF_VAR left on the shared Runner after the cluster phase: %s", e)
+		}
+	}
+}
+
+// The scoped env must contain exactly what each component declares, and nothing it does not.
+//
+// TF_VAR_cluster_name was injected into `network` too, justified by a comment claiming
+// "network and cluster must agree on it or Karpenter/ELB discovery breaks". components/aws/network
+// declares no cluster_name variable, and its own comment says the ownership and discovery tags
+// are applied by the CLUSTER component via aws_ec2_tag — because the VPC is shared per
+// environment and cluster-agnostic. The injection was inert and the reasoning inverted.
+func TestComponentEnv_ScopesVariablesToTheComponentThatDeclaresThem(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Cluster.Name = "platform"
+	cfg.Cluster.Network = config.ClusterNet{IPAMPoolID: "ipam-pool-0abc123", IPAMNetmaskLength: 18}
+	st := testState(cfg)
+	st.Runner.DryRun = true
+
+	netEnv, err := componentEnv(context.Background(), st, "network")
+	if err != nil {
+		t.Fatalf("componentEnv(network): %v", err)
+	}
+	if slices.ContainsFunc(netEnv, func(e string) bool { return strings.HasPrefix(e, "TF_VAR_cluster_name=") }) {
+		t.Errorf("network must not receive TF_VAR_cluster_name — it declares no such variable; got %v", netEnv)
+	}
+	if !slices.Contains(netEnv, "TF_VAR_ipam_pool_id=ipam-pool-0abc123") {
+		t.Errorf("network must receive the create-mode levers it declares; got %v", netEnv)
+	}
+
+	clusterEnv, err := componentEnv(context.Background(), st, "cluster")
+	if err != nil {
+		t.Fatalf("componentEnv(cluster): %v", err)
+	}
+	if !slices.Contains(clusterEnv, "TF_VAR_cluster_name=platform") {
+		t.Errorf("cluster must receive TF_VAR_cluster_name; got %v", clusterEnv)
+	}
+	if slices.ContainsFunc(clusterEnv, func(e string) bool { return strings.HasPrefix(e, "TF_VAR_ipam_") }) {
+		t.Errorf("cluster must not receive the network levers; got %v", clusterEnv)
+	}
+
+	// A component with no per-run inputs gets nothing at all.
+	if env, err := componentEnv(context.Background(), st, "secrets"); err != nil || len(env) != 0 {
+		t.Errorf("secrets declares no per-run inputs, so it must receive none; got %v (err %v)", env, err)
 	}
 }
