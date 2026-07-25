@@ -502,7 +502,16 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 		}
 	}
 	captureOutputs(ctx, st, "cluster")
-	return st.Runner.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", st.Config.ClusterName())
+	if err := st.Runner.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", st.Config.ClusterName()); err != nil {
+		return err
+	}
+	// The kubeconfig now points at the cluster this run built. Recording that is what
+	// permits the rollback's reap sweep to run at all — see engine.State.KubeconfigCluster.
+	// It is set after the command rather than before it so a failed repoint leaves the
+	// sweep disabled, which is the correct posture: kubectl still resolves the operator's
+	// previous context, and the sweep deletes everything it can see there.
+	st.KubeconfigCluster = st.Config.ClusterName()
+	return nil
 }
 
 func (cluster) Teardown(ctx context.Context, st *engine.State) error {
