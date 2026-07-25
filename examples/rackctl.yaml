@@ -72,7 +72,20 @@ addons:
                                   # cannot pull its image without an NGC key and has nothing to schedule on
 
 dns:
-  hostedZone: acme.example.com
+  hostedZone: acme.example.com   # the zone this platform owns. Applies landing-zone's dns component, which creates
+                                 # the Route53 hosted zone, publishes the zone as external-dns's domain filter to
+                                 # /eks-agent-platform/<environment>/dns/domain_filter, and requests one wildcard
+                                 # ACM certificate for *.<zone> (SAN <zone>).
+                                 #
+                                 # Omit the block entirely to skip DNS: nothing creates a zone and external-dns is
+                                 # left out. Every committed dns leaf pins a *.example.com placeholder in its own
+                                 # inputs, so this value is what makes the component operate on a real domain.
+                                 #
+                                 # rackctl does NOT wait for the certificate to validate, and cannot: this apply is
+                                 # creating the zone, so the registrar's NS records still point wherever they pointed
+                                 # before, and ACM validates by resolving a record over public DNS. Point <zone>'s NS
+                                 # records at the name servers this apply prints and the certificate issues on its own
+                                 # — ACM retries for 72 hours and the validation record is already in the zone.
 
 agentPlatform:
   enable: true
