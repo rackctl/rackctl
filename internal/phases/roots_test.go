@@ -43,7 +43,7 @@ func landingZone(t *testing.T, cfg *config.Config, present ...string) *engine.St
 
 func TestAssertComponentRoots_AllPresentPasses(t *testing.T) {
 	cfg := baseCfg()
-	cfg.Addons.Observability = true
+	cfg.Observability.Tier = config.TierFull
 	cfg.DNS = &config.DNS{HostedZone: "example.com"}
 	cfg.AgentPlatform.ModelImport = true
 
