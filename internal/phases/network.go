@@ -21,7 +21,7 @@ import (
 //
 // It prints each injected value as an operator-facing note, so a dry-run shows exactly
 // what would reach the network module without applying anything.
-func clusterNetworkEnv(st *engine.State) []string {
+func clusterNetworkEnv(st *engine.State, verb string) []string {
 	n := st.Config.Cluster.Network
 	var env []string
 
@@ -41,15 +41,15 @@ func clusterNetworkEnv(st *engine.State) []string {
 	env = append(env, "TF_VAR_network_mode="+string(mode(n)))
 
 	if n.Adopt() {
-		return append(env, adoptEnv(st, n)...)
+		return append(env, adoptEnv(st, n, verb)...)
 	}
 
 	// Noted even though it asserts the committed default, because it is injected either way
 	// and an override nobody can see in a dry-run is the class of problem this campaign keeps
 	// finding. One line; it says what mode this run lands and what that means for the VPC.
-	note(st, "network: TF_VAR_network_mode=create — this platform owns its VPC (built here, with its "+
+	note(st, "network: TF_VAR_network_mode=create — this platform owns its VPC (%s here, with its "+
 		"subnets, endpoints and egress). Set cluster.network.mode: adopt to join a VPC another "+
-		"account owns instead")
+		"account owns instead", map[bool]string{true: "destroyed", false: "built"}[verb == "destroy"])
 
 	if n.IPAMPoolID != "" {
 		env = append(env,
@@ -88,7 +88,7 @@ func mode(n config.ClusterNet) config.NetworkMode {
 //
 // Config validation has already rejected every contradictory combination, so this makes no
 // decisions and no AWS calls — it translates a valid config into environment.
-func adoptEnv(st *engine.State, n config.ClusterNet) []string {
+func adoptEnv(st *engine.State, n config.ClusterNet, verb string) []string {
 	priv, _ := json.Marshal(n.AdoptPrivateSubnetIDs)
 	pub := []byte("[]")
 	if len(n.AdoptPublicSubnetIDs) > 0 {
@@ -119,9 +119,11 @@ func adoptEnv(st *engine.State, n config.ClusterNet) []string {
 		"TF_VAR_enable_flow_logs=false",
 	}
 
-	note(st, "network: TF_VAR_network_mode=adopt — participating in VPC %s, building no VPC, subnets, "+
-		"endpoints or egress. The owner runs those; landing-zone re-exports the adopted values through "+
-		"the same outputs, so the cluster wires identically to a created VPC", n.AdoptVPCID)
+	note(st, "network: TF_VAR_network_mode=adopt — participating in VPC %s, which this platform does "+
+		"not own: no VPC, subnets, endpoints or egress are %s here. The owner runs those; "+
+		"landing-zone re-exports the adopted values through the same outputs, so the cluster wires "+
+		"identically to a created VPC", n.AdoptVPCID,
+		map[bool]string{true: "destroyed", false: "built"}[verb == "destroy"])
 	note(st, "network: %d private subnet(s) %s", len(n.AdoptPrivateSubnetIDs), string(priv))
 	if len(n.AdoptPublicSubnetIDs) > 0 {
 		note(st, "network: %d public subnet(s) %s", len(n.AdoptPublicSubnetIDs), string(pub))
@@ -133,9 +135,11 @@ func adoptEnv(st *engine.State, n config.ClusterNet) []string {
 	note(st, "network: TF_VAR_nat_gateways=1 TF_VAR_enable_flow_logs=false — neutralizing the two "+
 		"create-mode levers this environment's leaf pins (staging and production set 3 and true), "+
 		"which landing-zone rejects under adopt. Both are the owner's concern for a VPC we do not own")
-	note(st, "network: landing-zone asserts the rest at plan time against live AWS — every subnet is in "+
-		"VPC %s, each private route table routes to the S3 gateway prefix list and to a live NAT or "+
-		"transit gateway, and the private subnets span at least 3 availability zones", n.AdoptVPCID)
+	if verb != "destroy" {
+		note(st, "network: landing-zone asserts the rest at plan time against live AWS — every subnet is in "+
+			"VPC %s, each private route table routes to the S3 gateway prefix list and to a live NAT or "+
+			"transit gateway, and the private subnets span at least 3 availability zones", n.AdoptVPCID)
+	}
 
 	return env
 }

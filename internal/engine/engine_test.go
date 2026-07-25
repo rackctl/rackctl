@@ -285,11 +285,25 @@ func TestEngineDoesNotReapBeforeItHasACluster(t *testing.T) {
 	// KubeconfigCluster is zero: the cluster phase never ran, so nothing repointed kubectl.
 	_ = eng.Run(context.Background(), &State{Runner: run, Config: &config.Config{}})
 
-	for _, forbidden := range []string{"reap controller-owned resources", "kubectl delete", "force-delete operator-minted"} {
-		if strings.Contains(out.String(), forbidden) {
+	// Inverted on purpose: assert that NOTHING reap-like ran, rather than listing the strings
+	// today's four calls happen to print.
+	//
+	// A whitelist of forbidden substrings only covers the calls that exist when it is written.
+	// reap.UnstickTerminating and reap.OrphanedNodes print neither "reap controller-owned
+	// resources" nor "force-delete operator-minted", so a version of this test that listed
+	// those two strings stayed green when UnstickTerminating was moved OUT of the gate —
+	// including the finalizer strip, which is the call that orphans live AWS state. And
+	// reap.OrphanedVolumes, already called from two other places, would match nothing at all.
+	//
+	// The gate's comment claims it holds "for every phase before the cluster exists, including
+	// ones nobody has written yet". This assertion has to be the same shape as that claim, or
+	// it only pins the calls someone remembered.
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.Contains(line, "(dry-run)") || strings.Contains(line, "reap") {
 			t.Fatalf("the identity phase failed before any cluster existed, and the rollback still "+
-				"reached the ambient-kubeconfig sweep (%q). Every resource it can see belongs to "+
-				"someone else.\n\n%s", forbidden, out.String())
+				"reached the ambient-context sweep: %q\n\nEvery resource it can see belongs to "+
+				"someone else — the kubeconfig still points wherever the operator left it.\n\n%s",
+				strings.TrimSpace(line), out.String())
 		}
 	}
 }

@@ -65,14 +65,15 @@ func validateNetworkMode(n ClusterNet) []string {
 
 	// ---- adopt: the six create-mode levers it rejects ---------------------------------
 	//
-	// Four of these are compared against their DEFAULT rather than against an empty value,
-	// because they have meaningful defaults and therefore no unset state: the default IS the
-	// sentinel. That is the same shape landing-zone uses (`var.vpc_cidr == "10.0.0.0/16"`,
-	// `var.nat_gateways == 1`), and comparing natGateways against 0 instead would be wrong —
-	// ApplyDefaults has already forced it to 1.
+	// TWO of these — vpcCidr and natGateways — are compared against their DEFAULT rather than
+	// against an empty value, because ApplyDefaults forces both and they therefore have no
+	// unset state: the default IS the sentinel. That is the same shape landing-zone uses
+	// (`var.vpc_cidr == "10.0.0.0/16"`, `var.nat_gateways == 1`), and comparing natGateways
+	// against 0 instead would be wrong — ApplyDefaults has already forced it to 1. The other
+	// three have no meaningful default, so empty/false is the sentinel.
 
 	if n.VPCCIDR != "" && n.VPCCIDR != defaultVPCCIDR {
-		errs = append(errs, fmt.Sprintf("cluster.network.vpcCidr (%q) is a create-mode lever and does not apply with cluster.network.mode: adopt — an adopted VPC's CIDR is the owner's, and rackctl reads it back from the VPC. Leave it unset", n.VPCCIDR))
+		errs = append(errs, fmt.Sprintf("cluster.network.vpcCidr (%q) is a create-mode lever and does not apply with cluster.network.mode: adopt — an adopted VPC's CIDR is the owner's, and landing-zone reads it back from the VPC (data.aws_vpc.adopt). Leave it unset", n.VPCCIDR))
 	}
 	if n.NATGateways != 0 && n.NATGateways != 1 {
 		errs = append(errs, fmt.Sprintf("cluster.network.natGateways (%d) is a create-mode lever and does not apply with cluster.network.mode: adopt — the VPC owner runs egress for a shared VPC. Leave it unset", n.NATGateways))
@@ -87,10 +88,15 @@ func validateNetworkMode(n ClusterNet) []string {
 		errs = append(errs, "cluster.network.centralizedEgress is a create-mode lever and does not apply with cluster.network.mode: adopt — the VPC owner runs egress for a shared VPC")
 	}
 	// ipamNetmaskLength gets no adopt guard of its own, deliberately. Its landing-zone
-	// validation references only ipam_pool_id, never network_mode — so it is already
-	// constrained transitively (a pool is rejected above, and no pool requires a zero
-	// netmask, which Validate checks under create). Adding one here would report two errors
-	// for one mistake and imply that adjusting the netmask could help.
+	// validation references only ipam_pool_id, never network_mode, so an adopt guard here
+	// would report two errors for one mistake and imply that adjusting the netmask could
+	// help. It is constrained from two directions instead: WITH a pool, the pool is rejected
+	// just above and the netmask is beside the point; WITHOUT one, Validate's
+	// `IPAMPoolID == ""` case rejects a non-zero netmask in BOTH modes — which it only does
+	// because that switch skips its relationship checks for `adopt AND a pool` rather than
+	// for adopt outright. Skipping on adopt alone left this field unconstrained under adopt
+	// and constrained under create, and adoptEnv never injects it, so the value was dropped
+	// with nothing said. See the switch in Validate.
 
 	// ---- adopt: the four checks landing-zone cannot make -----------------------------
 	//

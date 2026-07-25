@@ -33,12 +33,20 @@ import (
 // validation timeout, and watched the whole thing be torn back down. Every `dns:`-enabled
 // install ended this way, including one using the shipped examples/rackctl.yaml verbatim.
 //
-// Both variables have to be sent, and sending only domain_name would be worse than sending
-// neither: the zone would then be correct while the certificate was still requested for
-// *.development.example.com, so the validation records would be written into the org's real
-// zone for a name it does not cover — the same unsatisfiable wait, now with a plausible-looking
-// zone to make it harder to diagnose.
-func dnsEnv(st *engine.State) ([]string, error) {
+// Both variables have to be sent, and the certificate is not a nicety on top of the zone.
+// dns/main.tf derives each validation record's NAME from the certificate and its ZONE from
+// domain_name, so overriding only domain_name asks Route53 to write
+// `_<hash>.development.example.com` into the acme.example.com zone. Route53 rejects an
+// out-of-zone RRSet with InvalidChangeBatch, so that combination fails within seconds at
+// record creation — loud and fast, but still after the cluster is built and therefore still
+// a full teardown.
+//
+// That is the durable reason for the override, and it is worth stating precisely because it
+// SURVIVES wait_for_validation = false: the validation record must fall inside the zone this
+// component creates, whatever the wait is set to. A justification framed around the wait
+// would read as obsolete the moment the wait was disabled, and invite someone to drop the
+// override.
+func dnsEnv(st *engine.State, verb string) ([]string, error) {
 	// Unreachable by construction — CoreComponents appends "dns" only when the block is
 	// present and non-empty — but this is the one place where getting it wrong reintroduces
 	// exactly the bug above (an apply that silently uses the leaf's placeholder), so it fails
@@ -63,9 +71,13 @@ func dnsEnv(st *engine.State) ([]string, error) {
 	// repoints the delegation — an out-of-band act that may take days. Waiting on it inside a
 	// day-0 install makes the install fail for a reason that is not a failure.
 	//
-	// The certificate is still requested, and still validates on its own once delegation
-	// lands: ACM retries for 72 hours, and the validation record is already in the zone. So
-	// nothing is lost except the block.
+	// The certificate is still requested, and the validation record is already in the zone,
+	// so it issues on its own IF the delegation lands inside ACM's window. That window is a
+	// hard expiry, not a patient retry: after 72 hours the request reaches "Validation timed
+	// out" and has to be re-requested. Since the delegation is a registrar change that may
+	// well take longer than three days, the operator note below says so and says what to do
+	// — a re-apply of the dns component requests a fresh certificate, because the provider
+	// treats a timed-out certificate as absent and clears it from state.
 	certs := map[string]any{
 		"wildcard": map[string]any{
 			"domain_name":               "*." + zone,
@@ -89,13 +101,42 @@ func dnsEnv(st *engine.State) ([]string, error) {
 	}
 	env = append(env, "TF_VAR_acm_certificates="+string(blob))
 
+	// enable_dnssec = false, for the same reason and against the same class of leaf pin.
+	//
+	// The PRODUCTION dns leaf pins enable_dnssec = true (development and staging pin false).
+	// Under create mode that builds an aws_kms_key with ECC_NIST_P256/SIGN_VERIFY and hands
+	// its ARN to aws_route53_key_signing_key — but Route53 requires a DNSSEC signing key in
+	// us-east-1, and the dns component declares no aliased provider, so the key is minted in
+	// the leaf's own region. Every committed leaf is us-west-2, and componentDir can only
+	// address live/aws/workload-<env>/<region>/…, so there is no region where this succeeds.
+	// CreateKeySigningKey rejects it immediately, in the substrate phase, after the cluster is
+	// built — the same paid-for-then-torn-down outcome as the placeholder domain, on a
+	// different pin. `environment: production` plus a dns block hit it every time.
+	//
+	// False is also the semantically right answer, not just the one that applies: DNSSEC
+	// establishes a chain of trust from the parent zone, and the parent delegation has not
+	// been repointed yet at day 0 — there is nothing to chain to. Signing a zone is an owner
+	// act to take deliberately once delegation is live, which is why it is not something a
+	// day-0 installer should be turning on implicitly.
+	env = append(env, "TF_VAR_enable_dnssec=false")
+
 	note(st, "dns: TF_VAR_acm_certificates — one wildcard cert for *.%s (SAN %s), requested but "+
 		"NOT waited on", zone, zone)
-	note(st, "dns: point %s's NS records at this zone's name servers to finish issuing the "+
-		"certificate. rackctl does not wait: the zone is being created by this apply, so the "+
-		"delegation cannot exist yet and ACM's DNS validation could never resolve. It retries "+
-		"for 72 hours and the validation record is already in the zone, so the cert issues on "+
-		"its own once the delegation lands", zone)
+	note(st, "dns: TF_VAR_enable_dnssec=false — the production leaf pins this true, which needs a "+
+		"signing key in us-east-1 while the component mints it in the leaf's own region, so the "+
+		"apply fails at CreateKeySigningKey. There is also nothing to chain trust to until the "+
+		"parent delegation is repointed; sign the zone deliberately once it is")
+
+	// Apply only. Told to an operator during `destroy dns`, this instructs them to point a
+	// live domain's delegation at name servers the same run is in the middle of deleting.
+	if verb != "destroy" {
+		note(st, "dns: NEXT, and rackctl cannot do it — point %s's NS records at this zone's name "+
+			"servers. Until that lands, ACM cannot resolve the certificate's validation record over "+
+			"public DNS, and the request EXPIRES after 72 hours with status \"Validation timed out\". "+
+			"If the delegation takes longer than that, re-apply the dns component to request a fresh "+
+			"certificate. rackctl does not wait, because the zone is being created by this apply, so "+
+			"the delegation cannot exist yet", zone)
+	}
 
 	return env, nil
 }
