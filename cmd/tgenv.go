@@ -54,9 +54,33 @@ func tgEnv(cfg *config.Config) []string {
 		"AWS_PROFILE=" + cfg.Cloud.Profile,
 		"AWS_REGION=" + cfg.Cloud.Region,
 		"TERRAGRUNT_ACCOUNT_ID=" + cfg.Cloud.AccountID,
-		// Safe to pass unconditionally: it is exactly CoreComponents' own condition for
-		// including managed-monitoring, so it is true iff the SSM parameters exist.
-		"TF_VAR_enable_managed_monitoring=" + strconv.FormatBool(cfg.Addons.Observability),
+		// Both derived from the one tier field, so they cannot disagree.
+		//
+		// observability_tier is published as the observability/tier label on the ArgoCD cluster
+		// Secret, and every tier-aware eks-gitops ApplicationSet either selects on it or derives
+		// a value from it. Every committed cluster-bootstrap leaf pins it to full, so passing it
+		// changes nothing in the common case and is what makes `tier: floor` reachable at all.
+		//
+		// enable_managed_monitoring is a second, wider switch on the same Secret. It is not just
+		// the Grafana URL: it un-guards five SSM reads and stamps the `monitoring/managed` label
+		// that the opencost ApplicationSet selects on as its ONLY selector, plus the
+		// monitoring/* annotations and the Loki and Tempo bucket annotations that decide whether
+		// those two get durable S3 storage or fall back to filesystem.
+		//
+		// So the safety argument is not "managed-monitoring ran". Two of those five parameters —
+		// loki_bucket and tempo_bucket — are published by CLUSTER-ADDONS, not managed-monitoring.
+		// Setting this flag is safe because the substrate phase applies BOTH components before
+		// the gitops phase runs cluster-bootstrap, which is the same ordering the committed
+		// leaves express as an explicit dependency. That phase boundary is the precondition; the
+		// tier is only what decides whether it is wanted.
+		// Labels this cluster eks-agent-platform/accelerators=true so the accelerators
+		// ApplicationSet (gpu-operator, nvidia-dra-driver) targets it. Opt-in and unset in every
+		// committed leaf, because a GPU driver on a cluster with no GPU nodes cannot even pull
+		// its image (nvcr.io wants an NGC key) and has nothing to schedule on. Same class as the
+		// flags above: opt-in BECAUSE it depends on the shape of the cluster rackctl just built.
+		"TF_VAR_enable_accelerators=" + strconv.FormatBool(cfg.Addons.Accelerators),
+		"TF_VAR_observability_tier=" + string(cfg.Observability.Tier),
+		"TF_VAR_enable_managed_monitoring=" + strconv.FormatBool(cfg.FullObservability()),
 	}
 	if u := cfg.Org.GitOps.GitURL(); u != "" {
 		env = append(env, "TF_VAR_gitops_repo_url="+u)

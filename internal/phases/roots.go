@@ -13,8 +13,9 @@ import (
 // A guard that fires without naming the knob is a dead end for the operator reading it.
 var componentGateRemedy = map[string]string{
 	"agent-iam":          "set agentPlatform.enable: false (which also skips the agent operator wait in phase 6)",
-	"managed-monitoring": "set addons.observability: false",
+	"managed-monitoring": "set observability.tier: floor",
 	"dns":                "remove the dns block",
+	"druid":              "set addons.druid: false",
 	"model-import":       "set agentPlatform.modelImport: false",
 }
 

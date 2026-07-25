@@ -490,8 +490,8 @@ type dashboardList struct {
 func CheckDashboards(ctx context.Context, env *Env) Result {
 	const name = "dashboards"
 
-	if !env.Cfg.Addons.Observability {
-		return skip(name, "addons.observability is off")
+	if !env.Cfg.FullObservability() {
+		return skip(name, "observability.tier is floor — no AMP/AMG to assert")
 	}
 
 	var ds dashboardList

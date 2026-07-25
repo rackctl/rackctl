@@ -56,12 +56,12 @@ func TestCoreComponents_ManagedMonitoringPrecedesClusterBootstrap(t *testing.T) 
 	// amp_endpoint, amp_workspace_id) to stamp them onto the ArgoCD cluster
 	// Secret. Applying it after cluster-bootstrap fails the read.
 	cfg := baseCfg()
-	cfg.Addons.Observability = true
+	cfg.Observability.Tier = config.TierFull
 	comps := CoreComponents(cfg)
 
 	mm, cb := indexOf(comps, "managed-monitoring"), indexOf(comps, "cluster-bootstrap")
 	if mm < 0 {
-		t.Fatalf("managed-monitoring missing when addons.observability is set; got %v", comps)
+		t.Fatalf("managed-monitoring missing at tier=full; got %v", comps)
 	}
 	if mm > cb {
 		t.Fatalf("managed-monitoring (%d) must precede cluster-bootstrap (%d): cluster-bootstrap reads its SSM params; got %v", mm, cb, comps)
@@ -127,7 +127,7 @@ func TestSubstrate_TeardownIsTheExactReverseOfApply(t *testing.T) {
 		"defaults": baseCfg(),
 		"all-on": func() *config.Config {
 			c := baseCfg()
-			c.Addons.Observability = true
+			c.Observability.Tier = config.TierFull
 			c.DNS = &config.DNS{HostedZone: "example.com"}
 			c.AgentPlatform.ModelImport = true
 			return c
@@ -166,7 +166,7 @@ func TestCoreComponents_ModelImportIsDestroyedLikeAnythingElse(t *testing.T) {
 
 func TestCoreComponents_NetworkFirst(t *testing.T) {
 	cfg := baseCfg()
-	cfg.Addons.Observability = true
+	cfg.Observability.Tier = config.TierFull
 	cfg.DNS = &config.DNS{HostedZone: "example.com"}
 	comps := CoreComponents(cfg)
 
@@ -230,7 +230,7 @@ func TestPhases_SubstrateBeforeGitOps(t *testing.T) {
 	// meaningless.
 	for name, cfg := range map[string]*config.Config{
 		"defaults":      baseCfg(),
-		"observability": func() *config.Config { c := baseCfg(); c.Addons.Observability = true; return c }(),
+		"observability": func() *config.Config { c := baseCfg(); c.Observability.Tier = config.TierFull; return c }(),
 		"dns":           func() *config.Config { c := baseCfg(); c.DNS = &config.DNS{HostedZone: "x.com"}; return c }(),
 		"model-import":  func() *config.Config { c := baseCfg(); c.AgentPlatform.ModelImport = true; return c }(),
 	} {
@@ -253,7 +253,7 @@ func TestSubstrateComponents_IsSubsequenceOfCore(t *testing.T) {
 		"defaults": baseCfg(),
 		"all-on": func() *config.Config {
 			c := baseCfg()
-			c.Addons.Observability = true
+			c.Observability.Tier = config.TierFull
 			c.DNS = &config.DNS{HostedZone: "example.com"}
 			c.AgentPlatform.ModelImport = true
 			return c
@@ -435,5 +435,75 @@ func TestComponentEnv_ScopesVariablesToTheComponentThatDeclaresThem(t *testing.T
 	// A component with no per-run inputs gets nothing at all.
 	if env, err := componentEnv(context.Background(), st, "secrets"); err != nil || len(env) != 0 {
 		t.Errorf("secrets declares no per-run inputs, so it must receive none; got %v (err %v)", env, err)
+	}
+}
+
+// The observability component is applied on BOTH tiers, and it is not optional.
+//
+// It is the sole producer of the three
+// /eks-agent-platform/<cluster>/observability/alerts_{critical,warning,info}_topic_arn
+// parameters. landing-zone's CloudWatch alarms are the floor tier's ONLY alerting, and the
+// full tier adds to them rather than replacing them — so gating this on the tier would
+// leave a floor cluster with no alert routing at all. rackctl applied it nowhere until now,
+// which left every rackctl-installed cluster with an alerting control loop and no producer.
+func TestCoreComponents_ObservabilityIsAppliedOnEveryTier(t *testing.T) {
+	for _, tier := range []config.ObservabilityTier{config.TierFull, config.TierFloor} {
+		cfg := baseCfg()
+		cfg.Observability.Tier = tier
+		comps := CoreComponents(cfg)
+		if indexOf(comps, "observability") < 0 {
+			t.Errorf("tier %q: observability must be applied — it is the only producer of the "+
+				"alert topic ARNs, and both tiers alert; got %v", tier, comps)
+		}
+		if indexOf(substrateComponents(cfg), "observability") < 0 {
+			t.Errorf("tier %q: the substrate phase must own observability; got %v",
+				tier, substrateComponents(cfg))
+		}
+	}
+}
+
+// managed-monitoring follows the tier, and only the tier.
+func TestCoreComponents_ManagedMonitoringFollowsTheTier(t *testing.T) {
+	full := baseCfg()
+	full.Observability.Tier = config.TierFull
+	if indexOf(CoreComponents(full), "managed-monitoring") < 0 {
+		t.Error("the full tier must apply managed-monitoring — it publishes the AMP endpoint the " +
+			"tier-gated ExternalSecret reads, and nothing else does")
+	}
+
+	floor := baseCfg()
+	floor.Observability.Tier = config.TierFloor
+	if indexOf(CoreComponents(floor), "managed-monitoring") >= 0 {
+		t.Error("the floor tier must NOT apply managed-monitoring — AMP and AMG both cost money " +
+			"and floor is CloudWatch only")
+	}
+}
+
+// observability must precede cluster-addons, and it must land before anything that resolves
+// its SSM parameters at PLAN time — eks-agent-platform's kill-switch burn-rate rules read
+// both topic ARNs through unguarded `data` blocks, so the ordering is load-bearing rather
+// than tidy once rackctl applies that tree.
+func TestCoreComponents_ObservabilityPrecedesTheGitOpsConsumers(t *testing.T) {
+	cfg := baseCfg()
+	comps := CoreComponents(cfg)
+	obs := indexOf(comps, "observability")
+	for _, later := range []string{"cluster-addons", "cluster-bootstrap"} {
+		if i := indexOf(comps, later); obs > i {
+			t.Errorf("observability (%d) must precede %s (%d); got %v", obs, later, i, comps)
+		}
+	}
+}
+
+// druid is opt-in and reaches the apply list when asked for. It was declared, defaulted and
+// documented for a long time while no code path read it — a knob that looks like a feature
+// and does nothing, which is the failure class the rest of this repo exists to kill.
+func TestCoreComponents_DruidIsOptInAndReachable(t *testing.T) {
+	if comps := CoreComponents(baseCfg()); indexOf(comps, "druid") >= 0 {
+		t.Fatalf("druid must be opt-in — it provisions Aurora Serverless and optionally MSK; got %v", comps)
+	}
+	cfg := baseCfg()
+	cfg.Addons.Druid = true
+	if comps := CoreComponents(cfg); indexOf(comps, "druid") < 0 {
+		t.Fatalf("addons.druid must reach the apply list; got %v", comps)
 	}
 }
