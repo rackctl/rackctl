@@ -34,9 +34,12 @@ import (
 //   - managed-monitoring provisions AMP + AMG and writes the endpoints to SSM.
 //     cluster-bootstrap READS those SSM params (grafana_url, amp_endpoint,
 //     amp_workspace_id) to stamp them onto the ArgoCD cluster Secret, so it must be
-//     applied BEFORE cluster-bootstrap or the read fails. It is gated on
-//     addons.observability because AMP and AMG both cost money — it is never
-//     applied unless asked for.
+//     applied BEFORE cluster-bootstrap or the read fails. It is gated on the FULL
+//     observability tier, and that gate is the whole invariant: tier=full means the
+//     full-tier OTel gateway will mount AMP_REMOTE_WRITE_URL from a Secret that
+//     external-secrets syncs out of AWS Secrets Manager, and this component is the only thing
+//     that writes that entry. Nothing in Terraform can check that cross-root fact — rackctl
+//     is the only place it can be held.
 //
 //   - dns creates the hosted zone + external-dns identity; gated on a dns block.
 //
@@ -63,8 +66,28 @@ func CoreComponents(cfg *config.Config) []string {
 	if cfg.AgentPlatform.Enabled() {
 		comps = append(comps, "agent-iam")
 	}
-	if cfg.Addons.Observability {
+	if cfg.FullObservability() {
 		comps = append(comps, "managed-monitoring") // must precede cluster-bootstrap
+	}
+	// observability is NOT conditional, and it is gated on nothing: it publishes the three
+	// /eks-agent-platform/<cluster>/observability/alerts_{critical,warning,info}_topic_arn
+	// parameters unconditionally, and it is their sole producer. rackctl applied it nowhere at
+	// all until now, so every rackctl-installed cluster had consumers of that contract and no
+	// producer.
+	//
+	// Its POSITION here is currently arbitrary — no component rackctl applies reads those
+	// parameters, so only the phase boundary (substrate before gitops) is load-bearing. It is
+	// placed early because the consumer that WILL bind is eks-agent-platform's kill-switch,
+	// whose burn-rate rules resolve both topic ARNs through unguarded `data` blocks at PLAN
+	// time. rackctl does not apply that tree yet; when it does, this ordering stops being
+	// arbitrary and starts being required.
+	comps = append(comps, "observability")
+	// druid is the per-tenant analytics substrate (Aurora Serverless + optionally MSK), gated
+	// because it is real money and most platforms never need it. Its live leaf is
+	// self-sufficient — it carries its own `tenants` sizing map — and it depends on network and
+	// cluster, both of which the cluster phase applied before this one.
+	if cfg.Addons.Druid {
+		comps = append(comps, "druid")
 	}
 	if cfg.DNS != nil && cfg.DNS.HostedZone != "" {
 		comps = append(comps, "dns")
@@ -548,6 +571,21 @@ type substrate struct{ base }
 func (substrate) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	note(st, "building the AWS substrate the catalog consumes (IAM, Pod Identity, buckets, monitoring)")
+
+	// Disclose the tier, because rackctl injects it over whatever the leaf pinned and every
+	// other lever that does that prints what it would land (see network.go). floor gets the
+	// louder line: it is the one value that can PRUNE a running cluster's telemetry, since
+	// re-running init is normal and an ambient TF_VAR wins over the leaf.
+	if st.Config.FullObservability() {
+		note(st, "observability tier: full — applying managed-monitoring (AMP + AMG) and labelling the cluster "+
+			"observability/tier=full, which is what the in-cluster LGTM stack and the AMP remote-write Secret "+
+			"select on")
+	} else {
+		note(st, "observability tier: FLOOR — managed-monitoring is NOT applied. Metrics go to CloudWatch as EMF, "+
+			"logs to CloudWatch Logs, traces to X-Ray. On a cluster that previously ran full this PRUNES Loki, "+
+			"Tempo, grafana-operator and the dashboards, with a telemetry gap while it converges — see "+
+			"eks-gitops/docs/runbooks/observability-tier.md")
+	}
 
 	// Say exactly what model-import provisions, and — more importantly — what it does
 	// not. It is easy to read "model import is on" as "an open-weight model will work",

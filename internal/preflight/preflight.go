@@ -252,7 +252,18 @@ func CheckCollisions(ctx context.Context, env *Env) doctor.Result {
 	add := func(what string) { found = append(found, what) }
 
 	// KMS aliases — the create-time conflict that cannot be retried out of.
-	for _, alias := range []string{"alias/eks/" + cluster, "alias/" + envName + "-platform-secrets"} {
+	//
+	// Every alias a component rackctl applies can mint must be listed here, because scheduling
+	// the KEY for deletion does not free the ALIAS: the next install dies on
+	// AliasAlreadyExists against a key that can no longer be revived. `<cluster>-alerts` is the
+	// observability component's, and it became reachable the moment that component went into
+	// CoreComponents unconditionally — a check that enumerates two of three aliases passes a
+	// run it should have blocked, which is worse than not checking at all.
+	for _, alias := range []string{
+		"alias/eks/" + cluster,
+		"alias/" + envName + "-platform-secrets",
+		"alias/" + cluster + "-alerts", // observability's alert-topic CMK
+	} {
 		if out, err := env.aws(ctx, "kms", "list-aliases", "--query",
 			fmt.Sprintf("length(Aliases[?AliasName=='%s'])", alias)); err == nil && strings.TrimSpace(out) != "0" {
 			add("KMS " + alias)

@@ -213,3 +213,54 @@ func TestApplyDefaults(t *testing.T) {
 		t.Errorf("eksGitopsRepo = %q, want derived from org", c.Org.GitOps.EKSGitopsRepo)
 	}
 }
+
+// The tier defaults to full and is a closed enum.
+//
+// Default full is deliberate: a rackctl-installed platform is the full agent platform, and
+// it matches what all four committed cluster-bootstrap leaves already pin. floor is the
+// opt-down for a cluster that should not carry AMP/AMG cost.
+//
+// The enum must be closed because the value is published as the observability/tier label on
+// the ArgoCD cluster Secret and eight eks-gitops ApplicationSet generators select on it. A
+// typo does not fail anything — it produces a label that matches no generator, so the
+// cluster comes up with the OTel node agent and nothing else. That is the quietest possible
+// failure, which is exactly why it is rejected here.
+func TestValidate_ObservabilityTier(t *testing.T) {
+	if got := Default().Observability.Tier; got != TierFull {
+		t.Errorf("the default tier must be full, got %q", got)
+	}
+
+	c := valid()
+	if c.Observability.Tier != TierFull {
+		t.Errorf("ApplyDefaults must fill the tier, got %q", c.Observability.Tier)
+	}
+
+	for _, tier := range []ObservabilityTier{TierFull, TierFloor} {
+		c := valid()
+		c.Observability.Tier = tier
+		if err := c.Validate(); err != nil {
+			t.Errorf("tier %q must validate: %v", tier, err)
+		}
+		if got := c.FullObservability(); got != (tier == TierFull) {
+			t.Errorf("FullObservability() = %v for tier %q", got, tier)
+		}
+	}
+
+	for _, bad := range []ObservabilityTier{"Full", "FULL", "none", "amp", "true"} {
+		c := valid()
+		c.Observability.Tier = bad
+		if err := c.Validate(); err == nil {
+			t.Errorf("tier %q must be rejected — an unrecognised label matches no ApplicationSet "+
+				"generator, so the cluster silently gets the node agent and nothing else", bad)
+		}
+	}
+}
+
+// An empty tier is filled by ApplyDefaults, never left to reach Validate as a blank label.
+func TestApplyDefaults_FillsTheObservabilityTier(t *testing.T) {
+	c := &Config{Org: Org{Name: "acme"}}
+	c.ApplyDefaults()
+	if c.Observability.Tier != TierFull {
+		t.Errorf("tier = %q, want full — a blank label matches no generator", c.Observability.Tier)
+	}
+}

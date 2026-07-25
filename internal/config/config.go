@@ -62,6 +62,7 @@ type Config struct {
 	Cluster       Cluster       `json:"cluster"`
 	Quotas        Quotas        `json:"quotas"`
 	Addons        Addons        `json:"addons"`
+	Observability Observability `json:"observability"`
 	DNS           *DNS          `json:"dns,omitempty"`
 	AgentPlatform AgentPlatform `json:"agentPlatform"`
 	ControlPlane  ControlPlane  `json:"controlPlane"`
@@ -203,10 +204,67 @@ type Quotas struct {
 }
 
 type Addons struct {
-	Observability bool `json:"observability"` // managed-monitoring (AMP+AMG)
-	Druid         bool `json:"druid"`
-	Accelerators  bool `json:"accelerators"` // gpu-operator / neuron
+	Druid        bool `json:"druid"`
+	Accelerators bool `json:"accelerators"` // gpu-operator / neuron
 }
+
+// ObservabilityTier selects which observability substrate a cluster runs. It mirrors
+// landing-zone's cluster-bootstrap var.observability_tier, which publishes it as the
+// `observability/tier` label on the ArgoCD cluster Secret — and eight eks-gitops
+// ApplicationSet generators select on that label.
+type ObservabilityTier string
+
+const (
+	// TierFloor is the provider-native tier: the amazon-cloudwatch-observability addon
+	// publishes ContainerInsights metrics, and the OTel gateway exports metrics as CloudWatch
+	// EMF, logs to CloudWatch Logs, and traces to AWS X-Ray. No signal is dropped — floor is
+	// a different backend, not a smaller one.
+	TierFloor ObservabilityTier = "floor"
+	// TierFull is floor plus the in-cluster LGTM stack (Loki, Tempo, kube-state-metrics,
+	// grafana-operator) and Amazon Managed Prometheus / Grafana.
+	TierFull ObservabilityTier = "full"
+)
+
+// Observability is the cluster's observability substrate.
+//
+// One field, deliberately, because the two knobs this replaces could express a state that
+// cannot work. landing-zone's cluster-bootstrap takes `observability_tier` and
+// `enable_managed_monitoring` as INDEPENDENT variables with nothing relating them, so
+// `tier = full` with no managed-monitoring is representable — and rackctl's old
+// `addons.observability: false` produced exactly that, because every committed leaf pins
+// tier=full and rackctl overrode only the flag.
+//
+// What breaks, concretely: the full-tier OTel gateway mounts AMP_REMOTE_WRITE_URL from a
+// Kubernetes Secret that external-secrets syncs out of AWS SECRETS MANAGER — the
+// `<cluster>-managed-monitoring-endpoints` entry, through the aws-secrets-manager
+// ClusterSecretStore. That is not SSM, and the distinction matters to whoever debugs it: the
+// managed-monitoring component publishes three SSM parameters AND that Secrets Manager entry,
+// so grepping SSM tells you nothing about this failure. The loud symptom comes first — the
+// gateway pod stuck in CreateContainerConfigError because the Secret it mounts does not
+// exist — with the ExternalSecret's SecretSyncedError behind it.
+//
+// The invariant is cross-root and therefore unexpressible as a Terraform validation:
+// tier=full REQUIRES the managed-monitoring component to have applied, because that component
+// is the only thing that writes that Secrets Manager entry. No variable block can see whether
+// another root ran. rackctl can — it is the thing that decides — so the tier is what gates
+// applying the component, and the incoherent combination stops being expressible at all.
+type Observability struct {
+	// Tier defaults to full. A rackctl-installed platform is the full agent platform; floor
+	// is the deliberate opt-down for a cluster that should not carry AMP/AMG cost. Floor is
+	// not free either — its cost is EMF custom-metric cardinality, and that lever lives in the
+	// eks-gitops values file rather than here.
+	//
+	// Treat the tier as a day-0 decision for a given cluster. rackctl injects it
+	// unconditionally, and an ambient TF_VAR overrides the value a leaf pinned, so re-running
+	// init with the tier changed is not a no-op: full→floor prunes Loki, Tempo,
+	// grafana-operator and the dashboards, with a telemetry gap while it happens. See
+	// eks-gitops/docs/runbooks/observability-tier.md before flipping one on a live cluster.
+	Tier ObservabilityTier `json:"tier"`
+}
+
+// FullObservability reports whether this cluster runs the full tier — and therefore whether
+// managed-monitoring is applied for it.
+func (c *Config) FullObservability() bool { return c.Observability.Tier == TierFull }
 
 type DNS struct {
 	HostedZone string `json:"hostedZone"`
@@ -276,8 +334,8 @@ func Default() *Config {
 			SystemNodes:          NodeGroup{InstanceTypes: []string{"m7g.xlarge"}, MinSize: 2, MaxSize: 6, DesiredSize: 2},
 			Network:              ClusterNet{VPCCIDR: defaultVPCCIDR, NATGateways: 1},
 		},
-		Quotas: Quotas{AutoRequest: true, VCPU: 256},
-		Addons: Addons{Observability: true},
+		Quotas:        Quotas{AutoRequest: true, VCPU: 256},
+		Observability: Observability{Tier: TierFull},
 		AgentPlatform: AgentPlatform{
 			Enable:               boolPtr(true),
 			BedrockModelFamilies: []string{"anthropic", "amazon-nova"},
@@ -313,6 +371,11 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Cluster.Network.NATGateways == 0 {
 		c.Cluster.Network.NATGateways = d.Cluster.Network.NATGateways
+	}
+	// Default the tier field itself, not the whole struct — same rule as ClusterNet below:
+	// replacing a sub-struct wholesale is how a deliberately-set sibling field gets wiped.
+	if c.Observability.Tier == "" {
+		c.Observability.Tier = d.Observability.Tier
 	}
 	if c.Quotas.VCPU == 0 {
 		c.Quotas = d.Quotas
@@ -408,6 +471,15 @@ func (c *Config) Validate() error {
 	// Centralized egress has nothing to route the default egress to without a TGW.
 	if n.CentralizedEgress && n.TransitGatewayID == "" {
 		errs = append(errs, "cluster.network.centralizedEgress requires cluster.network.transitGatewayId — there is nothing to route the private default egress to without a transit gateway")
+	}
+	switch c.Observability.Tier {
+	case TierFloor, TierFull:
+	default:
+		errs = append(errs, fmt.Sprintf("observability.tier must be %q or %q, got %q — the value is published as "+
+			"the observability/tier label on the ArgoCD cluster Secret, and every tier-aware eks-gitops "+
+			"ApplicationSet either selects on it or derives a value from it. An unrecognised tier matches no "+
+			"generator at all, so the cluster comes up with the OTel node agent and nothing else",
+			TierFull, TierFloor, c.Observability.Tier))
 	}
 	// model-import. Both rules exist for the same reason the network levers above do:
 	// the component APPLIES CLEANLY in either wrong configuration and is silently
