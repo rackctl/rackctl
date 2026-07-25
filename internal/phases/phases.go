@@ -525,6 +525,11 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 			return err
 		}
 	}
+	// Both components' outputs, not just the cluster's. The agent-platform substrate (phase 6)
+	// needs vpc_id, private_subnet_ids and the two route-table lists from `network`, and there
+	// is no SSM fallback for any of them — the network component publishes no SSM parameters at
+	// all, so a terragrunt output read here is the only channel.
+	captureOutputs(ctx, st, "network")
 	captureOutputs(ctx, st, "cluster")
 	if err := st.Runner.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", st.Config.ClusterName()); err != nil {
 		return err
@@ -669,6 +674,13 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 	for _, comp := range substrateComponents(st.Config) {
 		if err := apply(ctx, st, comp); err != nil {
 			return err
+		}
+		// The secrets CMK is the one landing-zone value the agent-platform substrate cannot get
+		// any other way: it is a single key serving BOTH of that tree's kms variables, and the
+		// network component publishes no SSM parameters at all, so a terragrunt output read is
+		// the only channel for either.
+		if comp == "secrets" {
+			captureOutputs(ctx, st, "secrets")
 		}
 	}
 	captureOutputs(ctx, st, "cluster-addons")
@@ -842,6 +854,19 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 		note(st, "agentPlatform.enable=false — skipping the agent operator")
 		return nil
 	}
+	// The AWS substrate this operator governs with, applied BEFORE the wait below.
+	//
+	// rackctl applied none of it until now, and the operator is the thing that notices: it
+	// reads SSM at startup for kill-switch.event_bus_name, cost-pipeline.athena_workgroup,
+	// cost-pipeline.athena_database and bedrock.baseline_guardrail_id, and its budget
+	// reconciler queries the Athena workgroup cost-pipeline creates. ArgoCD deployed the
+	// operator one phase ago, so it has already come up without them; applying here and then
+	// waiting for Available is what lets it recover on its next restart rather than being
+	// declared healthy while blind.
+	if err := applyAgentPlatform(ctx, st); err != nil {
+		return err
+	}
+
 	note(st, "agent operator + CRDs are owned by the GitOps catalog (addons-agent-operator); waiting for convergence")
 	if arn := st.Outputs["operator_role_arn"]; arn != "" {
 		note(st, "operator role: %s", arn)
@@ -863,10 +888,24 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 	return nil
 }
 
-// Teardown is a no-op: the operator is an ArgoCD Application, so it is removed when
-// the cluster is. Uninstalling a Helm release rackctl no longer creates would fail,
-// and deleting it out from under ArgoCD would just make ArgoCD put it back.
-func (platform) Teardown(context.Context, *engine.State) error { return nil }
+// Teardown destroys the agent-platform AWS substrate this phase applied.
+//
+// The operator itself is untouched, for the reason this used to be a no-op entirely: it is an
+// ArgoCD Application, so it goes when the cluster does. Uninstalling a Helm release rackctl
+// no longer creates would fail, and deleting it out from under ArgoCD would just make ArgoCD
+// put it back.
+//
+// The terraform tree is different — rackctl applies it directly, so rackctl owns unwinding
+// it, and it has to happen HERE rather than later in the rollback. Reverse-phase order puts
+// this before the substrate and cluster phases, which is exactly the constraint the tree
+// needs: its components resolve landing-zone's SSM parameters through unguarded data blocks
+// that a destroy plan still evaluates.
+func (platform) Teardown(ctx context.Context, st *engine.State) error {
+	if !st.Config.AgentPlatform.Enabled() {
+		return nil
+	}
+	return DestroyAgentPlatform(ctx, st)
+}
 
 // --- Phase 7 (optional): eks-fleet cluster control plane ---
 type fleet struct{ base }
