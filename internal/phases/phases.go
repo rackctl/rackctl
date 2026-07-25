@@ -223,6 +223,11 @@ func componentEnv(ctx context.Context, st *engine.State, component string) ([]st
 			return nil, err
 		}
 		return append(env, endpointEnv...), nil
+	case "dns":
+		// domain_name + acm_certificates. Both leaf-pinned to a *.example.com placeholder,
+		// and the certificate half is what makes a dns-enabled install fail after building a
+		// cluster. See dns.go.
+		return dnsEnv(st)
 	default:
 		return nil, nil
 	}
