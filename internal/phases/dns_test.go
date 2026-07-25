@@ -29,7 +29,7 @@ func dnsState(t *testing.T, zone string) (*engine.State, *strings.Builder) {
 // external-dns then filters on and manages nothing.
 func TestDNSEnv_SendsTheOperatorsZone(t *testing.T) {
 	st, _ := dnsState(t, "acme.example.com")
-	env, err := dnsEnv(st)
+	env, err := dnsEnv(st, "apply")
 	if err != nil {
 		t.Fatalf("dnsEnv: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestDNSEnv_SendsTheOperatorsZone(t *testing.T) {
 // a paid-for cluster torn back down.
 func TestDNSEnv_OverridesTheCertificateToo(t *testing.T) {
 	st, _ := dnsState(t, "acme.example.com")
-	env, err := dnsEnv(st)
+	env, err := dnsEnv(st, "apply")
 	if err != nil {
 		t.Fatalf("dnsEnv: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestDNSEnv_OverridesTheCertificateToo(t *testing.T) {
 // the operator with a zone, a pending certificate, and no idea what is expected of them.
 func TestDNSEnv_DisclosesTheDelegationStep(t *testing.T) {
 	st, out := dnsState(t, "acme.example.com")
-	if _, err := dnsEnv(st); err != nil {
+	if _, err := dnsEnv(st, "apply"); err != nil {
 		t.Fatalf("dnsEnv: %v", err)
 	}
 	if !strings.Contains(out.String(), "NS records") {
@@ -125,7 +125,7 @@ func TestDNSEnv_DisclosesTheDelegationStep(t *testing.T) {
 // much as the builder. A dns case that is never reached is the original bug.
 func TestComponentEnv_WiresDNS(t *testing.T) {
 	st, _ := dnsState(t, "acme.example.com")
-	env, err := componentEnv(context.Background(), st, "dns")
+	env, err := componentEnv(context.Background(), st, "dns", "apply")
 	if err != nil {
 		t.Fatalf("componentEnv(dns): %v", err)
 	}
@@ -140,7 +140,7 @@ func TestComponentEnv_WiresDNS(t *testing.T) {
 func TestComponentEnv_DNSVarsDoNotLeak(t *testing.T) {
 	st, _ := dnsState(t, "acme.example.com")
 	for _, comp := range []string{"network", "secrets", "agent-iam", "cluster-addons", "cluster-bootstrap"} {
-		env, err := componentEnv(context.Background(), st, comp)
+		env, err := componentEnv(context.Background(), st, comp, "apply")
 		if err != nil {
 			t.Fatalf("componentEnv(%s): %v", comp, err)
 		}
@@ -161,7 +161,7 @@ func TestDNSEnv_RefusesToApplyWithNoZone(t *testing.T) {
 	run.DryRun = true
 	st := &engine.State{Config: config.Default(), Runner: run} // DNS is nil
 
-	if _, err := dnsEnv(st); err == nil {
+	if _, err := dnsEnv(st, "apply"); err == nil {
 		t.Fatal("applying dns with no hostedZone must be an error, not an apply that quietly " +
 			"creates a hosted zone for example.com")
 	}
@@ -174,4 +174,66 @@ func contains(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// The third leaf pin, and the one that made `environment: production` plus a dns block fail
+// every time even after the domain and certificate were fixed.
+//
+// The production dns leaf pins enable_dnssec = true (development and staging pin false). Under
+// create mode that mints an ECC_NIST_P256/SIGN_VERIFY KMS key and hands its ARN to
+// aws_route53_key_signing_key — but Route53 requires a DNSSEC signing key in us-east-1, and the
+// component declares no aliased provider, so the key lands in the leaf's own region. Every
+// committed leaf is us-west-2 and componentDir can only address
+// live/aws/workload-<env>/<region>/…, so there is no region where this succeeds.
+// CreateKeySigningKey rejects it in the substrate phase, after the cluster is built, and
+// clean-on-failure tears the whole run down — the same outcome as the placeholder domain, on a
+// different pin.
+func TestDNSEnv_TurnsOffTheDNSSECTheProductionLeafPins(t *testing.T) {
+	st, _ := dnsState(t, "acme.example.com")
+	env, err := dnsEnv(st, "apply")
+	if err != nil {
+		t.Fatalf("dnsEnv: %v", err)
+	}
+	if !contains(env, "TF_VAR_enable_dnssec=false") {
+		t.Fatalf("the production leaf pins enable_dnssec = true, which needs a signing key in "+
+			"us-east-1 while the component mints one in the leaf's region — so the apply dies at "+
+			"CreateKeySigningKey after the cluster is already built.\ngot: %v", env)
+	}
+}
+
+// The forward-looking instruction must not print during a teardown.
+//
+// componentEnv is shared by apply and destroy — deliberately, so the two cannot drift on which
+// variables they inject — but a note saying "point your NS records at this zone's name servers
+// to finish issuing the certificate … the zone is being created by this apply" is an imperative
+// aimed at a human, and under `destroy dns` the run is DELETING that zone. An operator who acts
+// on it repoints a live domain's delegation at name servers being torn down.
+func TestDNSEnv_DoesNotTellTheOperatorToDelegateDuringATeardown(t *testing.T) {
+	st, out := dnsState(t, "acme.example.com")
+	if _, err := dnsEnv(st, "destroy"); err != nil {
+		t.Fatalf("dnsEnv: %v", err)
+	}
+	if strings.Contains(out.String(), "NS records") {
+		t.Fatalf("a destroy printed the NS-delegation instruction. The zone is being deleted, so "+
+			"this tells the operator to point a live domain at name servers that are going "+
+			"away.\ngot:\n%s", out.String())
+	}
+}
+
+// But the variables themselves must still be injected on the destroy path — a destroy plan
+// needs the same inputs the apply used, and a domain_name that reverted to the leaf's
+// placeholder would have terraform planning against a zone rackctl never created.
+func TestDNSEnv_StillInjectsEverythingOnDestroy(t *testing.T) {
+	st, _ := dnsState(t, "acme.example.com")
+	env, err := dnsEnv(st, "destroy")
+	if err != nil {
+		t.Fatalf("dnsEnv: %v", err)
+	}
+	for _, want := range []string{"TF_VAR_domain_name=acme.example.com", "TF_VAR_enable_dnssec=false"} {
+		if !contains(env, want) {
+			t.Errorf("destroy must inject %q too — suppressing a NOTE is not the same as dropping "+
+				"the variable, and a destroy planned against the leaf's placeholder domain targets a "+
+				"zone this platform never created", want)
+		}
+	}
 }

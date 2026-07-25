@@ -171,7 +171,7 @@ func componentDir(st *engine.State, component string) string {
 // A variable is scoped to the invocation that needs it, or it is a global — there is no
 // third thing, and `cmd/tgenv.go` is where the genuine globals live.
 func apply(ctx context.Context, st *engine.State, component string) error {
-	env, err := componentEnv(ctx, st, component)
+	env, err := componentEnv(ctx, st, component, "apply")
 	if err != nil {
 		return err
 	}
@@ -179,7 +179,7 @@ func apply(ctx context.Context, st *engine.State, component string) error {
 }
 
 func destroy(ctx context.Context, st *engine.State, component string) error {
-	env, err := componentEnv(ctx, st, component)
+	env, err := componentEnv(ctx, st, component, "destroy")
 	if err != nil {
 		return err
 	}
@@ -208,12 +208,18 @@ func Destroy(ctx context.Context, st *engine.State, component string) error {
 // Karpenter-discovery tags are per-cluster and applied by the CLUSTER component via
 // aws_ec2_tag, precisely because the VPC is shared per environment and cluster-agnostic.
 // The injection was inert and the reasoning was backwards.
-func componentEnv(ctx context.Context, st *engine.State, component string) ([]string, error) {
+// The verb matters only for what gets PRINTED. Every variable below is injected on both
+// paths — a destroy plan needs the same inputs the apply used — but a builder that prints
+// "do this next" is describing an apply, and printing that under `destroy dns` told the
+// operator to point a domain's NS records at name servers the same run was deleting. Notes
+// that merely state which value is being sent stay on both paths, because they are true on
+// both.
+func componentEnv(ctx context.Context, st *engine.State, component, verb string) ([]string, error) {
 	switch component {
 	case "network":
 		// The create-mode levers are network variables: ipam_pool_id, ipam_netmask_length,
 		// transit_gateway_id, centralized_egress.
-		return clusterNetworkEnv(st), nil
+		return clusterNetworkEnv(st, verb), nil
 	case "cluster":
 		// cluster_name plus the endpoint posture, all three cluster variables. The endpoint
 		// builder may detect this host's egress IP, so it can fail and must be able to say so.
@@ -224,10 +230,10 @@ func componentEnv(ctx context.Context, st *engine.State, component string) ([]st
 		}
 		return append(env, endpointEnv...), nil
 	case "dns":
-		// domain_name + acm_certificates. Both leaf-pinned to a *.example.com placeholder,
-		// and the certificate half is what makes a dns-enabled install fail after building a
-		// cluster. See dns.go.
-		return dnsEnv(st)
+		// domain_name + acm_certificates + enable_dnssec. All three leaf-pinned to values that
+		// fail or mislead, and two of them are what make a dns-enabled install fail after
+		// building a cluster. See dns.go.
+		return dnsEnv(st, verb)
 	default:
 		return nil, nil
 	}

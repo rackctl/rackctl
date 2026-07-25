@@ -8,11 +8,19 @@ import (
 // adoptCfg is a minimal VALID adopt config: mode, a VPC, and three private subnets. Every
 // create-mode lever is left at its default, which is the shape landing-zone's adopt guards
 // require — those defaults ARE the sentinels they compare against.
-func adoptCfg() *Config {
+// The baseline carries PUBLIC subnets too, so the private-only case below is a real
+// variation rather than a no-op. Without that, adoptCfg() already had a nil public list and
+// TestAdopt_NoPublicSubnetsIsValid asserted nil == nil — bit-for-bit the same config as
+// TestAdopt_MinimalConfigIsValid, leaving the happy path WITH public subnets untested.
+func adoptCfg(public ...string) *Config {
 	c := valid()
 	c.Cluster.Network.Mode = ModeAdopt
 	c.Cluster.Network.AdoptVPCID = "vpc-0abc123"
 	c.Cluster.Network.AdoptPrivateSubnetIDs = []string{"subnet-a1", "subnet-b2", "subnet-c3"}
+	if public == nil {
+		public = []string{"subnet-x9", "subnet-y8", "subnet-z7"}
+	}
+	c.Cluster.Network.AdoptPublicSubnetIDs = public
 	return c
 }
 
@@ -37,8 +45,7 @@ func TestAdopt_MinimalConfigIsValid(t *testing.T) {
 // A private-only adopt cluster is a supported shape — landing-zone blesses it explicitly
 // ("Empty is valid for a private-only cluster") — so an empty public list must not be an error.
 func TestAdopt_NoPublicSubnetsIsValid(t *testing.T) {
-	c := adoptCfg()
-	c.Cluster.Network.AdoptPublicSubnetIDs = nil
+	c := adoptCfg([]string{}...) // explicitly no public subnets, unlike the baseline
 	if got := errText(t, c); got != "" {
 		t.Fatalf("a private-only adopt cluster is valid upstream; rackctl must not reject it.\ngot: %s", got)
 	}
@@ -48,10 +55,10 @@ func TestAdopt_NoPublicSubnetsIsValid(t *testing.T) {
 // contradiction surfaces in a second instead of seconds-to-minutes into a tofu run naming a
 // Terraform variable the operator never typed.
 //
-// Four are compared against a DEFAULT rather than an empty value, because they have
-// meaningful defaults and so no unset state — the default is the sentinel. natGateways is the
-// one where getting that wrong would be silent: ApplyDefaults forces it to 1, so a guard
-// written against 0 would never fire.
+// Two of them — vpcCidr and natGateways — are compared against a DEFAULT rather than an empty
+// value, because ApplyDefaults forces both and so neither has an unset state: the default is
+// the sentinel. natGateways is the one where getting that wrong would be silent: ApplyDefaults
+// forces it to 1, so a guard written against 0 would never fire.
 func TestAdopt_RejectsEveryCreateModeLever(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -85,17 +92,43 @@ func TestAdopt_RejectsEveryCreateModeLever(t *testing.T) {
 // real mistake. Adding a second guard here would report two errors for one mistake and imply
 // that adjusting the netmask could help.
 func TestAdopt_IPAMPoolUnderAdoptReportsOneErrorNotTwo(t *testing.T) {
-	c := adoptCfg()
-	c.Cluster.Network.IPAMPoolID = "ipam-pool-0abc"
-	c.Cluster.Network.IPAMNetmaskLength = 16 // valid FOR a pool, so its own rule passes
+	// Both netmask values, because they exercise different arms. 16 is valid FOR a pool, so
+	// the create-mode rule would pass anyway; 0 is what that rule REJECTS when a pool is set,
+	// which is the case that proves Validate's adopt arm is being taken at all. Testing only
+	// 16 left the arm unpinned — deleting it entirely kept the whole suite green.
+	for _, netmask := range []int{16, 0} {
+		c := adoptCfg()
+		c.Cluster.Network.IPAMPoolID = "ipam-pool-0abc"
+		c.Cluster.Network.IPAMNetmaskLength = netmask
 
-	got := errText(t, c)
-	if !strings.Contains(got, "cluster.network.ipamPoolId") {
-		t.Fatalf("the pool itself must be rejected; got: %s", got)
+		got := errText(t, c)
+		if !strings.Contains(got, "cluster.network.ipamPoolId") {
+			t.Fatalf("netmask=%d: the pool itself must be rejected; got: %s", netmask, got)
+		}
+		if strings.Contains(got, "ipamNetmaskLength") {
+			t.Fatalf("netmask=%d: ipamNetmaskLength must not be reported — with a pool set it is "+
+				"beside the point, and naming it here suggests changing the netmask would help.\ngot: %s",
+				netmask, got)
+		}
 	}
-	if strings.Contains(got, "ipamNetmaskLength") {
-		t.Fatalf("ipamNetmaskLength must not be reported: it is constrained transitively through "+
-			"ipamPoolId, and naming it here suggests changing the netmask would help.\ngot: %s", got)
+}
+
+// The hole the adopt arm's condition closes. Skipping the create-mode relationship checks for
+// `adopt` outright — rather than for `adopt AND a pool` — made adopt strictly MORE permissive
+// than create for one field: this config validated clean while the identical create config was
+// rejected. And adoptEnv never injects ipam_netmask_length, so the value was dropped
+// invisibly, absent even from a dry-run.
+//
+// The reachable path: an operator converting a create config to adopt comments out ipamPoolId
+// and forgets the netmask on the line beneath it. Nothing said anything, and the stray line
+// stayed in their committed rackctl.yaml looking load-bearing.
+func TestAdopt_RejectsANetmaskWithNoPool(t *testing.T) {
+	c := adoptCfg()
+	c.Cluster.Network.IPAMNetmaskLength = 18 // no pool set
+
+	if got := errText(t, c); !strings.Contains(got, "ipamNetmaskLength") {
+		t.Fatalf("a netmask with no ipamPoolId must be rejected under adopt exactly as it is under "+
+			"create — it reaches nothing either way, and adopt must not be the laxer mode.\ngot: %s", got)
 	}
 }
 

@@ -298,7 +298,7 @@ func TestClusterNetworkEnv_InjectsLeversWhenSet(t *testing.T) {
 		TransitGatewayID:  "tgw-0abc123",
 		CentralizedEgress: true,
 	}
-	env := clusterNetworkEnv(testState(cfg))
+	env := clusterNetworkEnv(testState(cfg), "apply")
 	for _, want := range []string{
 		"TF_VAR_ipam_pool_id=ipam-pool-0abc123",
 		"TF_VAR_ipam_netmask_length=18",
@@ -324,7 +324,7 @@ func TestClusterNetworkEnv_OnlyTheModeWhenLeversOff(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Cluster.Network = config.ClusterNet{VPCCIDR: "10.0.0.0/16", NATGateways: 1}
 
-	env := clusterNetworkEnv(testState(cfg))
+	env := clusterNetworkEnv(testState(cfg), "apply")
 	if !slices.Contains(env, "TF_VAR_network_mode=create") {
 		t.Errorf("the mode must always be sent, and an omitted mode means create; got %v", env)
 	}
@@ -344,13 +344,16 @@ func TestClusterNetworkEnv_OnlyTheModeWhenLeversOff(t *testing.T) {
 // that looks inert. vpcCidr has the same shape and is harmless only because rackctl's default
 // happens to equal the leaves' value.
 //
-// Under ADOPT both ARE injected, and that is not a contradiction: there they neutralize
-// create-mode values the leaf pins which landing-zone rejects under adopt. See adoptEnv.
+// Under ADOPT, nat_gateways IS injected (as 1) together with enable_flow_logs=false, and that
+// is not a contradiction: those are the two values staging's and production's leaves pin that
+// landing-zone rejects under adopt, so neutralizing them is what makes adopt selectable there.
+// vpc_cidr is injected in NEITHER mode — no workload network leaf pins it, and a non-default
+// value is rejected outright under adopt. See adoptEnv.
 func TestClusterNetworkEnv_DoesNotInjectCreateModeSizing(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Cluster.Network = config.ClusterNet{VPCCIDR: "10.0.0.0/16", NATGateways: 1}
 
-	for _, e := range clusterNetworkEnv(testState(cfg)) {
+	for _, e := range clusterNetworkEnv(testState(cfg), "apply") {
 		for _, forbidden := range []string{"TF_VAR_nat_gateways=", "TF_VAR_vpc_cidr=", "TF_VAR_enable_flow_logs="} {
 			if strings.HasPrefix(e, forbidden) {
 				t.Errorf("create mode injected %q — staging and production pin nat_gateways = 3 and "+
@@ -449,7 +452,7 @@ func TestComponentEnv_ScopesVariablesToTheComponentThatDeclaresThem(t *testing.T
 	st := testState(cfg)
 	st.Runner.DryRun = true
 
-	netEnv, err := componentEnv(context.Background(), st, "network")
+	netEnv, err := componentEnv(context.Background(), st, "network", "apply")
 	if err != nil {
 		t.Fatalf("componentEnv(network): %v", err)
 	}
@@ -460,7 +463,7 @@ func TestComponentEnv_ScopesVariablesToTheComponentThatDeclaresThem(t *testing.T
 		t.Errorf("network must receive the create-mode levers it declares; got %v", netEnv)
 	}
 
-	clusterEnv, err := componentEnv(context.Background(), st, "cluster")
+	clusterEnv, err := componentEnv(context.Background(), st, "cluster", "apply")
 	if err != nil {
 		t.Fatalf("componentEnv(cluster): %v", err)
 	}
@@ -472,7 +475,7 @@ func TestComponentEnv_ScopesVariablesToTheComponentThatDeclaresThem(t *testing.T
 	}
 
 	// A component with no per-run inputs gets nothing at all.
-	if env, err := componentEnv(context.Background(), st, "secrets"); err != nil || len(env) != 0 {
+	if env, err := componentEnv(context.Background(), st, "secrets", "apply"); err != nil || len(env) != 0 {
 		t.Errorf("secrets declares no per-run inputs, so it must receive none; got %v (err %v)", env, err)
 	}
 }
@@ -572,7 +575,7 @@ func adoptState(t *testing.T, public ...string) (*engine.State, *strings.Builder
 // satisfies that, and a bare comma-joined string would not.
 func TestAdoptEnv_InjectsTheAdoptInputs(t *testing.T) {
 	st, _ := adoptState(t, "subnet-x9", "subnet-y8", "subnet-z7")
-	env := clusterNetworkEnv(st)
+	env := clusterNetworkEnv(st, "apply")
 
 	for _, want := range []string{
 		"TF_VAR_network_mode=adopt",
@@ -599,7 +602,7 @@ func TestAdoptEnv_InjectsTheAdoptInputs(t *testing.T) {
 // anything, and the VPC owner runs both egress and flow logging.
 func TestAdoptEnv_NeutralizesTheLeversTheLeafPins(t *testing.T) {
 	st, _ := adoptState(t)
-	env := clusterNetworkEnv(st)
+	env := clusterNetworkEnv(st, "apply")
 
 	for _, want := range []string{"TF_VAR_nat_gateways=1", "TF_VAR_enable_flow_logs=false"} {
 		if !slices.Contains(env, want) {
@@ -616,7 +619,7 @@ func TestAdoptEnv_NeutralizesTheLeversTheLeafPins(t *testing.T) {
 // rather than as an empty string, which tofu cannot decode as a list(string).
 func TestAdoptEnv_SendsAnEmptyPublicListExplicitly(t *testing.T) {
 	st, _ := adoptState(t)
-	if env := clusterNetworkEnv(st); !slices.Contains(env, "TF_VAR_adopt_public_subnet_ids=[]") {
+	if env := clusterNetworkEnv(st, "apply"); !slices.Contains(env, "TF_VAR_adopt_public_subnet_ids=[]") {
 		t.Fatalf("a private-only adopt cluster must send an explicit empty list; got %v", env)
 	}
 }
@@ -626,7 +629,7 @@ func TestAdoptEnv_SendsAnEmptyPublicListExplicitly(t *testing.T) {
 // validation that rejects them is a separate mechanism from this one.
 func TestAdoptEnv_SendsNoCreateModeLevers(t *testing.T) {
 	st, _ := adoptState(t)
-	for _, e := range clusterNetworkEnv(st) {
+	for _, e := range clusterNetworkEnv(st, "apply") {
 		for _, forbidden := range []string{"TF_VAR_ipam_pool_id=", "TF_VAR_ipam_netmask_length=", "TF_VAR_transit_gateway_id=", "TF_VAR_centralized_egress=", "TF_VAR_vpc_cidr="} {
 			if strings.HasPrefix(e, forbidden) {
 				t.Errorf("adopt injected the create-mode lever %q, which landing-zone rejects under adopt", e)
@@ -641,7 +644,7 @@ func TestAdoptEnv_SendsNoCreateModeLevers(t *testing.T) {
 // internet-facing Service or Ingress silently fails to provision.
 func TestAdoptEnv_DisclosesThePrivateOnlyConsequence(t *testing.T) {
 	st, out := adoptState(t)
-	clusterNetworkEnv(st)
+	clusterNetworkEnv(st, "apply")
 	if !strings.Contains(out.String(), "internet-facing") {
 		t.Fatalf("a private-only adopt cluster cannot provision an internet-facing load balancer; "+
 			"a run that does not say so leaves the operator debugging a Service that never gets an "+
@@ -655,7 +658,7 @@ func TestAdoptEnv_DisclosesThePrivateOnlyConsequence(t *testing.T) {
 func TestComponentEnv_AdoptVarsOnlyReachNetwork(t *testing.T) {
 	st, _ := adoptState(t)
 	for _, comp := range []string{"cluster", "secrets", "agent-iam", "cluster-addons", "cluster-bootstrap"} {
-		env, err := componentEnv(context.Background(), st, comp)
+		env, err := componentEnv(context.Background(), st, comp, "apply")
 		if err != nil {
 			continue // the cluster case may probe for an egress IP; not what this asserts
 		}
