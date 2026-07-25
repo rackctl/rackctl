@@ -28,15 +28,47 @@ cluster:
     maxSize: 6
     desiredSize: 2
   network:
-    vpcCidr: 10.0.0.0/16
-    natGateways: 1
-    # Create-mode levers, all off by default. Day-0 bootstrap is create mode only — the
-    # hub mints its own VPC (adopt is a spoke/eks-fleet concern, not rackctl's). These
-    # ride TF_VAR_* onto landing-zone's private-by-default network component at apply
-    # time, layered over the generic committed tree exactly like the endpoint posture.
-    # rackctl validates the combination up front, so a contradiction fails in a second
-    # here instead of ~20 minutes into a tofu apply. Uncomment to opt into the org's
-    # IPAM / transit-gateway topology:
+    mode: create                  # create (default) | adopt
+                                  #   create — this platform owns its VPC: builds the VPC, subnets, endpoints,
+                                  #            egress and the ELB role tags. What a day-0 hub normally wants.
+                                  #   adopt  — participate in a VPC someone else owns (a shared VPC in this
+                                  #            account, or one shared in over AWS RAM). Builds NOTHING: the VPC,
+                                  #            subnets, CIDR and AZs are resolved from the adopt* fields below and
+                                  #            re-exported through the same outputs, so the cluster wires
+                                  #            identically either way. The owner runs the VPC, the endpoints, the
+                                  #            egress and the subnet tagging.
+                                  #
+                                  # Under adopt, rackctl also sends nat_gateways=1 and enable_flow_logs=false to
+                                  # neutralize the create-mode values the staging and production leaves pin (3 and
+                                  # true), which landing-zone rejects under adopt. Both are the owner's concern for
+                                  # a VPC this platform does not own, so overriding them changes nothing real.
+    vpcCidr: 10.0.0.0/16          # create mode only; rejected under adopt (the CIDR is the owner's)
+    natGateways: 1                # create mode only; 1 (shared NAT) or equal to the AZ count (per-AZ HA).
+                                  # NOTE rackctl does not inject this — staging and production pin 3 in their own
+                                  # leaves for per-AZ redundancy, and an injected TF_VAR would silently override it
+    # --- adopt mode ----------------------------------------------------------------------
+    # Required when mode: adopt, rejected under create. rackctl validates the shape up front
+    # (ids well-formed, no subnet in both tiers, at least 3 distinct private subnets for the
+    # zone spread landing-zone asserts); landing-zone then asserts the rest at plan time
+    # against live AWS — every subnet is in the VPC, each private route table routes to the S3
+    # gateway prefix list and to a live NAT or transit gateway, and the subnets span the zones.
+    #
+    # adoptVpcId: vpc-0abc123
+    # adoptPrivateSubnetIds: [subnet-0aaa, subnet-0bbb, subnet-0ccc]   # where nodes and pods run
+    # adoptPublicSubnetIds: [subnet-0ddd, subnet-0eee, subnet-0fff]    # optional — omit for a private-only
+    #                                                                 # cluster. Internal load balancers work;
+    #                                                                 # an internet-facing Service/Ingress will
+    #                                                                 # NOT provision, because the Kyverno rule
+    #                                                                 # that injects LB subnets needs a non-empty
+    #                                                                 # public list
+    #
+    # --- create-mode levers ---------------------------------------------------------------
+    # All off by default, and all rejected under adopt. These ride TF_VAR_* onto
+    # landing-zone's private-by-default network component at apply time, layered over the
+    # generic committed tree exactly like the endpoint posture. rackctl validates the
+    # combination up front, so a contradiction fails in a second here instead of
+    # seconds-to-minutes into a tofu run. Uncomment to opt into the org's IPAM /
+    # transit-gateway topology:
     #
     # ipamPoolId: ipam-pool-0abc123   # draw the VPC CIDR from an IPAM pool instead of vpcCidr; leave vpcCidr at its default (mutually exclusive with a non-default vpcCidr)
     # ipamNetmaskLength: 18           # netmask of the CIDR carved from the pool, 16–20 (required with ipamPoolId; subnets carve 8 bits smaller, so /20 is the smallest that clears AWS's /28 minimum)
