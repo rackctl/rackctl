@@ -16,6 +16,7 @@ type Repos struct {
 	EKSGitops     string // the org's fork of nanohype/eks-gitops (addon catalog)
 	AgentPlatform string // eks-agent-platform (operator + CRDs + charts)
 	Portal        string // portal (day-2 UI; cloned only when controlPlane.portal)
+	EKSFleet      string // eks-fleet (cluster control plane; cloned only when controlPlane.eksFleet)
 }
 
 // State threads shared data through the phase pipeline.

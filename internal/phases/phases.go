@@ -480,6 +480,16 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 			return err
 		}
 	}
+	// eks-fleet is the cluster control plane (Crossplane composition + Cluster XRD).
+	// The fleet phase runs entirely against this checkout — it is a separate repo from
+	// landing-zone, and the old phase applied a path that never existed under the
+	// landing-zone Dir. Clone only when gated on, mirroring the portal.
+	if st.Config.ControlPlane.EKSFleet {
+		note(st, "controlPlane.eksFleet is on — cloning nanohype/eks-fleet for the hub control-plane install")
+		if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/eks-fleet.git", st.Repos.EKSFleet); err != nil {
+			return err
+		}
+	}
 	// Every component this config will apply must have a live root in the tree just
 	// cloned. This is the first phase at which a tree exists to check, and the last
 	// before anything is provisioned.
@@ -893,12 +903,121 @@ func (platform) Teardown(ctx context.Context, st *engine.State) error {
 }
 
 // --- Phase 7 (optional): eks-fleet cluster control plane ---
+//
+// Turns the cluster this run just stood up into a hub that can vend further
+// clusters via namespaced Cluster CRs. The real sequence lives in
+// eks-fleet/docs/stand-up-the-hub.md §4 and config/bootstrap/README.md — not a
+// single `kubectl apply -f crossplane.yaml` (that file is a Configuration
+// package meta, not an installable set of resources, and the old phase pointed
+// Runner.Dir at landing-zone, which has no eks-fleet/ directory at all).
+//
+// What this phase does NOT do, and why:
+//
+//   - It does not apply landing-zone's fleet-hub component. That lives under
+//     live/aws/fleet/… (a dedicated fleet account), and componentDir can only
+//     address live/aws/workload-<env>/…. Same boundary as the multi-account
+//     seam (ledger S10): rackctl reaches the workload tree, not the fleet tree.
+//     The IRSA role + nanohype-eks-fleet-tfstate bucket that fleet-hub mints are
+//     a prerequisite the operator supplies (or that a future rung-0 campaign
+//     vends); without them provider-opentofu has no ambient credentials.
+//   - It does not write Cluster CRs into org.gitops.clustersRepo. That is the
+//     day-2 vending surface; this phase only installs the factory.
+//
+// Order matches the bootstrap README: Crossplane → provider+functions →
+// ProviderConfig → XRD + composition → reaper.
 type fleet struct{ base }
 
+// crossplaneHelmVersion is the pin stand-up-the-hub.md installs. Bump with that doc.
+const crossplaneHelmVersion = "2.3.1"
+
 func (fleet) Run(ctx context.Context, st *engine.State) error {
-	note(st, "installing Crossplane v2 hub + eks-fleet compositions; future clusters become Cluster CRs in %s",
+	note(st, "installing the eks-fleet cluster control plane on this cluster — Crossplane v2, "+
+		"provider-opentofu, the Cluster XRD and composition. Future clusters become namespaced "+
+		"Cluster CRs (org.gitops.clustersRepo=%s is where day-2 vends land, not this phase)",
 		st.Config.Org.GitOps.ClustersRepo)
-	return st.Runner.Run(ctx, "kubectl", "apply", "-f", "eks-fleet/crossplane.yaml")
+	note(st, "prerequisite: the hub IRSA role (eks-fleet-crossplane) and nanohype-eks-fleet-tfstate "+
+		"bucket from landing-zone's fleet-hub component. fleet-hub lives under live/aws/fleet/…, "+
+		"which rackctl does not apply — supply that substrate out of band, or the provider pod "+
+		"has no ambient AWS credentials. See eks-fleet/docs/stand-up-the-hub.md")
+
+	// Everything below is relative to the eks-fleet checkout. acquire cloned it when
+	// the gate was on; a missing Dir is a programming error, not an operator one.
+	if st.Repos.EKSFleet == "" {
+		return fmt.Errorf("controlPlane.eksFleet is on but Repos.EKSFleet is empty — acquire must clone nanohype/eks-fleet first")
+	}
+	st.Runner.Dir = st.Repos.EKSFleet
+	note(st, "running from %s — every -f path below is relative to that checkout", st.Repos.EKSFleet)
+
+	// 1. Crossplane v2.
+	if err := st.Runner.Run(ctx, "helm", "repo", "add", "crossplane-stable", "https://charts.crossplane.io/stable"); err != nil {
+		// helm repo add fails if the repo already exists; treat that as fine and continue.
+		// A real network/auth failure will surface on the install below.
+		note(st, "helm repo add crossplane-stable: %v (continuing — install will fail if the chart is unreachable)", err)
+	}
+	if err := st.Runner.Run(ctx, "helm", "upgrade", "--install", "crossplane", "crossplane-stable/crossplane",
+		"-n", "crossplane-system", "--create-namespace", "--version", crossplaneHelmVersion); err != nil {
+		return err
+	}
+	if err := st.Runner.Run(ctx, "kubectl", "-n", "crossplane-system", "rollout", "status", "deploy/crossplane", "--timeout=180s"); err != nil {
+		return err
+	}
+
+	// 2. provider-opentofu + functions. providers.yaml carries a placeholder
+	// eks.amazonaws.com/role-arn; the operator (or a prior fleet-hub apply) must have
+	// put the real hub role there, or IRSA will not attach. We apply the file as-is and
+	// say so — rewriting it would invent a role ARN we cannot see from the workload tree.
+	note(st, "applying config/bootstrap/providers.yaml — ensure eks.amazonaws.com/role-arn on the "+
+		"provider-opentofu ServiceAccount is the hub role ARN from fleet-hub (terragrunt output -raw hub_role_arn)")
+	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "config/bootstrap/providers.yaml"); err != nil {
+		return err
+	}
+	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "config/functions.yaml"); err != nil {
+		return err
+	}
+	if err := st.Runner.Run(ctx, "kubectl", "-n", "crossplane-system", "wait",
+		"--for=condition=Healthy", "provider/provider-opentofu", "--timeout=300s"); err != nil {
+		return err
+	}
+
+	// 3. Single ClusterProviderConfig (credentials source None → ambient IRSA).
+	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "config/providers/providerconfig.yaml"); err != nil {
+		return err
+	}
+
+	// 4. The Cluster API. Namespace create is best-effort — AlreadyExists is fine.
+	_ = st.Runner.Run(ctx, "kubectl", "create", "namespace", "platform")
+	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "apis/cluster/definition.yaml"); err != nil {
+		return err
+	}
+	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "compositions/cluster-aws.yaml"); err != nil {
+		return err
+	}
+
+	// 5. Ephemeral-spoke reaper (ttlDays > 0 Cluster CRs).
+	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "config/reaper.yaml"); err != nil {
+		return err
+	}
+
+	note(st, "eks-fleet control plane installed. Validate: kubectl get xrd clusters.fleet.nanohype.dev && "+
+		"kubectl get composition cluster-aws. Vend a spoke with a namespaced Cluster CR — see "+
+		"eks-fleet/examples/")
+	return nil
+}
+
+func (fleet) Teardown(ctx context.Context, st *engine.State) error {
+	// Crossplane + the XRD/composition are cluster-scoped. Tear them down only if we
+	// know where the checkout is; otherwise leave them — uninstalling Crossplane by
+	// name alone is fine, and is what a rollback needs.
+	if st.Repos.EKSFleet != "" {
+		st.Runner.Dir = st.Repos.EKSFleet
+		_ = st.Runner.Run(ctx, "kubectl", "delete", "-f", "config/reaper.yaml", "--ignore-not-found")
+		_ = st.Runner.Run(ctx, "kubectl", "delete", "-f", "compositions/cluster-aws.yaml", "--ignore-not-found")
+		_ = st.Runner.Run(ctx, "kubectl", "delete", "-f", "apis/cluster/definition.yaml", "--ignore-not-found")
+		_ = st.Runner.Run(ctx, "kubectl", "delete", "-f", "config/providers/providerconfig.yaml", "--ignore-not-found")
+		_ = st.Runner.Run(ctx, "kubectl", "delete", "-f", "config/functions.yaml", "--ignore-not-found")
+		_ = st.Runner.Run(ctx, "kubectl", "delete", "-f", "config/bootstrap/providers.yaml", "--ignore-not-found")
+	}
+	return st.Runner.Run(ctx, "helm", "uninstall", "crossplane", "-n", "crossplane-system", "--ignore-not-found")
 }
 
 // --- Phase 8 (optional): operator portal ---
