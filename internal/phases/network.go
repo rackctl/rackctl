@@ -66,6 +66,22 @@ func clusterNetworkEnv(st *engine.State, verb string) []string {
 		env = append(env, "TF_VAR_centralized_egress=true")
 		note(st, "network: TF_VAR_centralized_egress=true — private default route via the transit gateway, zero local NAT gateways")
 	}
+
+	// Sizing knobs: only when they differ from Default(). Staging and production pin
+	// nat_gateways=3 for per-AZ HA; rackctl's default is 1. Injecting the default would
+	// quietly downgrade both environments to a single shared NAT — the exact class of
+	// silent override this campaign exists to kill. A non-default value is the operator's
+	// deliberate choice and must reach the leaf.
+	d := config.Default().Cluster.Network
+	if n.VPCCIDR != "" && n.VPCCIDR != d.VPCCIDR {
+		env = append(env, "TF_VAR_vpc_cidr="+n.VPCCIDR)
+		note(st, "network: TF_VAR_vpc_cidr=%s — literal CIDR override (mutually exclusive with IPAM)", n.VPCCIDR)
+	}
+	if n.NATGateways != 0 && n.NATGateways != d.NATGateways {
+		env = append(env, "TF_VAR_nat_gateways="+strconv.Itoa(n.NATGateways))
+		note(st, "network: TF_VAR_nat_gateways=%d — overrides the leaf (staging/production pin 3; "+
+			"development inherits the component default of 1)", n.NATGateways)
+	}
 	return env
 }
 

@@ -670,17 +670,10 @@ func TestComponentEnv_AdoptVarsOnlyReachNetwork(t *testing.T) {
 	}
 }
 
-// druid is the one component rackctl applies that it cannot destroy — in ANY environment,
-// including development. Its Aurora module sets neither skip_final_snapshot nor
-// final_snapshot_identifier and the `tenants` object type exposes neither, so no TF_VAR shape
-// reaches them; its three per-tenant buckets have no force_destroy_buckets input and no
-// development carve-out; and deepstorage has neither versioning nor expiry, so on a working
-// cluster it is never empty.
-//
-// That breaks the rule every other component here keeps. The operator must learn it at apply
-// time, not halfway through a destroy with the cluster already half gone and the VPC still
-// billing.
-func TestSubstrate_WarnsThatDruidCannotBeTornDown(t *testing.T) {
+// druid is opt-in real money. O1 settled the teardown wedge upstream; the apply note now
+// names the substrate and points at the two-act force_destroy_buckets path for non-dev,
+// rather than claiming the cluster can never come down.
+func TestSubstrate_NotesDruidWhenEnabled(t *testing.T) {
 	var out strings.Builder
 	run := exec.New(&out)
 	run.DryRun = true
@@ -690,10 +683,11 @@ func TestSubstrate_WarnsThatDruidCannotBeTornDown(t *testing.T) {
 
 	_ = (substrate{}).Run(context.Background(), st)
 
-	if !strings.Contains(out.String(), "will not tear down cleanly") {
-		t.Fatalf("enabling druid must disclose that the cluster cannot be destroyed — every other "+
-			"component rackctl applies, it also destroys, and discovering this mid-teardown leaves "+
-			"a half-gone cluster billing.\ngot:\n%s", out.String())
+	if !strings.Contains(out.String(), "addons.druid: true") {
+		t.Fatalf("enabling druid must note that the analytics substrate is being applied.\ngot:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "will not tear down cleanly") {
+		t.Fatalf("O1 settled the teardown wedge — the old permanent-wedge warning must go.\ngot:\n%s", out.String())
 	}
 }
 

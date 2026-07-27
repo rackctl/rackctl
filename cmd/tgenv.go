@@ -73,14 +73,31 @@ func tgEnv(cfg *config.Config) []string {
 		// the gitops phase runs cluster-bootstrap, which is the same ordering the committed
 		// leaves express as an explicit dependency. That phase boundary is the precondition; the
 		// tier is only what decides whether it is wanted.
-		// Labels this cluster eks-agent-platform/accelerators=true so the accelerators
-		// ApplicationSet (gpu-operator, nvidia-dra-driver) targets it. Opt-in and unset in every
-		// committed leaf, because a GPU driver on a cluster with no GPU nodes cannot even pull
-		// its image (nvcr.io wants an NGC key) and has nothing to schedule on. Same class as the
-		// flags above: opt-in BECAUSE it depends on the shape of the cluster rackctl just built.
+		//
+		// enable_accelerators labels this cluster eks-agent-platform/accelerators=true so the
+		// accelerators ApplicationSet (gpu-operator, nvidia-dra-driver) targets it. Opt-in and
+		// unset in every committed leaf, because a GPU driver on a cluster with no GPU nodes
+		// cannot even pull its image (nvcr.io wants an NGC key) and has nothing to schedule on.
+		//
+		// enable_agent_platform labels the cluster into the operator ApplicationSet. Default
+		// true upstream, which is the right day-0 answer — but when the operator opts out
+		// (agentPlatform.enable: false) rackctl also skips agent-iam, so without this flag the
+		// GitOps install still deploys an operator whose IAM role was never created.
+		//
+		// enable_external_dns stamps the domain-filter annotation from the SSM parameter the
+		// dns component publishes. Every committed workload leaf pins it true, and the
+		// development leaf declares a hard dependency on dns — so a config with no dns: block
+		// fails cluster-bootstrap on a missing SSM parameter. Deriving the flag from whether
+		// rackctl applied dns is what closes that hole.
+		//
+		// enable_portal_reader mints the portal's read-only SA + token. Opt-in upstream;
+		// follows controlPlane.portal so a portal-enabled install actually gets the reader.
 		"TF_VAR_enable_accelerators=" + strconv.FormatBool(cfg.Addons.Accelerators),
 		"TF_VAR_observability_tier=" + string(cfg.Observability.Tier),
 		"TF_VAR_enable_managed_monitoring=" + strconv.FormatBool(cfg.FullObservability()),
+		"TF_VAR_enable_agent_platform=" + strconv.FormatBool(cfg.AgentPlatform.Enabled()),
+		"TF_VAR_enable_external_dns=" + strconv.FormatBool(cfg.HasDNS()),
+		"TF_VAR_enable_portal_reader=" + strconv.FormatBool(cfg.ControlPlane.Portal),
 	}
 	if u := cfg.Org.GitOps.GitURL(); u != "" {
 		env = append(env, "TF_VAR_gitops_repo_url="+u)
