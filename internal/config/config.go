@@ -16,6 +16,10 @@ import (
 // it becomes part of the EKS cluster name and the AWS resource names derived from it.
 var rfc1123Label = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$`)
 
+// k8sMajorMinor is Kubernetes major.minor only — the shape EKS (and landing-zone's
+// cluster_version validation) accept. No patch component, no leading "v".
+var k8sMajorMinor = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
+
 // defaultVPCCIDR is the literal CIDR a create-mode VPC uses when it is not drawn from an
 // IPAM pool. It doubles as the sentinel for "unset" in the ipamPoolId ⇄ vpcCidr mutual
 // exclusion: an IPAM-allocated VPC leaves vpcCidr at this default (the CIDR comes from the
@@ -110,17 +114,76 @@ func (g OrgGitOps) GitURL() string {
 	return u
 }
 
-type Cloud struct {
-	Provider       Provider        `json:"provider"`
-	AccountID      string          `json:"accountId"`
-	Region         string          `json:"region"`
-	Profile        string          `json:"profile"` // AWS SSO profile
-	IdentityCenter *IdentityCenter `json:"identityCenter,omitempty"`
+// TenantsGitSSHURL renders TenantsRepo as the SSH URL cluster-bootstrap's
+// tenants_repo_url wants ("github.com/acme/tenants" -> "git@github.com:acme/tenants.git").
+//
+// That variable registers a read-only deploy key and the matching ArgoCD repository
+// credential so ArgoCD can pull portal-committed tenant manifests. HTTPS is accepted by
+// the component's parser too, but the live wiring and the variable's own description
+// speak SSH, so that is what rackctl sends. Returns "" when TenantsRepo is empty.
+func (g OrgGitOps) TenantsGitSSHURL() string {
+	if g.TenantsRepo == "" {
+		return ""
+	}
+	u := g.TenantsRepo
+	switch {
+	case strings.HasPrefix(u, "git@"):
+		// already SSH
+	case strings.HasPrefix(u, "https://github.com/"):
+		u = "git@github.com:" + strings.TrimPrefix(u, "https://github.com/")
+	case strings.HasPrefix(u, "github.com/"):
+		u = "git@github.com:" + strings.TrimPrefix(u, "github.com/")
+	default:
+		// leave other hosts as-is; the component will reject a shape it cannot parse
+	}
+	if !strings.HasSuffix(u, ".git") {
+		u += ".git"
+	}
+	return u
 }
 
-type IdentityCenter struct {
-	Manage    bool   `json:"manage"`
-	AdminUser string `json:"adminUser,omitempty"`
+// HasDNS reports whether this config applies the dns component (and therefore whether
+// cluster-bootstrap should stamp external-dns's domain filter from the SSM parameter
+// that component publishes).
+func (c *Config) HasDNS() bool {
+	return c.DNS != nil && c.DNS.HostedZone != ""
+}
+
+// BedrockModelIDGlobs maps agentPlatform.bedrockModelFamilies onto the IAM resource
+// globs agent-iam's bedrock_allowed_model_ids expects (e.g. "anthropic" → "anthropic.*",
+// "amazon-nova" → "amazon.nova-*"). Families that already look like globs (contain `*`
+// or `.`) pass through unchanged. Unknown families get a trailing `.*` so a typo is
+// still a scoped grant rather than a silent Resource="*".
+//
+// The default families ["anthropic", "amazon-nova"] map to landing-zone's own default
+// ["anthropic.*", "amazon.nova-*"], so a default-valued config injects nothing and the
+// leaf wins — the same "only when it differs from Default()" rule every sizing knob follows.
+func (a AgentPlatform) BedrockModelIDGlobs() []string {
+	if len(a.BedrockModelFamilies) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(a.BedrockModelFamilies))
+	for _, f := range a.BedrockModelFamilies {
+		switch {
+		case f == "":
+			continue
+		case strings.ContainsAny(f, "*."):
+			out = append(out, f)
+		case f == "amazon-nova":
+			// landing-zone's default uses amazon.nova-* (hyphen after nova), not amazon-nova.*.
+			out = append(out, "amazon.nova-*")
+		default:
+			out = append(out, f+".*")
+		}
+	}
+	return out
+}
+
+type Cloud struct {
+	Provider  Provider `json:"provider"`
+	AccountID string   `json:"accountId"`
+	Region    string   `json:"region"`
+	Profile   string   `json:"profile"` // AWS SSO profile
 }
 
 type Cluster struct {
@@ -130,6 +193,10 @@ type Cluster struct {
 	// in one account and environment. Must not equal the environment token. Mirrors
 	// eks-fleet's Cluster.spec.clusterName and landing-zone's var.cluster_name.
 	Name                 string `json:"name"`
+	// Version is the Kubernetes major.minor to install (e.g. "1.36"). It rides
+	// TF_VAR_cluster_version into landing-zone's cluster component only when it differs
+	// from Default() — an ambient TF_VAR beats a leaf's inputs, so injecting the default
+	// would silently override a leaf that deliberately pins a different version.
 	Version              string `json:"version"`
 	EndpointPublicAccess bool   `json:"endpointPublicAccess"` // prod should be false (needs bastion/VPN)
 	// EndpointAllowlist is the set of CIDR blocks permitted to reach the public EKS API
@@ -142,7 +209,6 @@ type Cluster struct {
 	EndpointAllowlist []string   `json:"endpointAllowlist,omitempty"`
 	SystemNodes       NodeGroup  `json:"systemNodes"`
 	Network           ClusterNet `json:"network"`
-	TTLDays           int        `json:"ttlDays"` // eks-fleet auto-reap; 0 = persistent
 }
 
 // ClusterName is the resolved EKS cluster name, <environment>-<cluster.name> — the
@@ -220,12 +286,10 @@ type ClusterNet struct {
 	// annotation and does not provision. Internal load balancers are unaffected.
 	//
 	// The ConfigMap is the artifact to check — `kubectl -n kube-system get cm network-config
-	// -o jsonpath='{.data.public_subnet_ids}'`. cluster-bootstrap ALSO stamps a
-	// network/public-subnet-ids annotation on the ArgoCD cluster Secret, for ApplicationSet
-	// generators that cannot see in-cluster resources, and under adopt that annotation is
-	// present-but-empty. Nothing reads it. Someone debugging a load balancer finds a key that
-	// looks like the right lever and is empty, which reads as confirmation rather than as a
-	// wrong turn.
+	// -o jsonpath='{.data.public_subnet_ids}'`. The private subnet list is also stamped as
+	// the network/private-subnet-ids annotation on the ArgoCD cluster Secret (Karpenter node
+	// placement via the addons-operations-kustomize ApplicationSet). There is no public
+	// annotation — Kyverno sources public subnets from the ConfigMap only.
 	AdoptPublicSubnetIDs []string `json:"adoptPublicSubnetIds,omitempty"`
 
 	// The four fields below are the create-mode network levers. They opt a day-0 hub out
@@ -393,7 +457,10 @@ func Default() *Config {
 		Cloud:       Cloud{Provider: ProviderAWS, Region: "us-west-2"},
 		Environment: EnvDev,
 		Cluster: Cluster{
-			Version:              "1.35",
+			// Matches landing-zone's cluster_version default. Diverging here made every
+			// operator who trusted the example config believe they were pinning 1.35 while
+			// the leaf installed 1.36 regardless — the field was read by nothing.
+			Version:              "1.36",
 			EndpointPublicAccess: true,
 			SystemNodes:          NodeGroup{InstanceTypes: []string{"m7g.xlarge"}, MinSize: 2, MaxSize: 6, DesiredSize: 2},
 			Network:              ClusterNet{VPCCIDR: defaultVPCCIDR, NATGateways: 1},
@@ -488,6 +555,9 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("cluster.name %q must be <= 12 chars: the derived <environment>-<name> feeds cluster-scoped S3/IAM names; the tightest (agent-iam's account+region-qualified model-artifacts bucket) fits within S3's 63-char limit in us-west-2", c.Cluster.Name))
 	case c.Cluster.Name == string(c.Environment):
 		errs = append(errs, fmt.Sprintf("cluster.name must not equal environment (the cluster name would double, e.g. %[1]s-%[1]s)", c.Environment))
+	}
+	if c.Cluster.Version != "" && !k8sMajorMinor.MatchString(c.Cluster.Version) {
+		errs = append(errs, fmt.Sprintf("cluster.version %q must be Kubernetes major.minor, e.g. \"1.36\" (no patch component, no leading \"v\") — landing-zone rejects any other shape at plan time", c.Cluster.Version))
 	}
 	if c.Environment == EnvProduction && c.Cluster.EndpointPublicAccess {
 		errs = append(errs, "cluster.endpointPublicAccess should be false for production (requires bastion/VPN)")
