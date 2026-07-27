@@ -173,17 +173,35 @@ func printResults(results []doctor.Result) {
 // ---- destroy ----
 
 var (
-	destroyConfig string
-	destroyApply  bool
+	destroyConfig       string
+	destroyApply        bool
+	destroyForceBuckets bool
 )
 
 var destroyCmd = &cobra.Command{
 	Use:   "destroy",
 	Short: "Tear down a provisioned platform (reverse order)",
+	Long: `Tear down a provisioned platform in reverse apply order.
+
+By default this is a dry-run plan. Pass --apply to destroy.
+
+Outside development, several S3 buckets (agent-iam artifacts, cluster-addons
+velero/loki/tempo, model-import staging, druid deepstorage) refuse a destroy
+when non-empty unless force_destroy has been applied into state first. Pass
+--force-buckets with --apply to do that two-act sequence: apply the owning
+components with TF_VAR_force_destroy_buckets=true, then destroy. Development
+always allows teardown without the flag.
+
+Note: eks-agent-platform's bedrock and cost-pipeline buckets (ledger O5) do not
+yet accept force_destroy_buckets — a destroy after the platform has run may still
+wedge there until that lands upstream.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load(destroyConfig)
 		if err != nil {
 			return err
+		}
+		if destroyForceBuckets && !destroyApply {
+			// Dry-run is fine — PermitBucketTeardown prints both acts. No hard reject.
 		}
 		ctx := context.Background()
 		run := exec.New(os.Stdout)
@@ -194,6 +212,9 @@ var destroyCmd = &cobra.Command{
 		fmt.Println(ui.Title(fmt.Sprintf("rackctl destroy — %s · %s · %s", cfg.Org.Name, cfg.Cloud.Region, cfg.Environment)))
 		if run.DryRun {
 			fmt.Println(ui.Warn("dry-run — no cloud changes (pass --apply to destroy)"))
+		}
+		if destroyForceBuckets {
+			fmt.Println(ui.Warn("force-buckets: will apply force_destroy_buckets=true on bucket-owning components before destroying"))
 		}
 
 		// Point kubectl at the cluster being destroyed, FIRST, and treat a failure as
@@ -293,6 +314,16 @@ var destroyCmd = &cobra.Command{
 			Outputs: map[string]string{},
 		}
 
+		// Act 1 of the two-act teardown. force_destroy has no effect until an apply lands
+		// it in state, so this must run BEFORE any destroy — and while cluster + secrets
+		// state is still live (agent-iam and cluster-addons depend on both).
+		if destroyForceBuckets {
+			fmt.Println(ui.Step("force-buckets: permit teardown (apply force_destroy_buckets=true)"))
+			if err := phases.PermitBucketTeardown(ctx, st); err != nil {
+				return err
+			}
+		}
+
 		// The agent-platform terraform tree comes down FIRST, before any landing-zone
 		// component. Its components resolve landing-zone's SSM parameters — agent-iam's
 		// operator role and tenant paths, observability's alert topic ARNs — through unguarded
@@ -303,7 +334,15 @@ var destroyCmd = &cobra.Command{
 		// populated State.Outputs. The values are still present — network, secrets and cluster
 		// are precisely what the teardown has not reached yet — so this reads them back rather
 		// than guessing or skipping.
+		//
+		// O5: bedrock and cost-pipeline still have no force_destroy_buckets. A destroy after
+		// the platform has run may wedge on those four buckets until upstream ships the input.
+		// Disclosed here so --force-buckets is not mistaken for covering that tree.
 		if cfg.AgentPlatform.Enabled() {
+			if destroyForceBuckets {
+				fmt.Println(ui.Warn("force-buckets does not cover eks-agent-platform bedrock/cost-pipeline " +
+					"(ledger O5) — those four buckets still have no force_destroy_buckets input"))
+			}
 			phases.CaptureLandingZoneOutputs(ctx, st)
 			fmt.Println(ui.Step("destroy agent-platform substrate"))
 			if err := phases.DestroyAgentPlatform(ctx, st); err != nil {
@@ -370,5 +409,7 @@ func init() {
 	doctorCmd.Flags().StringVarP(&doctorConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	destroyCmd.Flags().StringVarP(&destroyConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	destroyCmd.Flags().BoolVar(&destroyApply, "apply", false, "actually destroy (default is a dry-run plan)")
+	destroyCmd.Flags().BoolVar(&destroyForceBuckets, "force-buckets", false,
+		"before destroying, apply force_destroy_buckets=true on bucket-owning components so non-empty buckets can be emptied (two-act; required outside development for a reliable teardown)")
 	upgradeCmd.Flags().StringVarP(&upgradeConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 }
