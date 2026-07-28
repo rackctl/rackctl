@@ -862,6 +862,37 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 		return err
 	}
 
+	// Now that eval-runtime has written its SSM parameters, republish cluster-bootstrap with
+	// enable_eval_runtime on.
+	//
+	// This is a re-apply, and it is the only way the annotation can ever be stamped. The
+	// variable is opt-in upstream BECAUSE it depends on another component having run
+	// (cluster-bootstrap/variables.tf:182 — "Requires that component to have applied
+	// first"), and rackctl runs cluster-bootstrap in the gitops phase, one phase before the
+	// agent-platform tree exists. Setting the flag there would fail the SSM read; leaving it
+	// unset means bootstrap.tf:397-400 never stamps
+	// `eks-agent-platform/eval-reports-bucket` on the ArgoCD cluster Secret, the operator
+	// ApplicationSet renders evalReportsBucket empty, and every EvalSuite run completes with
+	// its reports going nowhere durable. Nothing errors — which is the whole problem.
+	//
+	// tgenv.go states this rule for enable_managed_monitoring and it applies verbatim here:
+	// any landing-zone variable that is opt-in because it depends on another component
+	// having run is a variable rackctl must supply. This is that same wire, one flag over.
+	//
+	// The apply is a near-no-op — cluster-bootstrap converged a phase ago — but it is a real
+	// apply, so it is announced rather than slipped in.
+	note(st, "republishing cluster-bootstrap with enable_eval_runtime=true — eval-runtime's SSM "+
+		"parameters exist only now, and this is what stamps eks-agent-platform/eval-reports-bucket "+
+		"on the ArgoCD cluster Secret. Without it the operator renders an empty bucket and EvalSuite "+
+		"reports are never persisted")
+	prevDir := st.Runner.Dir
+	st.Runner.Dir = st.Repos.LandingZone
+	err := applyWith(ctx, st, "cluster-bootstrap", "TF_VAR_enable_eval_runtime=true")
+	st.Runner.Dir = prevDir
+	if err != nil {
+		return fmt.Errorf("republishing cluster-bootstrap for eval-runtime: %w", err)
+	}
+
 	note(st, "agent operator + CRDs are owned by the GitOps catalog (addons-agent-operator); waiting for convergence")
 	if arn := st.Outputs["operator_role_arn"]; arn != "" {
 		note(st, "operator role: %s", arn)
