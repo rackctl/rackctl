@@ -119,6 +119,29 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 							"Nothing was rolled back. Run `rackctl doctor` to see what is wrong, or "+
 							"`rackctl destroy --apply` to tear it down deliberately."))
 				}
+			case p.Optional():
+				// An OPTIONAL phase runs after the platform is already usable, and nothing
+				// it installs is a prerequisite for anything before it. fleet installs a
+				// control-plane factory, portal a day-2 UI, and smoke vends a first tenant
+				// whose entire purpose is to PROVE the rest of the run worked.
+				//
+				// Rolling back because one of those failed destroys nine phases of
+				// provisioned cloud to remedy a failure in the tenth. For smoke it is worse
+				// than disproportionate: the check destroys the thing it was checking, so
+				// the operator loses both the platform and the evidence of why it failed.
+				//
+				// All three end in a wait that can legitimately expire on a healthy
+				// platform — Crossplane's provider install, a portal chart that is not
+				// published yet and falls back to a local one, and a 15-minute wait on the
+				// first tenant reaching Ready. That is the same reasoning NoRollbackError
+				// encodes for the ArgoCD convergence wait, made structural here so the next
+				// optional phase inherits it instead of having to remember.
+				if e.Hook == nil {
+					fmt.Fprintln(e.Out, ui.Warn(
+						"this is an optional phase and the platform underneath it is provisioned — "+
+							"leaving it standing. Nothing was rolled back. Run `rackctl doctor` to see "+
+							"what is wrong, or `rackctl destroy --apply` to tear it down deliberately."))
+				}
 			case e.CleanOnFail && !errors.As(err, &noRollback):
 				// The phase that FAILED is torn down too. It failed partway, which
 				// means it may have created resources before it died — a terragrunt

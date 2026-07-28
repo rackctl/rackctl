@@ -356,3 +356,61 @@ func TestEngineNamesTheClusterItReaps(t *testing.T) {
 			"in the account.\n\n%s", out.String())
 	}
 }
+
+// An OPTIONAL phase's failure must never roll the platform back.
+//
+// fleet, portal and smoke all run after the cloud is provisioned and the cluster is
+// converged, and all three end in a wait that can expire on a perfectly healthy platform:
+// Crossplane's provider install, a portal chart that is not published yet, and a
+// 15-minute wait on the first tenant reaching Ready. None of them returns
+// NoRollbackError, so with the rollback armed a slow Crossplane image pull used to
+// destroy the EKS cluster, the VPC and the entire agent-platform substrate.
+//
+// The smoke case is the sharpest: it exists to PROVE the platform works, so rolling back
+// on its failure means the check destroys the thing it was checking — and the evidence.
+func TestEngineDoesNotRollBackWhenAnOptionalPhaseFails(t *testing.T) {
+	var log []string
+	e := &Engine{
+		Phases: []Phase{
+			recPhase{id: "cluster", enabled: true, log: &log},
+			recPhase{id: "gitops", enabled: true, log: &log},
+			recPhase{id: "smoke", enabled: true, optional: true, fail: true, log: &log},
+		},
+		Out:         io.Discard,
+		CleanOnFail: true, // rollback is ON — and must still not fire
+	}
+	if err := e.Run(context.Background(), &State{}); err == nil {
+		t.Fatal("expected the failure to surface — an optional phase failing is still a failure")
+	}
+
+	// Every phase ran; NOTHING was torn down. Asserting the whole log (rather than the
+	// absence of one string) is deliberate: a teardown of ANY phase must fail this test,
+	// including a teardown of the optional phase itself.
+	want := []string{"run:cluster", "run:gitops", "run:smoke"}
+	if !equal(log, want) {
+		t.Fatalf("log = %v, want %v — an optional phase's failure must leave the platform standing",
+			log, want)
+	}
+}
+
+// The optional carve-out must not leak into the phases that DO build the platform: a
+// required phase failing still rolls back, or a half-applied component orphans resources.
+func TestEngineStillRollsBackWhenARequiredPhaseFails(t *testing.T) {
+	var log []string
+	e := &Engine{
+		Phases: []Phase{
+			recPhase{id: "cluster", enabled: true, log: &log},
+			recPhase{id: "substrate", enabled: true, fail: true, log: &log},
+		},
+		Out:         io.Discard,
+		CleanOnFail: true,
+	}
+	if err := e.Run(context.Background(), &State{}); err == nil {
+		t.Fatal("expected error")
+	}
+	// The failed phase is torn down too — it may have created resources before it died.
+	want := []string{"run:cluster", "run:substrate", "teardown:substrate", "teardown:cluster"}
+	if !equal(log, want) {
+		t.Fatalf("log = %v, want %v — a required phase's failure must still roll back", log, want)
+	}
+}

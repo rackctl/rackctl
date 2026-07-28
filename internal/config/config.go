@@ -192,7 +192,7 @@ type Cluster struct {
 	// no default, because a shared default collides the moment a second cluster lands
 	// in one account and environment. Must not equal the environment token. Mirrors
 	// eks-fleet's Cluster.spec.clusterName and landing-zone's var.cluster_name.
-	Name                 string `json:"name"`
+	Name string `json:"name"`
 	// Version is the Kubernetes major.minor to install (e.g. "1.36"). It rides
 	// TF_VAR_cluster_version into landing-zone's cluster component only when it differs
 	// from Default() — an ambient TF_VAR beats a leaf's inputs, so injecting the default
