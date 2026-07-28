@@ -192,6 +192,12 @@ when non-empty unless force_destroy has been applied into state first. Pass
 components with TF_VAR_force_destroy_buckets=true, then destroy. Development
 always allows teardown without the flag.
 
+Note: druid is NOT covered outside development (ledger O8). Its Aurora carries
+deletion_protection = true, pinned in the staging and production leaves and
+unreachable from a TF_VAR, so the permitting apply cannot clear it. rackctl
+refuses rather than emptying the deepstorage segments and then wedging on
+DeleteDBCluster — clear deletion_protection out of band first.
+
 Note: eks-agent-platform's bedrock and cost-pipeline buckets (ledger O5) do not
 yet accept force_destroy_buckets — a destroy after the platform has run may still
 wedge there until that lands upstream.`,
@@ -410,6 +416,6 @@ func init() {
 	destroyCmd.Flags().StringVarP(&destroyConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	destroyCmd.Flags().BoolVar(&destroyApply, "apply", false, "actually destroy (default is a dry-run plan)")
 	destroyCmd.Flags().BoolVar(&destroyForceBuckets, "force-buckets", false,
-		"before destroying, apply force_destroy_buckets=true on bucket-owning components so non-empty buckets can be emptied (two-act; required outside development for a reliable teardown)")
+		"before destroying, apply force_destroy_buckets=true on bucket-owning components so non-empty buckets can be emptied (two-act; required outside development for a reliable teardown, and does not cover druid there — see ledger O8)")
 	upgradeCmd.Flags().StringVarP(&upgradeConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 }
