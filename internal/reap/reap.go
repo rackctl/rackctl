@@ -487,3 +487,32 @@ func pointAt(ctx context.Context, run execer, cluster string) error {
 	}
 	return run.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", cluster)
 }
+
+// FleetSpokes returns the names of eks-fleet Cluster CRs on the hub, if any.
+//
+// A Cluster CR is not a Kubernetes object with a Kubernetes-shaped blast radius. The
+// eks-fleet composition hands it to provider-opentofu, which applies a whole landing-zone
+// module for it — a real EKS control plane, its VPC, its NAT gateways, its node roles —
+// and the ClusterProviderConfig is explicitly built to vend CROSS-ACCOUNT
+// (compositions/cluster-aws.yaml: "hub role same-account, fleet-vend cross-account").
+//
+// So the hub cluster is the only thing that knows those clusters exist. Destroy the hub
+// and every spoke is orphaned: the Crossplane control plane that could have deleted them
+// is gone, their terraform state sits in a bucket rackctl never touches, and no rackctl
+// command will ever enumerate them again. They bill forever, in accounts this config does
+// not even name.
+//
+// An empty result is reported for an unreachable cluster or an absent CRD, because both
+// mean the same thing here: there is no hub to read spokes from.
+func FleetSpokes(ctx context.Context, run *exec.Runner) []string {
+	return fleetSpokes(ctx, run)
+}
+
+func fleetSpokes(ctx context.Context, run execer) []string {
+	out, err := run.Capture(ctx, "kubectl", "get", "clusters.fleet.nanohype.dev",
+		"-A", "-o", `jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{end}`)
+	if err != nil {
+		return nil // no CRD installed, or no reachable cluster — either way, no spokes to strand
+	}
+	return strings.Fields(out)
+}
