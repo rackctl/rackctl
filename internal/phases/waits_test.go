@@ -100,9 +100,6 @@ func TestKubectlWaits_OnlyNameConditionsSomethingWrites(t *testing.T) {
 				return true
 			}
 			joined := strings.Join(parts, " ")
-			if !strings.Contains(joined, "kubectl") && !strings.Contains(joined, "wait") {
-				// Still scan: Run(ctx, "kubectl", …) puts kubectl in an arg, not the fun.
-			}
 			for _, m := range re.FindAllStringSubmatch(joined, -1) {
 				cond := m[1]
 				if _, ok := allowed[cond]; ok {

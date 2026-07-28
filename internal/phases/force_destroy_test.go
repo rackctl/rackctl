@@ -3,7 +3,10 @@ package phases
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -200,5 +203,82 @@ func TestPermitBucketTeardown_AllowsDruidInDevelopment(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "druid") {
 		t.Fatalf("druid must be in the permitting apply in development:\n%s", out.String())
+	}
+}
+
+// The flag must reach the terragrunt PROCESS, not just the log.
+//
+// The previous version of this test asserted
+// strings.Contains(out, "TF_VAR_force_destroy_buckets=true") against the dry-run
+// transcript. exec.Runner echoes argv and never env, so that assertion was satisfied
+// entirely by PermitBucketTeardown's own notes: deleting `extraEnv` from applyWith
+// altogether left every force-buckets test green, leaving the one behaviour target 11
+// exists for completely unguarded. That is the same "string whitelist stayed green when
+// the guarded call moved" class an earlier pass on this branch found five of.
+//
+// So this runs for real against a fake terragrunt on $PATH that records its own
+// environment — the only way to observe what the child process was actually handed.
+func TestPermitBucketTeardown_FlagReachesTheTerragruntProcess(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "invocations")
+	// Record verb + whether the variable was exported, once per invocation.
+	tgScript := fmt.Sprintf(`#!/bin/sh
+for a in "$@"; do
+  case "$a" in apply|destroy|init) verb="$a";; esac
+done
+echo "$verb force_destroy_buckets=${TF_VAR_force_destroy_buckets:-UNSET}" >> %q
+exit 0
+`, log)
+	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte(tgScript), 0o755); err != nil {
+		t.Fatalf("write fake terragrunt: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := config.Default()
+	cfg.Org.Name = "acme"
+	cfg.Cloud.AccountID = "111111111111"
+	cfg.Cloud.Profile = "p"
+	cfg.Cloud.Region = "us-west-2"
+	cfg.Cluster.Name = "platform"
+	cfg.ApplyDefaults()
+
+	st := &engine.State{
+		Config:  cfg,
+		Runner:  exec.New(io.Discard), // NOT dry-run — the point is to exec
+		Repos:   engine.Repos{Workdir: dir, LandingZone: dir},
+		Outputs: map[string]string{},
+	}
+	if err := PermitBucketTeardown(context.Background(), st); err != nil {
+		t.Fatalf("permitting apply: %v", err)
+	}
+
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatalf("no terragrunt was invoked at all — the permitting apply must issue real "+
+			"commands, not only print notes: %v", err)
+	}
+	got := string(b)
+
+	// Every apply must carry the flag. An apply without it lands nothing in state, and the
+	// destroy that follows fails on BucketNotEmpty — the exact failure two acts exist to avoid.
+	var applies int
+	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
+		if !strings.HasPrefix(line, "apply ") {
+			continue
+		}
+		applies++
+		if !strings.Contains(line, "force_destroy_buckets=true") {
+			t.Fatalf("a permitting apply ran WITHOUT TF_VAR_force_destroy_buckets=true:\n%s", got)
+		}
+	}
+	if want := len(ForceDestroyBucketComponents(cfg)); applies != want {
+		t.Fatalf("got %d permitting applies, want %d (one per bucket-owning component):\n%s",
+			applies, want, got)
+	}
+
+	// And the flag must NOT leak past its invocation — tg() restores Runner.Env with a
+	// defer, and a leak would set force_destroy on components that never asked for it.
+	if len(st.Runner.Env) != 0 {
+		t.Fatalf("Runner.Env must be restored after the permitting applies, got %v", st.Runner.Env)
 	}
 }
