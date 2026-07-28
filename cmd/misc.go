@@ -355,8 +355,9 @@ wedge there until that lands upstream.`,
 		}
 
 		// Act 1 of the two-act teardown. force_destroy has no effect until an apply lands
-		// it in state, so this must run BEFORE any destroy — and while cluster + secrets
-		// state is still live (agent-iam and cluster-addons depend on both).
+		// it in state, so this must run BEFORE any destroy — and while every dependency each
+		// leaf declares is still live (agent-iam needs cluster+secrets, cluster-addons needs
+		// cluster, druid needs network+cluster, model-import needs nothing).
 		if destroyForceBuckets {
 			fmt.Println(ui.Step("force-buckets: permit teardown (apply force_destroy_buckets=true)"))
 			if err := phases.PermitBucketTeardown(ctx, st); err != nil {

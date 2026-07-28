@@ -157,7 +157,17 @@ agentPlatform:
     hipaa: false
 
 controlPlane:
-  eksFleet: false                 # opt-in: Crossplane cluster control plane
+  eksFleet: false                 # opt-in: Crossplane cluster control plane. Requires org.gitops.clustersRepo
+                                  # and fleetHubRoleArn below.
+  # fleetHubRoleArn: arn:aws:iam::111111111111:role/eks-fleet-crossplane
+                                  # the IAM role provider-opentofu assumes to vend spokes. REQUIRED with
+                                  # eksFleet: eks-fleet ships config/bootstrap/providers.yaml with a literal
+                                  # <FLEET_ACCOUNT_ID> placeholder and its stand-up doc substitutes the real
+                                  # ARN at apply time, so applying it unrendered installs a provider that
+                                  # never receives credentials — while still reporting Healthy.
+                                  # Get it from landing-zone's fleet-hub component, which rackctl does NOT
+                                  # apply (it lives under live/aws/fleet/…, a different account):
+                                  #   terragrunt output -raw hub_role_arn
   portal: false                   # opt-in: day-2 operator UI
 
 firstTenant:                      # optional smoke test (phase 9). Vends this tenant from

@@ -12,10 +12,16 @@ import (
 // that declare force_destroy_buckets. Development always allows teardown; elsewhere the
 // variable is the only channel (no live leaf sets it), so rackctl must inject it.
 //
-// Order among these does not matter for the permitting apply — model-import has no
-// dependency block, and agent-iam / cluster-addons / druid only need cluster+secrets
-// state which is still live when this runs (before any destroy). The reverse-destroy
-// loop below still owns the teardown order.
+// Order among these does not matter for the permitting apply. What matters is that every
+// dependency each leaf declares is still live, and it is: act 1 runs before any destroy.
+// The actual dependency sets (live/_envcommon/aws/*.hcl) are
+//
+//	agent-iam       cluster + secrets
+//	cluster-addons  cluster
+//	druid           network + cluster
+//	model-import    none (no envcommon leaf)
+//
+// The reverse-destroy loop still owns the teardown order.
 var forceDestroyBucketComponents = map[string]bool{
 	"agent-iam":      true, // access-logs, model-artifacts, eval-reports
 	"cluster-addons": true, // velero, loki, tempo, argo-workflows
@@ -84,9 +90,11 @@ func ForceDestroyBucketComponents(cfg *config.Config) []string {
 // separate step, and why a dry-run prints both acts and says why there are two.
 //
 // velero_backup_policy is the composition upstream documents as the safe order (copy
-// recovery points to the central vault first, then empty the local bucket). rackctl does
-// not apply the backup component that owns the plan keys, so it is unreachable here; the
-// note says so rather than pretending --force-buckets preserves restore points.
+// recovery points to the central vault first, then empty the local bucket). The variable
+// is declared on CLUSTER-ADDONS (variables.tf:36); its VALUE names a plan key defined in
+// the backup component's backup_plans (validation message, variables.tf:60). rackctl has
+// no field for it and does not apply backup, so the path is unreachable here; the note
+// says so rather than pretending --force-buckets preserves restore points.
 func PermitBucketTeardown(ctx context.Context, st *engine.State) error {
 	comps := ForceDestroyBucketComponents(st.Config)
 	if len(comps) == 0 {
@@ -120,9 +128,10 @@ func PermitBucketTeardown(ctx context.Context, st *engine.State) error {
 		"landed it in state — applying %v with TF_VAR_force_destroy_buckets=true first, then "+
 		"destroying. Injecting the flag only on the destroy path fails on BucketNotEmpty", comps)
 	note(st, "force-buckets: this empties the local velero/loki/tempo/artifacts buckets. If the "+
-		"restore points matter, set velero_backup_policy on the backup component first so the "+
-		"central plan copies them to the backup account's DR region — that path is not reachable "+
-		"through rackctl (no config field, and rackctl does not apply backup)")
+		"restore points matter, pin velero_backup_policy on the cluster-addons leaf to a plan key "+
+		"from the backup component's backup_plans and apply that FIRST, so the central plan copies "+
+		"them to the backup account's DR region — that path is not reachable through rackctl (no "+
+		"config field, and rackctl does not apply backup)")
 	if st.Config.Environment != config.EnvDev {
 		note(st, "force-buckets: environment is %s — development always allows teardown without this "+
 			"flag; outside development the permitting apply is what makes destroy reliable",
