@@ -462,8 +462,13 @@ func Default() *Config {
 			// the leaf installed 1.36 regardless — the field was read by nothing.
 			Version:              "1.36",
 			EndpointPublicAccess: true,
-			SystemNodes:          NodeGroup{InstanceTypes: []string{"m7g.xlarge"}, MinSize: 2, MaxSize: 6, DesiredSize: 2},
-			Network:              ClusterNet{VPCCIDR: defaultVPCCIDR, NATGateways: 1},
+			// Matches landing-zone's system_node_instance_types default, for the same reason
+			// Version does. No leaf pins the variable, and a value equal to Default() is never
+			// injected — so the single-type list rackctl used to show was not merely wrong, it
+			// was UNREACHABLE: an operator who deliberately wanted Graviton3 only wrote exactly
+			// that, nothing was injected, and m6g nodes joined the group anyway.
+			SystemNodes: NodeGroup{InstanceTypes: []string{"m7g.xlarge", "m6g.xlarge"}, MinSize: 2, MaxSize: 6, DesiredSize: 2},
+			Network:     ClusterNet{VPCCIDR: defaultVPCCIDR, NATGateways: 1},
 		},
 		Quotas:        Quotas{AutoRequest: true, VCPU: 256},
 		Observability: Observability{Tier: TierFull},
@@ -490,8 +495,26 @@ func (c *Config) ApplyDefaults() {
 	if c.Cluster.Version == "" {
 		c.Cluster.Version = d.Cluster.Version
 	}
+	// Field by field, never the whole struct — the same rule ClusterNet and Observability
+	// state below, and for a sharper reason now that all four fields ride TF_VARs.
+	//
+	// Replacing the struct wholesale broke both directions. A config naming only
+	// instanceTypes kept its zero sizes, and since ANY difference from Default() injects
+	// all four, rackctl sent min=0/max=0/desired=0 — which overrides the production leaf's
+	// 3/9/3 pin and is rejected outright by EKS, failing the cluster phase mid-install. A
+	// config naming only sizes had them silently replaced by 2/6/2 and injected nothing,
+	// which is precisely the "documented but inert" defect this field was wired to kill.
 	if len(c.Cluster.SystemNodes.InstanceTypes) == 0 {
-		c.Cluster.SystemNodes = d.Cluster.SystemNodes
+		c.Cluster.SystemNodes.InstanceTypes = d.Cluster.SystemNodes.InstanceTypes
+	}
+	if c.Cluster.SystemNodes.MinSize == 0 {
+		c.Cluster.SystemNodes.MinSize = d.Cluster.SystemNodes.MinSize
+	}
+	if c.Cluster.SystemNodes.MaxSize == 0 {
+		c.Cluster.SystemNodes.MaxSize = d.Cluster.SystemNodes.MaxSize
+	}
+	if c.Cluster.SystemNodes.DesiredSize == 0 {
+		c.Cluster.SystemNodes.DesiredSize = d.Cluster.SystemNodes.DesiredSize
 	}
 	// Default the two base fields individually, never the whole struct — replacing
 	// ClusterNet wholesale would wipe an IPAM/transit-gateway/egress lever set without a
@@ -558,6 +581,26 @@ func (c *Config) Validate() error {
 	}
 	if c.Cluster.Version != "" && !k8sMajorMinor.MatchString(c.Cluster.Version) {
 		errs = append(errs, fmt.Sprintf("cluster.version %q must be Kubernetes major.minor, e.g. \"1.36\" (no patch component, no leading \"v\") — landing-zone rejects any other shape at plan time", c.Cluster.Version))
+	}
+	// The system node group's sizes must hold 1 <= min <= desired <= max. All four fields
+	// ride TF_VARs onto landing-zone's node group as a set, so a contradiction here becomes
+	// an EKS API rejection minutes into the cluster apply, with the VPC already built and
+	// the state to unpick. A second here is cheaper.
+	if n := c.Cluster.SystemNodes; len(n.InstanceTypes) > 0 || n.MinSize != 0 || n.MaxSize != 0 || n.DesiredSize != 0 {
+		switch {
+		case n.MinSize < 1:
+			errs = append(errs, fmt.Sprintf("cluster.systemNodes.minSize must be at least 1, got %d — the system "+
+				"group runs CoreDNS and the addons every other workload depends on", n.MinSize))
+		case n.DesiredSize < n.MinSize || n.DesiredSize > n.MaxSize:
+			errs = append(errs, fmt.Sprintf("cluster.systemNodes.desiredSize (%d) must be between minSize (%d) "+
+				"and maxSize (%d) — EKS rejects the node group otherwise", n.DesiredSize, n.MinSize, n.MaxSize))
+		case n.MaxSize < n.MinSize:
+			errs = append(errs, fmt.Sprintf("cluster.systemNodes.maxSize (%d) must be at least minSize (%d)",
+				n.MaxSize, n.MinSize))
+		}
+		if len(n.InstanceTypes) == 0 {
+			errs = append(errs, "cluster.systemNodes.instanceTypes must not be empty")
+		}
 	}
 	if c.Environment == EnvProduction && c.Cluster.EndpointPublicAccess {
 		errs = append(errs, "cluster.endpointPublicAccess should be false for production (requires bastion/VPN)")

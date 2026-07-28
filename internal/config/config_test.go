@@ -305,3 +305,77 @@ func TestApplyDefaults_FillsTheObservabilityTier(t *testing.T) {
 		t.Errorf("tier = %q, want full — a blank label matches no generator", c.Observability.Tier)
 	}
 }
+
+// A partial systemNodes block must be completed field by field, not by replacing the
+// struct — the wholesale form broke both directions.
+//
+// All four fields ride TF_VARs as a SET (landing-zone has no "leave the rest alone"
+// partial), so whatever survives ApplyDefaults is what overrides the leaf.
+func TestApplyDefaults_SystemNodesCompletesPerField(t *testing.T) {
+	t.Run("types only keeps real sizes, never zeros", func(t *testing.T) {
+		c := &Config{}
+		c.Cluster.SystemNodes.InstanceTypes = []string{"c7g.2xlarge"}
+		c.ApplyDefaults()
+		n := c.Cluster.SystemNodes
+		if n.MinSize == 0 || n.MaxSize == 0 || n.DesiredSize == 0 {
+			t.Fatalf("sizes left at zero (%d/%d/%d). All four fields are injected together "+
+				"whenever any differs from Default(), so zeros become "+
+				"TF_VAR_system_node_max_size=0 — which overrides production's leaf pin of 9 "+
+				"and is rejected by EKS mid-install", n.MinSize, n.MaxSize, n.DesiredSize)
+		}
+		if got := n.InstanceTypes; len(got) != 1 || got[0] != "c7g.2xlarge" {
+			t.Fatalf("the operator's instanceTypes must survive, got %v", got)
+		}
+	})
+
+	t.Run("sizes only keeps them, never discards them", func(t *testing.T) {
+		c := &Config{}
+		c.Cluster.SystemNodes.MinSize, c.Cluster.SystemNodes.MaxSize, c.Cluster.SystemNodes.DesiredSize = 3, 9, 3
+		c.ApplyDefaults()
+		n := c.Cluster.SystemNodes
+		if n.MinSize != 3 || n.MaxSize != 9 || n.DesiredSize != 3 {
+			t.Fatalf("the operator's sizing was silently discarded: got %d/%d/%d, want 3/9/3 — "+
+				"the whole-struct replacement made this field documented but inert",
+				n.MinSize, n.MaxSize, n.DesiredSize)
+		}
+		if len(n.InstanceTypes) == 0 {
+			t.Fatal("instanceTypes must still be defaulted")
+		}
+	})
+}
+
+// rackctl's default instance types must equal landing-zone's, or the documented value is
+// unreachable: no leaf pins system_node_instance_types, and a value equal to Default() is
+// never injected — so asking for exactly the shown list silently gets the component's list.
+func TestDefault_SystemNodeInstanceTypesMatchLandingZone(t *testing.T) {
+	got := Default().Cluster.SystemNodes.InstanceTypes
+	want := []string{"m7g.xlarge", "m6g.xlarge"} // components/aws/cluster/variables.tf:142
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v — see the comment on Default()", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+// A contradictory node group must fail in a second here, not minutes into the cluster apply.
+func TestValidate_RejectsImpossibleSystemNodeSizing(t *testing.T) {
+	for name, mut := range map[string]func(*Config){
+		"desired above max": func(c *Config) { c.Cluster.SystemNodes.DesiredSize = 99 },
+		"min above max":     func(c *Config) { c.Cluster.SystemNodes.MinSize, c.Cluster.SystemNodes.MaxSize = 9, 3 },
+		"zero min":          func(c *Config) { c.Cluster.SystemNodes.MinSize = -1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := Default()
+			c.Org.Name, c.Cloud.AccountID, c.Cloud.Profile, c.Cluster.Name = "acme", "111111111111", "p", "platform"
+			mut(c)
+			c.ApplyDefaults()
+			if err := c.Validate(); err == nil {
+				t.Fatal("expected a validation error — EKS rejects the node group, and by then " +
+					"the VPC is built and the cluster apply is minutes in")
+			}
+		})
+	}
+}
