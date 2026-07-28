@@ -136,7 +136,7 @@ func TestTGEnv_AgentPlatformFlagTracksTheConfig(t *testing.T) {
 		enable *bool
 		want   string
 	}{
-		{nil, "TF_VAR_enable_agent_platform=true"},                         // omitted = on
+		{nil, "TF_VAR_enable_agent_platform=true"}, // omitted = on
 		{boolPtr(true), "TF_VAR_enable_agent_platform=true"},
 		{boolPtr(false), "TF_VAR_enable_agent_platform=false"},
 	} {

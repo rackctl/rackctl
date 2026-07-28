@@ -24,8 +24,8 @@ func TestDefault_ClusterVersionMatchesLandingZone(t *testing.T) {
 // already-SSH forms all land on git@github.com:… so the deploy-key wiring parses them.
 func TestTenantsGitSSHURL(t *testing.T) {
 	cases := map[string]string{
-		"":                              "",
-		"github.com/acme/tenants":       "git@github.com:acme/tenants.git",
+		"":                                    "",
+		"github.com/acme/tenants":             "git@github.com:acme/tenants.git",
 		"https://github.com/acme/tenants.git": "git@github.com:acme/tenants.git",
 		"git@github.com:acme/tenants.git":     "git@github.com:acme/tenants.git",
 	}
