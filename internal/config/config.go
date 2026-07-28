@@ -20,6 +20,10 @@ var rfc1123Label = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$`)
 // cluster_version validation) accept. No patch component, no leading "v".
 var k8sMajorMinor = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
 
+// iamRoleARN is the shape of an IAM role ARN. IAM is global, so there is no region
+// segment: arn:<partition>:iam::<account>:role/<path...><name>.
+var iamRoleARN = regexp.MustCompile(`^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$`)
+
 // defaultVPCCIDR is the literal CIDR a create-mode VPC uses when it is not drawn from an
 // IPAM pool. It doubles as the sentinel for "unset" in the ipamPoolId ⇄ vpcCidr mutual
 // exclusion: an IPAM-allocated VPC leaves vpcCidr at this default (the CIDR comes from the
@@ -440,6 +444,21 @@ type Compliance struct {
 type ControlPlane struct {
 	EKSFleet bool `json:"eksFleet"` // Crossplane cluster control plane (multi-cluster)
 	Portal   bool `json:"portal"`   // day-2 operator UI
+	// FleetHubRoleARN is the IAM role provider-opentofu assumes to vend spoke clusters —
+	// landing-zone's fleet-hub component publishes it as `hub_role_arn`.
+	//
+	// It is required with EKSFleet because eks-fleet's config/bootstrap/providers.yaml
+	// ships a LITERAL placeholder (`arn:aws:iam::<FLEET_ACCOUNT_ID>:role/eks-fleet-crossplane`)
+	// and its own stand-up doc says "the file stays a placeholder", substituting the real
+	// ARN at apply time. Applying the file as-is installs a provider whose ServiceAccount
+	// annotation is not an ARN at all, so it never receives credentials — and since
+	// `kubectl apply` is declarative, it also reverts a real ARN an operator had put there.
+	//
+	// fleet-hub lives under live/aws/fleet/…, a tree rackctl does not apply, so this cannot
+	// be captured from an output the way the landing-zone values are. Get it with:
+	//
+	//	terragrunt output -raw hub_role_arn   # from live/aws/fleet/<region>/hub/fleet-hub
+	FleetHubRoleARN string `json:"fleetHubRoleArn,omitempty"`
 }
 
 type FirstTenant struct {
@@ -700,6 +719,19 @@ func (c *Config) Validate() error {
 	}
 	if c.ControlPlane.EKSFleet && c.Org.GitOps.ClustersRepo == "" {
 		errs = append(errs, "org.gitops.clustersRepo is required when controlPlane.eksFleet is true")
+	}
+	if c.ControlPlane.EKSFleet {
+		switch arn := c.ControlPlane.FleetHubRoleARN; {
+		case arn == "":
+			errs = append(errs, "controlPlane.fleetHubRoleArn is required when controlPlane.eksFleet is true — "+
+				"eks-fleet's config/bootstrap/providers.yaml ships a literal <FLEET_ACCOUNT_ID> placeholder and "+
+				"expects the real hub role ARN substituted at apply time. Get it from landing-zone's fleet-hub "+
+				"component: terragrunt output -raw hub_role_arn")
+		case !iamRoleARN.MatchString(arn):
+			errs = append(errs, fmt.Sprintf("controlPlane.fleetHubRoleArn %q is not an IAM role ARN — expected "+
+				"arn:<partition>:iam::<account>:role/<name>. A malformed value annotates the provider's "+
+				"ServiceAccount with something EKS cannot resolve, and the provider comes up with no credentials", arn))
+		}
 	}
 	if c.ControlPlane.Portal && c.Org.GitOps.TenantsRepo == "" {
 		errs = append(errs, "org.gitops.tenantsRepo is required when controlPlane.portal is true")

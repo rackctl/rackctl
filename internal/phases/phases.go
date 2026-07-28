@@ -966,9 +966,11 @@ func (fleet) Run(ctx context.Context, st *engine.State) error {
 	// eks.amazonaws.com/role-arn; the operator (or a prior fleet-hub apply) must have
 	// put the real hub role there, or IRSA will not attach. We apply the file as-is and
 	// say so — rewriting it would invent a role ARN we cannot see from the workload tree.
-	note(st, "applying config/bootstrap/providers.yaml — ensure eks.amazonaws.com/role-arn on the "+
-		"provider-opentofu ServiceAccount is the hub role ARN from fleet-hub (terragrunt output -raw hub_role_arn)")
-	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "config/bootstrap/providers.yaml"); err != nil {
+	rendered, err := renderFleetProviders(st)
+	if err != nil {
+		return err
+	}
+	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", rendered); err != nil {
 		return err
 	}
 	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "config/functions.yaml"); err != nil {

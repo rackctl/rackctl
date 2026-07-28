@@ -190,14 +190,19 @@ type execer interface {
 // do not name two co-located clusters where one base name is a hyphen-prefix of the other.
 // config.Validate cannot catch that — it sees one cluster at a time.
 //
-// One class of operator-minted role is NOT covered, and it is a pre-existing gap this filter
-// does not change: the eventBridgeScheduler capability mints `<environment>-<platform>-scheduler-invoke`
-// at the ROOT path with no Path set, keyed on the environment rather than the cluster
-// (platform_capability_policy.go). The path prefix above excludes it before the name filter is
-// ever reached. It carries the tenant permissions boundary agent-iam destroys, so a Platform
-// declaring that capability whose finalizer did not complete can still wedge a teardown on
-// DeleteConflict — the case this function otherwise removes. Covering it needs a second
-// enumeration scoped by ENVIRONMENT, not by cluster name.
+// One class of operator-minted role is NOT covered: the eventBridgeScheduler capability
+// mints `<cluster>-<platform>-scheduler-invoke` at the ROOT path with no Path set
+// (platform_capability_policy.go:270). The name filter below WOULD match it — upstream
+// 0546a92 re-keyed it from the environment to the cluster — but the path prefix excludes it
+// before the name is ever considered. It carries the tenant permissions boundary agent-iam
+// destroys, so a Platform declaring that capability whose finalizer did not complete can
+// still wedge a teardown on DeleteConflict.
+//
+// Widening the path is not the answer: enumerating IAM's root path means every role in the
+// account, and this sweep must stay scoped to one cluster. The channel upstream prescribes
+// is the tag sweep — 0546a92 tags these roles so a compromise sweep can pick them out of
+// the root path (platform_capability_policy.go:315-322) — or accepting that the finalizer
+// owns the delete, which it does whenever the operator is healthy.
 func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer, cluster string) {
 	reapOperatorRoles(ctx, run, run.DryRun, out, cluster)
 }

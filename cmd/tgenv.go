@@ -90,8 +90,18 @@ func tgEnv(cfg *config.Config) []string {
 		// fails cluster-bootstrap on a missing SSM parameter. Deriving the flag from whether
 		// rackctl applied dns is what closes that hole.
 		//
-		// enable_portal_reader mints the portal's read-only SA + token. Opt-in upstream;
-		// follows controlPlane.portal so a portal-enabled install actually gets the reader.
+		// enable_portal_reader mints the portal's read-only ServiceAccount and a DURABLE
+		// token, so the portal can register the cluster and watch Platform/Tenant CRs.
+		//
+		// It defaults to TRUE upstream (cluster-bootstrap/variables.tf:154) and no leaf pins
+		// it, so a portal-enabled install already got the reader — this injection does not
+		// fix an inert knob. What it does is the opposite, and deliberately: it turns the
+		// reader OFF when controlPlane.portal is false, because a durable cluster-read token
+		// that nothing consumes is a standing credential minted for no reason.
+		//
+		// This is the one place rackctl injects a value that is not "different from the
+		// leaf's" — there is no leaf pin to respect here, only a component default, and
+		// leaving a credential lying around is not a default worth inheriting.
 		"TF_VAR_enable_accelerators=" + strconv.FormatBool(cfg.Addons.Accelerators),
 		"TF_VAR_observability_tier=" + string(cfg.Observability.Tier),
 		"TF_VAR_enable_managed_monitoring=" + strconv.FormatBool(cfg.FullObservability()),
