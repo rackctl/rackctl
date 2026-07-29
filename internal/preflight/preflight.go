@@ -34,6 +34,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -66,6 +67,7 @@ func Run(ctx context.Context, env *Env) []doctor.Result {
 		CheckCollisions(ctx, env),
 		CheckSoftDeletedSecrets(ctx, env),
 		CheckCatalogFork(ctx, env),
+		CheckGitHubToken(ctx, env),
 		CheckVendFreshness(ctx, env),
 	}
 }
@@ -405,6 +407,49 @@ func CheckCatalogFork(ctx context.Context, env *Env) doctor.Result {
 			fork, behind, upstream, fork, upstream))
 	}
 	return ok(name, fork+" is current with "+upstream)
+}
+
+// ─────────────────────────── github credential ───────────────────────────
+
+// CheckGitHubToken asserts a GitHub credential exists when the config arms the one
+// component that needs one.
+//
+// org.gitops.tenantsRepo is the trigger. It makes rackctl send TF_VAR_tenants_repo_url,
+// and cluster-bootstrap's own comment states the contract exactly: "the token comes from
+// the GITHUB_TOKEN environment variable. When tenants_repo_url is empty, owner is "" and
+// no github resources are created, so the provider is never called"
+// (components/aws/cluster-bootstrap/main.tf:170-172). Setting the repo is what calls it.
+//
+// Unauthenticated, that provider 401s during PHASE 5 — after the VPC, the EKS cluster and
+// every substrate component are built and billing. Cheap to know now, expensive to learn
+// then.
+//
+// The trap this check really exists for: the documented setup path PRODUCES the failing
+// state. quickstart.md tells operators to run `gh auth login`, which stores the credential
+// in gh's keyring and exports nothing at all. Following the docs exactly left GITHUB_TOKEN
+// unset, so the install that was set up correctly is the install that fails.
+func CheckGitHubToken(ctx context.Context, env *Env) doctor.Result {
+	const name = "github token"
+
+	repo := env.Cfg.Org.GitOps.TenantsRepo
+	if repo == "" {
+		return ok(name, "org.gitops.tenantsRepo is unset — cluster-bootstrap's github provider is never called")
+	}
+	if os.Getenv("GITHUB_TOKEN") != "" {
+		return ok(name, "GITHUB_TOKEN is exported")
+	}
+	// Require a non-empty token, not merely a zero exit. `gh auth token` prints nothing and
+	// still succeeds in some states, and "it exited 0" is the green light that means nothing.
+	if tok, err := env.Run.Capture(ctx, "gh", "auth", "token"); err == nil && tok != "" {
+		return ok(name, "gh holds a token — rackctl passes it to cluster-bootstrap as GITHUB_TOKEN")
+	}
+	return fail(name, fmt.Sprintf(
+		"org.gitops.tenantsRepo is set (%s) but no GitHub credential is reachable. That setting "+
+			"arms cluster-bootstrap's `provider \"github\"`, which authenticates from GITHUB_TOKEN "+
+			"and nothing else — without it the apply 401s in phase 5, after the VPC and the EKS "+
+			"cluster are already built. Fix: `gh auth login` (rackctl bridges the token for you), "+
+			"or export GITHUB_TOKEN with repo scope on %s. Or unset org.gitops.tenantsRepo to skip "+
+			"the tenant-repo deploy-key wiring entirely.", repo, repo))
 }
 
 // ─────────────────────────── local vend ───────────────────────────
