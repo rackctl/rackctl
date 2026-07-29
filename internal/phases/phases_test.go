@@ -2,7 +2,10 @@ package phases
 
 import (
 	"context"
+	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -11,6 +14,46 @@ import (
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
 )
+
+// A cluster-bootstrap failure must NOT roll back.
+//
+// By the time phase 5 runs, the substrate phases have built the VPC, the EKS cluster and
+// every AWS dependency the addons need. ArgoCD failing to install — a GitHub 401 on the
+// tenants-repo deploy key, a chart that will not render — is not a reason to demolish any
+// of it. The convergence wait further down this same phase already says exactly that; the
+// apply above it used to return BARE, so the sweep ran and destroyed the cluster and the
+// VPC over a credential fixable in ten seconds.
+func TestGitopsPhase_AFailedInstallDoesNotDestroyTheProvisionedCloud(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake terragrunt: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := config.Default()
+	cfg.Org.Name = "acme"
+	cfg.Cluster.Name = "platform"
+	cfg.ApplyDefaults()
+
+	st := &engine.State{
+		Config: cfg,
+		Runner: exec.New(io.Discard), // NOT dry-run — the point is to exec and fail
+		Repos:  engine.Repos{Workdir: dir, LandingZone: dir},
+	}
+
+	err := gitopsPhase{}.Run(context.Background(), st)
+	if err == nil {
+		t.Fatal("a failing cluster-bootstrap apply must return an error")
+	}
+	var noRollback *engine.NoRollbackError
+	if !errors.As(err, &noRollback) {
+		t.Fatalf("ArgoCD failing to install must not trigger the rollback sweep — the cloud is "+
+			"already provisioned; got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "left standing") {
+		t.Errorf("the operator must be told the cluster survived:\n%s", err)
+	}
+}
 
 // testState wraps a config in an engine.State whose runner discards notes, so the
 // TF_VAR builders (which print operator-facing notes) can be exercised without output.

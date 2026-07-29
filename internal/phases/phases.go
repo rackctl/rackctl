@@ -237,10 +237,11 @@ func componentEnv(ctx context.Context, st *engine.State, component, verb string)
 		// mapped globs differ from Default() — otherwise the leaf's fleet default stands.
 		return agentIAMEnv(st), nil
 	case "cluster-bootstrap":
-		// tenants_repo_url when the portal's tenants repo is set. The enable_* booleans
-		// live in tgEnv (global), because cluster-bootstrap is not the only consumer of
-		// some of them and the ambient injection is deliberate.
-		return clusterBootstrapEnv(st), nil
+		// tenants_repo_url when the portal's tenants repo is set, plus the GITHUB_TOKEN
+		// that variable makes mandatory — setting it arms the component's github provider.
+		// The enable_* booleans live in tgEnv (global), because cluster-bootstrap is not
+		// the only consumer of some of them and the ambient injection is deliberate.
+		return clusterBootstrapEnv(ctx, st)
 	default:
 		return nil, nil
 	}
@@ -756,7 +757,21 @@ func (gitopsPhase) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	note(st, "installing ArgoCD + app-of-apps pointing at %s", st.Config.Org.GitOps.GitURL())
 	if err := apply(ctx, st, "cluster-bootstrap"); err != nil {
-		return err
+		// By the time this runs, the substrate phases have built the VPC, the EKS cluster
+		// and every AWS dependency the addons need. A cluster-bootstrap failure means
+		// ArgoCD did not install — a GitHub 401 on the tenants-repo deploy key, a chart
+		// that will not render, a webhook not yet up. None of those are a reason to
+		// demolish the cloud underneath.
+		//
+		// The convergence wait immediately below already takes exactly this position, in
+		// as many words. An apply failure in the SAME phase reaching the opposite
+		// conclusion was an inconsistency, not a decision: it returned bare, so the
+		// rollback sweep ran and destroyed the cluster and the VPC over a credential the
+		// operator could have fixed in ten seconds and re-run.
+		return &engine.NoRollbackError{Err: fmt.Errorf(
+			"installing ArgoCD failed. The cloud IS provisioned and the cluster is left "+
+				"standing — fix the cause and re-run `rackctl init` (it is re-runnable), or "+
+				"`rackctl destroy` if you want it gone: %w", err)}
 	}
 
 	// Wait on the health STATUS, not on a condition. ArgoCD publishes no `Healthy`
