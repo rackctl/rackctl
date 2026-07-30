@@ -20,6 +20,10 @@ var rfc1123Label = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$`)
 // cluster_version validation) accept. No patch component, no leading "v".
 var k8sMajorMinor = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
 
+// iamRoleARN is the shape of an IAM role ARN. IAM is global, so there is no region
+// segment: arn:<partition>:iam::<account>:role/<path...><name>.
+var iamRoleARN = regexp.MustCompile(`^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$`)
+
 // defaultVPCCIDR is the literal CIDR a create-mode VPC uses when it is not drawn from an
 // IPAM pool. It doubles as the sentinel for "unset" in the ipamPoolId ⇄ vpcCidr mutual
 // exclusion: an IPAM-allocated VPC leaves vpcCidr at this default (the CIDR comes from the
@@ -440,6 +444,21 @@ type Compliance struct {
 type ControlPlane struct {
 	EKSFleet bool `json:"eksFleet"` // Crossplane cluster control plane (multi-cluster)
 	Portal   bool `json:"portal"`   // day-2 operator UI
+	// FleetHubRoleARN is the IAM role provider-opentofu assumes to vend spoke clusters —
+	// landing-zone's fleet-hub component publishes it as `hub_role_arn`.
+	//
+	// It is required with EKSFleet because eks-fleet's config/bootstrap/providers.yaml
+	// ships a LITERAL placeholder (`arn:aws:iam::<FLEET_ACCOUNT_ID>:role/eks-fleet-crossplane`)
+	// and its own stand-up doc says "the file stays a placeholder", substituting the real
+	// ARN at apply time. Applying the file as-is installs a provider whose ServiceAccount
+	// annotation is not an ARN at all, so it never receives credentials — and since
+	// `kubectl apply` is declarative, it also reverts a real ARN an operator had put there.
+	//
+	// fleet-hub lives under live/aws/fleet/…, a tree rackctl does not apply, so this cannot
+	// be captured from an output the way the landing-zone values are. Get it with:
+	//
+	//	terragrunt output -raw hub_role_arn   # from live/aws/fleet/<region>/hub/fleet-hub
+	FleetHubRoleARN string `json:"fleetHubRoleArn,omitempty"`
 }
 
 type FirstTenant struct {
@@ -462,8 +481,13 @@ func Default() *Config {
 			// the leaf installed 1.36 regardless — the field was read by nothing.
 			Version:              "1.36",
 			EndpointPublicAccess: true,
-			SystemNodes:          NodeGroup{InstanceTypes: []string{"m7g.xlarge"}, MinSize: 2, MaxSize: 6, DesiredSize: 2},
-			Network:              ClusterNet{VPCCIDR: defaultVPCCIDR, NATGateways: 1},
+			// Matches landing-zone's system_node_instance_types default, for the same reason
+			// Version does. No leaf pins the variable, and a value equal to Default() is never
+			// injected — so the single-type list rackctl used to show was not merely wrong, it
+			// was UNREACHABLE: an operator who deliberately wanted Graviton3 only wrote exactly
+			// that, nothing was injected, and m6g nodes joined the group anyway.
+			SystemNodes: NodeGroup{InstanceTypes: []string{"m7g.xlarge", "m6g.xlarge"}, MinSize: 2, MaxSize: 6, DesiredSize: 2},
+			Network:     ClusterNet{VPCCIDR: defaultVPCCIDR, NATGateways: 1},
 		},
 		Quotas:        Quotas{AutoRequest: true, VCPU: 256},
 		Observability: Observability{Tier: TierFull},
@@ -490,8 +514,26 @@ func (c *Config) ApplyDefaults() {
 	if c.Cluster.Version == "" {
 		c.Cluster.Version = d.Cluster.Version
 	}
+	// Field by field, never the whole struct — the same rule ClusterNet and Observability
+	// state below, and for a sharper reason now that all four fields ride TF_VARs.
+	//
+	// Replacing the struct wholesale broke both directions. A config naming only
+	// instanceTypes kept its zero sizes, and since ANY difference from Default() injects
+	// all four, rackctl sent min=0/max=0/desired=0 — which overrides the production leaf's
+	// 3/9/3 pin and is rejected outright by EKS, failing the cluster phase mid-install. A
+	// config naming only sizes had them silently replaced by 2/6/2 and injected nothing,
+	// which is precisely the "documented but inert" defect this field was wired to kill.
 	if len(c.Cluster.SystemNodes.InstanceTypes) == 0 {
-		c.Cluster.SystemNodes = d.Cluster.SystemNodes
+		c.Cluster.SystemNodes.InstanceTypes = d.Cluster.SystemNodes.InstanceTypes
+	}
+	if c.Cluster.SystemNodes.MinSize == 0 {
+		c.Cluster.SystemNodes.MinSize = d.Cluster.SystemNodes.MinSize
+	}
+	if c.Cluster.SystemNodes.MaxSize == 0 {
+		c.Cluster.SystemNodes.MaxSize = d.Cluster.SystemNodes.MaxSize
+	}
+	if c.Cluster.SystemNodes.DesiredSize == 0 {
+		c.Cluster.SystemNodes.DesiredSize = d.Cluster.SystemNodes.DesiredSize
 	}
 	// Default the two base fields individually, never the whole struct — replacing
 	// ClusterNet wholesale would wipe an IPAM/transit-gateway/egress lever set without a
@@ -558,6 +600,26 @@ func (c *Config) Validate() error {
 	}
 	if c.Cluster.Version != "" && !k8sMajorMinor.MatchString(c.Cluster.Version) {
 		errs = append(errs, fmt.Sprintf("cluster.version %q must be Kubernetes major.minor, e.g. \"1.36\" (no patch component, no leading \"v\") — landing-zone rejects any other shape at plan time", c.Cluster.Version))
+	}
+	// The system node group's sizes must hold 1 <= min <= desired <= max. All four fields
+	// ride TF_VARs onto landing-zone's node group as a set, so a contradiction here becomes
+	// an EKS API rejection minutes into the cluster apply, with the VPC already built and
+	// the state to unpick. A second here is cheaper.
+	if n := c.Cluster.SystemNodes; len(n.InstanceTypes) > 0 || n.MinSize != 0 || n.MaxSize != 0 || n.DesiredSize != 0 {
+		switch {
+		case n.MinSize < 1:
+			errs = append(errs, fmt.Sprintf("cluster.systemNodes.minSize must be at least 1, got %d — the system "+
+				"group runs CoreDNS and the addons every other workload depends on", n.MinSize))
+		case n.DesiredSize < n.MinSize || n.DesiredSize > n.MaxSize:
+			errs = append(errs, fmt.Sprintf("cluster.systemNodes.desiredSize (%d) must be between minSize (%d) "+
+				"and maxSize (%d) — EKS rejects the node group otherwise", n.DesiredSize, n.MinSize, n.MaxSize))
+		case n.MaxSize < n.MinSize:
+			errs = append(errs, fmt.Sprintf("cluster.systemNodes.maxSize (%d) must be at least minSize (%d)",
+				n.MaxSize, n.MinSize))
+		}
+		if len(n.InstanceTypes) == 0 {
+			errs = append(errs, "cluster.systemNodes.instanceTypes must not be empty")
+		}
 	}
 	if c.Environment == EnvProduction && c.Cluster.EndpointPublicAccess {
 		errs = append(errs, "cluster.endpointPublicAccess should be false for production (requires bastion/VPN)")
@@ -657,6 +719,19 @@ func (c *Config) Validate() error {
 	}
 	if c.ControlPlane.EKSFleet && c.Org.GitOps.ClustersRepo == "" {
 		errs = append(errs, "org.gitops.clustersRepo is required when controlPlane.eksFleet is true")
+	}
+	if c.ControlPlane.EKSFleet {
+		switch arn := c.ControlPlane.FleetHubRoleARN; {
+		case arn == "":
+			errs = append(errs, "controlPlane.fleetHubRoleArn is required when controlPlane.eksFleet is true — "+
+				"eks-fleet's config/bootstrap/providers.yaml ships a literal <FLEET_ACCOUNT_ID> placeholder and "+
+				"expects the real hub role ARN substituted at apply time. Get it from landing-zone's fleet-hub "+
+				"component: terragrunt output -raw hub_role_arn")
+		case !iamRoleARN.MatchString(arn):
+			errs = append(errs, fmt.Sprintf("controlPlane.fleetHubRoleArn %q is not an IAM role ARN — expected "+
+				"arn:<partition>:iam::<account>:role/<name>. A malformed value annotates the provider's "+
+				"ServiceAccount with something EKS cannot resolve, and the provider comes up with no credentials", arn))
+		}
 	}
 	if c.ControlPlane.Portal && c.Org.GitOps.TenantsRepo == "" {
 		errs = append(errs, "org.gitops.tenantsRepo is required when controlPlane.portal is true")

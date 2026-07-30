@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -47,6 +48,83 @@ func mustFail(t *testing.T, r doctor.Result, wantSubstr string) {
 	}
 	if wantSubstr != "" && !strings.Contains(r.Detail, wantSubstr) {
 		t.Errorf("%s: detail does not name the remedy (%q missing):\n%s", r.Name, wantSubstr, r.Detail)
+	}
+}
+
+// ─────────────────────────── registration ───────────────────────────
+
+// A check that is not in Run()'s list never executes, however good it is. Nothing else
+// asserts that list, so a check could be written, tested, and silently never run.
+func TestRun_EveryCheckIsRegistered(t *testing.T) {
+	fakeBin(t, "aws", `exit 1`)
+	fakeBin(t, "gh", `exit 1`)
+	t.Setenv("GITHUB_TOKEN", "")
+
+	var names []string
+	for _, r := range Run(context.Background(), testEnv()) {
+		names = append(names, r.Name)
+	}
+	for _, want := range []string{
+		"aws identity", "vcpu quota", "terraform state", "orphan collisions",
+		"soft-deleted secrets", "catalog fork", "github token", "local vend",
+	} {
+		if !slices.Contains(names, want) {
+			t.Errorf("check %q is not registered in Run() — it would never execute; got %v", want, names)
+		}
+	}
+}
+
+// ─────────────────────────── github credential ───────────────────────────
+
+// tokenEnv is testEnv with a tenants repo set — the setting that arms cluster-bootstrap's
+// github provider — and any real GITHUB_TOKEN cleared so the test controls both channels.
+func tokenEnv(t *testing.T, repo string) *Env {
+	t.Helper()
+	t.Setenv("GITHUB_TOKEN", "")
+	e := testEnv()
+	e.Cfg.Org.GitOps.TenantsRepo = repo
+	return e
+}
+
+// The failure this exists to prevent: a 401 in PHASE 5, after the VPC and the EKS cluster
+// are built and billing. Knowable in a second, before a dollar is spent.
+func TestCheckGitHubToken_FailsWhenTheConfigNeedsATokenAndNoneExists(t *testing.T) {
+	fakeBin(t, "gh", `exit 1`)
+
+	r := CheckGitHubToken(context.Background(), tokenEnv(t, "github.com/acme/tenants"))
+	mustFail(t, r, "gh auth login")
+	if !strings.Contains(r.Detail, "phase 5") {
+		t.Errorf("must say WHEN it would blow up — that is the whole cost argument:\n%s", r.Detail)
+	}
+}
+
+// `gh auth login` stores the credential in gh's keyring and exports nothing. rackctl
+// bridges it, so this is a healthy state rather than the failure it used to be.
+func TestCheckGitHubToken_OKWhenGhHoldsOne(t *testing.T) {
+	fakeBin(t, "gh", `[ "$1 $2" = "auth token" ] && echo ghs_x; exit 0`)
+
+	if r := CheckGitHubToken(context.Background(), tokenEnv(t, "github.com/acme/tenants")); r.Status != doctor.OK {
+		t.Fatalf("gh holding a token is sufficient — rackctl passes it through: %s", r.Detail)
+	}
+}
+
+// A zero exit with no output is not a credential. Reading it as one puts the check right
+// back to green-lighting the 401 it was written to catch.
+func TestCheckGitHubToken_ZeroExitWithNoTokenIsNotHealthy(t *testing.T) {
+	fakeBin(t, "gh", `exit 0`)
+
+	if r := CheckGitHubToken(context.Background(), tokenEnv(t, "github.com/acme/tenants")); r.Status == doctor.OK {
+		t.Fatalf("an empty token must never report OK:\n%s", r.Detail)
+	}
+}
+
+// No tenants repo means the provider is never called. Gating an install on a credential
+// it will never use would be a false alarm on the common path.
+func TestCheckGitHubToken_OKWhenNoTenantsRepo(t *testing.T) {
+	fakeBin(t, "gh", `exit 1`)
+
+	if r := CheckGitHubToken(context.Background(), tokenEnv(t, "")); r.Status != doctor.OK {
+		t.Fatalf("portal-off installs need no GitHub token: %s", r.Detail)
 	}
 }
 

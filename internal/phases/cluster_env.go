@@ -3,6 +3,8 @@ package phases
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"slices"
 	"strconv"
 
@@ -91,17 +93,80 @@ func agentIAMEnv(st *engine.State) []string {
 }
 
 // clusterBootstrapEnv builds the TF_VARs cluster-bootstrap declares that are not the
-// global booleans already in tgEnv. tenants_repo_url is the one: when the portal is on,
-// ArgoCD needs a deploy key on the tenants repo, and that wiring only fires when this
-// variable is set. Empty (the default) disables it, which is correct for a portal-off
-// install and wrong for a portal-on one.
-func clusterBootstrapEnv(st *engine.State) []string {
+// global booleans already in tgEnv, plus the GitHub credential those TF_VARs make
+// mandatory.
+//
+// tenants_repo_url is the one: when the portal is on, ArgoCD needs a deploy key on the
+// tenants repo, and that wiring only fires when this variable is set. Empty (the default)
+// disables it, which is correct for a portal-off install and wrong for a portal-on one.
+//
+// Setting it is also what ARMS cluster-bootstrap's `provider "github"`, whose owner is
+// parsed from this very URL. The component says so itself: "the token comes from the
+// GITHUB_TOKEN environment variable. When tenants_repo_url is empty, owner is "" and no
+// github resources are created, so the provider is never called" (main.tf:170-172). So
+// this variable and that credential are one decision, which is why they are built here
+// together rather than left to be discovered a phase later as a 401.
+func clusterBootstrapEnv(ctx context.Context, st *engine.State) ([]string, error) {
 	u := st.Config.Org.GitOps.TenantsGitSSHURL()
 	if u == "" {
-		return nil
+		return nil, nil
 	}
 	note(st, "cluster-bootstrap: TF_VAR_tenants_repo_url=%s — registers a read-only deploy key "+
 		"and the matching ArgoCD repository credential so portal-committed tenant manifests pull",
 		u)
-	return []string{"TF_VAR_tenants_repo_url=" + u}
+	env := []string{"TF_VAR_tenants_repo_url=" + u}
+
+	tok, source, err := githubToken(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+	note(st, "cluster-bootstrap: GITHUB_TOKEN from %s — tenants_repo_url arms the github provider "+
+		"and it authenticates with this", source)
+	if tok != "" {
+		env = append(env, "GITHUB_TOKEN="+tok)
+	}
+	return env, nil
+}
+
+// githubToken resolves the credential cluster-bootstrap's github provider needs, returning
+// the token and a description of where it came from.
+//
+// An exported GITHUB_TOKEN is honoured as-is and returned EMPTY: os.Environ() already
+// carries it to the child, so re-injecting a copy would only widen the number of places
+// the secret lives.
+//
+// The gh fallback exists because the documented setup path produces no token at all.
+// quickstart tells operators to run `gh auth login`, which stores the credential in gh's
+// keyring and exports nothing — so the operator who followed the instructions exactly is
+// the operator whose apply 401s. Asking gh for the token it is already holding turns the
+// documented path into a working one.
+//
+// The token is never returned through a note or an error string. exec.Runner echoes argv
+// but never env (tools.go:41), so passing it as env is precisely what keeps it out of the
+// transcript — do not "improve" this by moving it to a -var flag.
+func githubToken(ctx context.Context, st *engine.State) (token, source string, err error) {
+	if os.Getenv("GITHUB_TOKEN") != "" {
+		return "", "the exported GITHUB_TOKEN", nil
+	}
+	if st.Runner.DryRun {
+		// Capture is a no-op in dry-run, so gh cannot be consulted. Say that plainly rather
+		// than reporting a token that was never resolved — preflight is what fails early.
+		return "", "gh at apply time (not resolved in a dry-run)", nil
+	}
+	// Require a non-empty token, not merely a zero exit — see CheckGitHubToken.
+	tok, err := st.Runner.Capture(ctx, "gh", "auth", "token")
+	if err != nil || tok == "" {
+		return "", "", &engine.NoRollbackError{Err: fmt.Errorf(
+			"cluster-bootstrap needs a GitHub token and none is reachable.\n\n" +
+				"org.gitops.tenantsRepo is set, which sends TF_VAR_tenants_repo_url and arms " +
+				"cluster-bootstrap's `provider \"github\"`. That provider authenticates from " +
+				"GITHUB_TOKEN and nothing else, so the apply would fail with a 401 — with the VPC, " +
+				"the EKS cluster and every substrate component already built.\n\n" +
+				"Fix either way:\n" +
+				"  gh auth login                          # rackctl bridges the token for you\n" +
+				"  export GITHUB_TOKEN=$(gh auth token)   # if you are logged in already\n\n" +
+				"The token needs repo scope to register the read-only deploy key. Or unset " +
+				"org.gitops.tenantsRepo to skip the tenant-repo wiring entirely")}
+	}
+	return tok, "`gh auth token`", nil
 }

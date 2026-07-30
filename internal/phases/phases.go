@@ -237,10 +237,11 @@ func componentEnv(ctx context.Context, st *engine.State, component, verb string)
 		// mapped globs differ from Default() — otherwise the leaf's fleet default stands.
 		return agentIAMEnv(st), nil
 	case "cluster-bootstrap":
-		// tenants_repo_url when the portal's tenants repo is set. The enable_* booleans
-		// live in tgEnv (global), because cluster-bootstrap is not the only consumer of
-		// some of them and the ambient injection is deliberate.
-		return clusterBootstrapEnv(st), nil
+		// tenants_repo_url when the portal's tenants repo is set, plus the GITHUB_TOKEN
+		// that variable makes mandatory — setting it arms the component's github provider.
+		// The enable_* booleans live in tgEnv (global), because cluster-bootstrap is not
+		// the only consumer of some of them and the ambient injection is deliberate.
+		return clusterBootstrapEnv(ctx, st)
 	default:
 		return nil, nil
 	}
@@ -756,7 +757,21 @@ func (gitopsPhase) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	note(st, "installing ArgoCD + app-of-apps pointing at %s", st.Config.Org.GitOps.GitURL())
 	if err := apply(ctx, st, "cluster-bootstrap"); err != nil {
-		return err
+		// By the time this runs, the substrate phases have built the VPC, the EKS cluster
+		// and every AWS dependency the addons need. A cluster-bootstrap failure means
+		// ArgoCD did not install — a GitHub 401 on the tenants-repo deploy key, a chart
+		// that will not render, a webhook not yet up. None of those are a reason to
+		// demolish the cloud underneath.
+		//
+		// The convergence wait immediately below already takes exactly this position, in
+		// as many words. An apply failure in the SAME phase reaching the opposite
+		// conclusion was an inconsistency, not a decision: it returned bare, so the
+		// rollback sweep ran and destroyed the cluster and the VPC over a credential the
+		// operator could have fixed in ten seconds and re-run.
+		return &engine.NoRollbackError{Err: fmt.Errorf(
+			"installing ArgoCD failed. The cloud IS provisioned and the cluster is left "+
+				"standing — fix the cause and re-run `rackctl init` (it is re-runnable), or "+
+				"`rackctl destroy` if you want it gone: %w", err)}
 	}
 
 	// Wait on the health STATUS, not on a condition. ArgoCD publishes no `Healthy`
@@ -860,6 +875,37 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 	// declared healthy while blind.
 	if err := applyAgentPlatform(ctx, st); err != nil {
 		return err
+	}
+
+	// Now that eval-runtime has written its SSM parameters, republish cluster-bootstrap with
+	// enable_eval_runtime on.
+	//
+	// This is a re-apply, and it is the only way the annotation can ever be stamped. The
+	// variable is opt-in upstream BECAUSE it depends on another component having run
+	// (cluster-bootstrap/variables.tf:182 — "Requires that component to have applied
+	// first"), and rackctl runs cluster-bootstrap in the gitops phase, one phase before the
+	// agent-platform tree exists. Setting the flag there would fail the SSM read; leaving it
+	// unset means bootstrap.tf:397-400 never stamps
+	// `eks-agent-platform/eval-reports-bucket` on the ArgoCD cluster Secret, the operator
+	// ApplicationSet renders evalReportsBucket empty, and every EvalSuite run completes with
+	// its reports going nowhere durable. Nothing errors — which is the whole problem.
+	//
+	// tgenv.go states this rule for enable_managed_monitoring and it applies verbatim here:
+	// any landing-zone variable that is opt-in because it depends on another component
+	// having run is a variable rackctl must supply. This is that same wire, one flag over.
+	//
+	// The apply is a near-no-op — cluster-bootstrap converged a phase ago — but it is a real
+	// apply, so it is announced rather than slipped in.
+	note(st, "republishing cluster-bootstrap with enable_eval_runtime=true — eval-runtime's SSM "+
+		"parameters exist only now, and this is what stamps eks-agent-platform/eval-reports-bucket "+
+		"on the ArgoCD cluster Secret. Without it the operator renders an empty bucket and EvalSuite "+
+		"reports are never persisted")
+	prevDir := st.Runner.Dir
+	st.Runner.Dir = st.Repos.LandingZone
+	err := applyWith(ctx, st, "cluster-bootstrap", "TF_VAR_enable_eval_runtime=true")
+	st.Runner.Dir = prevDir
+	if err != nil {
+		return fmt.Errorf("republishing cluster-bootstrap for eval-runtime: %w", err)
 	}
 
 	note(st, "agent operator + CRDs are owned by the GitOps catalog (addons-agent-operator); waiting for convergence")
@@ -966,9 +1012,11 @@ func (fleet) Run(ctx context.Context, st *engine.State) error {
 	// eks.amazonaws.com/role-arn; the operator (or a prior fleet-hub apply) must have
 	// put the real hub role there, or IRSA will not attach. We apply the file as-is and
 	// say so — rewriting it would invent a role ARN we cannot see from the workload tree.
-	note(st, "applying config/bootstrap/providers.yaml — ensure eks.amazonaws.com/role-arn on the "+
-		"provider-opentofu ServiceAccount is the hub role ARN from fleet-hub (terragrunt output -raw hub_role_arn)")
-	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "config/bootstrap/providers.yaml"); err != nil {
+	rendered, err := renderFleetProviders(st)
+	if err != nil {
+		return err
+	}
+	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", rendered); err != nil {
 		return err
 	}
 	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "config/functions.yaml"); err != nil {

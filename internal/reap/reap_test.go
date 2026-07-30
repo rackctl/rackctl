@@ -3,6 +3,7 @@ package reap
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -393,4 +394,43 @@ func TestPointAt_RefusesABlankCluster(t *testing.T) {
 	if len(f.runs) != 0 {
 		t.Fatalf("nothing should be executed for a blank cluster; got %v", f.runs)
 	}
+}
+
+// A hub with vended spokes must be discoverable before anything is destroyed.
+//
+// A Cluster CR composes a whole landing-zone stack through provider-opentofu — a real EKS
+// control plane, VPC and NAT gateways, frequently in another AWS account. The hub is the
+// only place they are tracked, so a teardown that does not see them strands them past the
+// point of recovery.
+func TestFleetSpokes_NamesEveryVendedCluster(t *testing.T) {
+	got := fleetSpokes(context.Background(), &spokeExecer{out: "team-a/orders  team-b/analytics "})
+	want := []string{"team-a/orders", "team-b/analytics"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+// No CRD installed (fleet was never enabled) and no reachable cluster both mean the same
+// thing: there is no hub, so there is nothing to strand. Neither may block a teardown.
+func TestFleetSpokes_EmptyWhenThereIsNoHub(t *testing.T) {
+	noCRD := &spokeExecer{err: errors.New(`error: the server doesn't have a resource type "clusters"`)}
+	if got := fleetSpokes(context.Background(), noCRD); len(got) != 0 {
+		t.Fatalf("got %v, want none — an absent CRD must not block a teardown", got)
+	}
+}
+
+// spokeExecer answers the one Capture FleetSpokes makes.
+type spokeExecer struct {
+	out string
+	err error
+}
+
+func (s *spokeExecer) Run(context.Context, string, ...string) error { return nil }
+func (s *spokeExecer) Capture(context.Context, string, ...string) (string, error) {
+	return s.out, s.err
 }

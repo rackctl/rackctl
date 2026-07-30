@@ -18,9 +18,16 @@ import (
 // (a) have acquired an eks-fleet checkout path and (b) issue kubectl/helm commands
 // against files that exist in that repo.
 func TestFleet_DryRunUsesTheEKSFleetCheckout(t *testing.T) {
-	// Prefer a real local clone so the paths we assert actually exist; fall back to a
-	// fixture that mirrors the bootstrap layout.
-	checkout := "/Users/bs/codes/nanohype/eks-fleet"
+	// The fixture below is the unit test everywhere. RACKCTL_EKSFLEET_CHECKOUT opts a
+	// developer (or an integration job) into running the same assertions against a real
+	// clone — which is the only way this catches upstream path drift.
+	//
+	// It used to hardcode an absolute path under one developer's home. That made the
+	// property the test advertises ("commands against paths that exist in the eks-fleet
+	// checkout") verifiable on exactly one machine: in CI the fixture is built from the
+	// same six path strings the phase applies, so it can only ever agree with itself. If
+	// upstream renames config/reaper.yaml, CI stays green and the phase 404s at apply time.
+	checkout := os.Getenv("RACKCTL_EKSFLEET_CHECKOUT")
 	if _, err := os.Stat(filepath.Join(checkout, "apis/cluster/definition.yaml")); err != nil {
 		checkout = t.TempDir()
 		for _, p := range []string{

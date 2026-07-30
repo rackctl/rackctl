@@ -2,6 +2,10 @@ package phases
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -283,5 +287,83 @@ func TestApplyAgentPlatform_ApplyStillRequiresTheOutputs(t *testing.T) {
 	if _, err := agentPlatformEnv(st); err == nil {
 		t.Fatal("on the apply path a missing output must still be a loud, named error — the " +
 			"dry-run placeholder must not have relaxed it")
+	}
+}
+
+// enable_eval_runtime must be republished onto cluster-bootstrap after the agent-platform
+// tree lands, or EvalSuite reports are silently discarded.
+//
+// The variable is opt-in upstream because it depends on eks-agent-platform's eval-runtime
+// component having written its SSM parameters (cluster-bootstrap/variables.tf:182). rackctl
+// applies cluster-bootstrap in the gitops phase, one phase BEFORE that tree exists — so the
+// flag cannot be set there, and if it is never set at all, bootstrap.tf never stamps
+// `eks-agent-platform/eval-reports-bucket` on the ArgoCD cluster Secret. The operator then
+// renders an empty bucket and every eval run's reports go nowhere. Nothing errors.
+//
+// This is the same rule tgenv.go states for enable_managed_monitoring, one flag over.
+func TestPlatform_RepublishesClusterBootstrapForEvalRuntime(t *testing.T) {
+	// A fake terragrunt on $PATH that records verb, working dir and whether the flag was
+	// exported. exec.Runner echoes argv but never env, so a dry-run transcript cannot tell
+	// the flag apart from the note that mentions it — asserting on the transcript is how a
+	// test like this passes while the behaviour is gone.
+	dir := t.TempDir()
+	logf := filepath.Join(dir, "invocations")
+	script := fmt.Sprintf(`#!/bin/sh
+for a in "$@"; do
+  case "$a" in apply|destroy|init) verb="$a";; esac
+  case "$a" in */cluster-bootstrap) comp="cluster-bootstrap";; esac
+done
+[ -n "$comp" ] && echo "$verb $comp eval_runtime=${TF_VAR_enable_eval_runtime:-UNSET}" >> %q
+exit 0
+`, logf)
+	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// The live roots the phase asserts before applying anything.
+	for _, c := range agentPlatformComponents() {
+		root := filepath.Join(dir, "terraform/live/development-platform", c)
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "terragrunt.hcl"), []byte("# fixture\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "live/aws/workload-development/us-west-2/development/cluster-bootstrap"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	st, _ := apState(t)
+	st.Runner = exec.New(io.Discard) // NOT dry-run — the point is to exec
+	st.Repos = engine.Repos{Workdir: dir, LandingZone: dir, AgentPlatform: dir}
+
+	if err := (platform{}).Run(context.Background(), st); err != nil {
+		t.Fatalf("platform run: %v", err)
+	}
+
+	b, err := os.ReadFile(logf)
+	if err != nil {
+		t.Fatalf("cluster-bootstrap was never re-applied. eval-runtime's SSM parameters exist only "+
+			"after the agent-platform tree lands, so this republish is the ONLY point at which "+
+			"eks-agent-platform/eval-reports-bucket can be stamped on the ArgoCD cluster Secret. "+
+			"Without it the operator renders an empty bucket and every EvalSuite report is "+
+			"discarded silently: %v", err)
+	}
+	got := string(b)
+	if !strings.Contains(got, "apply cluster-bootstrap eval_runtime=true") {
+		t.Fatalf("the republish must carry TF_VAR_enable_eval_runtime=true to the terragrunt "+
+			"process:\n%s", got)
+	}
+	// The flag must not leak: cluster-bootstrap is the only component that declares it.
+	if len(st.Runner.Env) != 0 {
+		t.Fatalf("Runner.Env must be restored after the republish, got %v", st.Runner.Env)
 	}
 }

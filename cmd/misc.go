@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -192,6 +193,12 @@ when non-empty unless force_destroy has been applied into state first. Pass
 components with TF_VAR_force_destroy_buckets=true, then destroy. Development
 always allows teardown without the flag.
 
+Note: druid is NOT covered outside development (ledger O8). Its Aurora carries
+deletion_protection = true, pinned in the staging and production leaves and
+unreachable from a TF_VAR, so the permitting apply cannot clear it. rackctl
+refuses rather than emptying the deepstorage segments and then wedging on
+DeleteDBCluster — clear deletion_protection out of band first.
+
 Note: eks-agent-platform's bedrock and cost-pipeline buckets (ledger O5) do not
 yet accept force_destroy_buckets — a destroy after the platform has run may still
 wedge there until that lands upstream.`,
@@ -247,6 +254,39 @@ wedge there until that lands upstream.`,
 					"belonging to another cluster can be touched. But a Platform or PVC left behind "+
 					"here may stop that teardown on a DeleteConflict or an in-use security group; "+
 					"if so, fix the kubeconfig and re-run.", cfg.ClusterName(), err)))
+		}
+
+		// REFUSE before anything destructive if this hub has vended spoke clusters.
+		//
+		// An eks-fleet Cluster CR is not a Kubernetes object with a Kubernetes-shaped blast
+		// radius: the composition hands it to provider-opentofu, which applies a whole
+		// landing-zone module — a real EKS control plane, its VPC, its NAT gateways — and
+		// the ClusterProviderConfig vends CROSS-ACCOUNT by design. This hub is the only
+		// thing that knows those clusters exist, so destroying it orphans every one of
+		// them: the control plane that could delete them is gone, their terraform state is
+		// in a bucket rackctl never touches, and no rackctl command will enumerate them
+		// again. They bill forever, in accounts this config does not even name.
+		//
+		// rackctl will not delete them either — tearing down someone else's cluster as a
+		// side effect of tearing down this one is not a decision an installer gets to make.
+		// So it stops and says what is there.
+		if reaping {
+			if spokes := reap.FleetSpokes(ctx, run); len(spokes) > 0 {
+				return fmt.Errorf(
+					"this cluster is an eks-fleet hub with %d spoke cluster(s) still vended:\n\n"+
+						"    %s\n\n"+
+						"Each one is a real EKS cluster — its own control plane, VPC and NAT gateways, "+
+						"provisioned by provider-opentofu and often in another AWS account. This hub is "+
+						"the only place they are tracked. Destroying it would strand them: Crossplane "+
+						"goes with the cluster, their terraform state stays in the eks-fleet state "+
+						"bucket, and nothing rackctl runs would ever find them again.\n\n"+
+						"Delete the spokes first and let Crossplane tear them down:\n"+
+						"    kubectl delete clusters.fleet.nanohype.dev --all -A --wait\n\n"+
+						"Watch them go (a spoke takes as long as any EKS teardown), then re-run this "+
+						"destroy. rackctl does not delete them for you — that is a different cluster's "+
+						"lifecycle, and often a different account's bill",
+					len(spokes), strings.Join(spokes, "\n    "))
+			}
 		}
 
 		// Let the operator delete the AWS resources it — not Terraform — created,
@@ -315,8 +355,9 @@ wedge there until that lands upstream.`,
 		}
 
 		// Act 1 of the two-act teardown. force_destroy has no effect until an apply lands
-		// it in state, so this must run BEFORE any destroy — and while cluster + secrets
-		// state is still live (agent-iam and cluster-addons depend on both).
+		// it in state, so this must run BEFORE any destroy — and while every dependency each
+		// leaf declares is still live (agent-iam needs cluster+secrets, cluster-addons needs
+		// cluster, druid needs network+cluster, model-import needs nothing).
 		if destroyForceBuckets {
 			fmt.Println(ui.Step("force-buckets: permit teardown (apply force_destroy_buckets=true)"))
 			if err := phases.PermitBucketTeardown(ctx, st); err != nil {
@@ -410,6 +451,6 @@ func init() {
 	destroyCmd.Flags().StringVarP(&destroyConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	destroyCmd.Flags().BoolVar(&destroyApply, "apply", false, "actually destroy (default is a dry-run plan)")
 	destroyCmd.Flags().BoolVar(&destroyForceBuckets, "force-buckets", false,
-		"before destroying, apply force_destroy_buckets=true on bucket-owning components so non-empty buckets can be emptied (two-act; required outside development for a reliable teardown)")
+		"before destroying, apply force_destroy_buckets=true on bucket-owning components so non-empty buckets can be emptied (two-act; required outside development for a reliable teardown, and does not cover druid there — see ledger O8)")
 	upgradeCmd.Flags().StringVarP(&upgradeConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 }

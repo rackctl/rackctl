@@ -20,7 +20,7 @@ cluster:
   endpointPublicAccess: true     # prod MUST be false (needs bastion/VPN). landing-zone is private-by-default; rackctl supplies this posture at apply time
   endpointAllowlist: []          # CIDRs allowed to reach the public API endpoint. Empty + public => rackctl auto-detects this host's egress IP as <ip>/32 (never 0.0.0.0/0). Explicit entries win, e.g. [203.0.113.4/32]
   systemNodes:
-    instanceTypes: [m7g.xlarge]
+    instanceTypes: [m7g.xlarge, m6g.xlarge]  # matches landing-zone; a value equal to this default is never injected, so the shown list is what you get
     minSize: 2
     maxSize: 6
     desiredSize: 2               # injected as system_node_* ONLY when any field differs from these defaults, so staging/production leaf pins stand
@@ -100,8 +100,15 @@ observability:
 addons:
   druid: false                    # per-tenant analytics substrate (Aurora Serverless, optionally MSK). Real money;
                                   # its live leaf carries its own tenant sizing map. Applied when true; lives under
-                                  # every workload environment. Teardown outside development needs the two-act
-                                  # force_destroy_buckets path (target 11) — development always allows it.
+                                  # every workload environment.
+                                  #
+                                  # TEARDOWN: development tears down cleanly. Outside development it does NOT, and
+                                  # `--force-buckets` does not fix it: landing-zone pins the tenant Aurora's
+                                  # deletion_protection = true in the staging and production leaves, inside a
+                                  # map(object) no TF_VAR can reach without replacing the leaf's sizing too. rackctl
+                                  # refuses that teardown rather than deleting the deepstorage segments (no
+                                  # versioning, no expiry, only copy) and then wedging on DeleteDBCluster with the
+                                  # cluster and VPC still billing. Clear deletion_protection out of band first.
   accelerators: false             # label the cluster so the accelerators ApplicationSet (gpu-operator,
                                   # nvidia-dra-driver) targets it. Rides TF_VAR_enable_accelerators. Leave false
                                   # without GPU nodes — the driver cannot pull its image without an NGC key and has
@@ -150,7 +157,17 @@ agentPlatform:
     hipaa: false
 
 controlPlane:
-  eksFleet: false                 # opt-in: Crossplane cluster control plane
+  eksFleet: false                 # opt-in: Crossplane cluster control plane. Requires org.gitops.clustersRepo
+                                  # and fleetHubRoleArn below.
+  # fleetHubRoleArn: arn:aws:iam::111111111111:role/eks-fleet-crossplane
+                                  # the IAM role provider-opentofu assumes to vend spokes. REQUIRED with
+                                  # eksFleet: eks-fleet ships config/bootstrap/providers.yaml with a literal
+                                  # <FLEET_ACCOUNT_ID> placeholder and its stand-up doc substitutes the real
+                                  # ARN at apply time, so applying it unrendered installs a provider that
+                                  # never receives credentials — while still reporting Healthy.
+                                  # Get it from landing-zone's fleet-hub component, which rackctl does NOT
+                                  # apply (it lives under live/aws/fleet/…, a different account):
+                                  #   terragrunt output -raw hub_role_arn
   portal: false                   # opt-in: day-2 operator UI
 
 firstTenant:                      # optional smoke test (phase 9). Vends this tenant from
