@@ -22,10 +22,20 @@ checksum:
   name_template: "checksums.txt"
 
 brews:
+  # A formula, not a cask, on purpose. goreleaser nudges toward homebrew_casks,
+  # but casks are macOS-only and this binary ships for Linux too — docs/install
+  # advertises `brew install rackctl/tap/rackctl` on both. Revisit only when
+  # goreleaser actually removes `brews` (it still works as of v2.17.1: `check`
+  # exits 2 on the deprecation, `release` succeeds), and treat dropping
+  # Linuxbrew as the cost of that move.
   - repository:
       owner: rackctl
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+      # rackctl/homebrew-tap protects main with a no-bypass ruleset, so the bot
+      # cannot push the formula bump directly — it opens a PR instead.
+      pull_request:
+        enabled: true
     homepage: "https://rackctl.com"
     description: "The day-0 installer for a nanohype platform"
     license: "Apache-2.0"
