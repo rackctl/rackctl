@@ -127,8 +127,10 @@ func TestCoreComponents_DNSOnlyWithHostedZone(t *testing.T) {
 }
 
 func TestCoreComponents_ModelImportIsOptIn(t *testing.T) {
-	// It provisions account+region-scoped substrate an org may never want, and it is the
-	// one component rackctl applies but never destroys. It must never appear unasked.
+	// It provisions account+region-scoped substrate an org may never want — an S3 staging
+	// bucket, an import service role and SSM discovery parameters — and Custom Model Import
+	// only runs in four regions, so applying it unasked is dead weight at best and a
+	// validation failure at worst. It must never appear unasked.
 	if comps := CoreComponents(baseCfg()); indexOf(comps, "model-import") >= 0 {
 		t.Fatalf("model-import must be opt-in; got %v", comps)
 	}

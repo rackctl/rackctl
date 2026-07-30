@@ -207,9 +207,8 @@ wedge there until that lands upstream.`,
 		if err != nil {
 			return err
 		}
-		if destroyForceBuckets && !destroyApply {
-			// Dry-run is fine — PermitBucketTeardown prints both acts. No hard reject.
-		}
+		// --force-buckets needs no dry-run guard: PermitBucketTeardown prints both acts
+		// and refuses where it must, so a dry-run is informative rather than dangerous.
 		ctx := context.Background()
 		run := exec.New(os.Stdout)
 		run.DryRun = !destroyApply
