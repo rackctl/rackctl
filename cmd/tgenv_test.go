@@ -91,8 +91,8 @@ func TestTGEnv_TierDrivesTheComponentAndBothFlags(t *testing.T) {
 		// label disagrees with its substrate is the SecretSyncedError case above; a cluster
 		// with a blank label matches no generator at all and gets the node agent only.
 		if want := "TF_VAR_observability_tier=" + string(tc.tier); !slices.Contains(env, want) {
-			t.Errorf("tier=%s: %q not injected — eight eks-gitops ApplicationSet generators "+
-				"select on this label; got %v", tc.tier, want, env)
+			t.Errorf("tier=%s: %q not injected — the tier-aware eks-gitops ApplicationSets select "+
+				"on this label, and several derive Helm parameters from it; got %v", tc.tier, want, env)
 		}
 	}
 }

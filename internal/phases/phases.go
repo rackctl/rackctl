@@ -86,6 +86,19 @@ func CoreComponents(cfg *config.Config) []string {
 	// because it is real money and most platforms never need it. Its live leaf is
 	// self-sufficient — it carries its own `tenants` sizing map — and it depends on network and
 	// cluster, both of which the cluster phase applied before this one.
+	//
+	// It is also, today, the one component here that CANNOT be destroyed — in any environment,
+	// including development. modules/tenant/aurora.tf sets neither skip_final_snapshot nor
+	// final_snapshot_identifier, so the aws_rds_cluster delete errors demanding a snapshot
+	// identifier, and neither field exists on the `tenants` object type — so no TF_VAR shape
+	// reaches them, not even one reproducing the whole sizing map. Its three per-tenant buckets
+	// also have no force_destroy_buckets input and no development carve-out, and `deepstorage`
+	// has neither versioning nor expiry, so on a working cluster it is never empty.
+	//
+	// That breaks the rule the rest of this list keeps — rackctl destroys everything it brings
+	// in — so applying it is disclosed at the point of use rather than left to be discovered at
+	// teardown. The fix is a landing-zone change (shared ledger, item O1); when it lands, the
+	// disclosure in substrate.Run comes out.
 	if cfg.Addons.Druid {
 		comps = append(comps, "druid")
 	}
@@ -171,7 +184,7 @@ func componentDir(st *engine.State, component string) string {
 // A variable is scoped to the invocation that needs it, or it is a global — there is no
 // third thing, and `cmd/tgenv.go` is where the genuine globals live.
 func apply(ctx context.Context, st *engine.State, component string) error {
-	env, err := componentEnv(ctx, st, component)
+	env, err := componentEnv(ctx, st, component, "apply")
 	if err != nil {
 		return err
 	}
@@ -179,7 +192,7 @@ func apply(ctx context.Context, st *engine.State, component string) error {
 }
 
 func destroy(ctx context.Context, st *engine.State, component string) error {
-	env, err := componentEnv(ctx, st, component)
+	env, err := componentEnv(ctx, st, component, "destroy")
 	if err != nil {
 		return err
 	}
@@ -208,12 +221,18 @@ func Destroy(ctx context.Context, st *engine.State, component string) error {
 // Karpenter-discovery tags are per-cluster and applied by the CLUSTER component via
 // aws_ec2_tag, precisely because the VPC is shared per environment and cluster-agnostic.
 // The injection was inert and the reasoning was backwards.
-func componentEnv(ctx context.Context, st *engine.State, component string) ([]string, error) {
+// The verb matters only for what gets PRINTED. Every variable below is injected on both
+// paths — a destroy plan needs the same inputs the apply used — but a builder that prints
+// "do this next" is describing an apply, and printing that under `destroy dns` told the
+// operator to point a domain's NS records at name servers the same run was deleting. Notes
+// that merely state which value is being sent stay on both paths, because they are true on
+// both.
+func componentEnv(ctx context.Context, st *engine.State, component, verb string) ([]string, error) {
 	switch component {
 	case "network":
 		// The create-mode levers are network variables: ipam_pool_id, ipam_netmask_length,
 		// transit_gateway_id, centralized_egress.
-		return clusterNetworkEnv(st), nil
+		return clusterNetworkEnv(st, verb), nil
 	case "cluster":
 		// cluster_name plus the endpoint posture, all three cluster variables. The endpoint
 		// builder may detect this host's egress IP, so it can fail and must be able to say so.
@@ -223,6 +242,11 @@ func componentEnv(ctx context.Context, st *engine.State, component string) ([]st
 			return nil, err
 		}
 		return append(env, endpointEnv...), nil
+	case "dns":
+		// domain_name + acm_certificates + enable_dnssec. All three leaf-pinned to values that
+		// fail or mislead, and two of them are what make a dns-enabled install fail after
+		// building a cluster. See dns.go.
+		return dnsEnv(st, verb)
 	default:
 		return nil, nil
 	}
@@ -502,7 +526,16 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 		}
 	}
 	captureOutputs(ctx, st, "cluster")
-	return st.Runner.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", st.Config.ClusterName())
+	if err := st.Runner.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", st.Config.ClusterName()); err != nil {
+		return err
+	}
+	// The kubeconfig now points at the cluster this run built. Recording that is what
+	// permits the rollback's reap sweep to run at all — see engine.State.KubeconfigCluster.
+	// It is set after the command rather than before it so a failed repoint leaves the
+	// sweep disabled, which is the correct posture: kubectl still resolves the operator's
+	// previous context, and the sweep deletes everything it can see there.
+	st.KubeconfigCluster = st.Config.ClusterName()
+	return nil
 }
 
 func (cluster) Teardown(ctx context.Context, st *engine.State) error {
@@ -585,6 +618,26 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 			"logs to CloudWatch Logs, traces to X-Ray. On a cluster that previously ran full this PRUNES Loki, "+
 			"Tempo, grafana-operator and the dashboards, with a telemetry gap while it converges — see "+
 			"eks-gitops/docs/runbooks/observability-tier.md")
+	}
+
+	// druid is a one-way door today, and that is the opposite of every other component here,
+	// so it is said out loud at the point of use. See CoreComponents for the mechanism: the
+	// Aurora delete demands a final-snapshot identifier the `tenants` object type cannot
+	// express, so no TF_VAR reaches it, and the three per-tenant buckets have no
+	// force_destroy escape and no development carve-out.
+	//
+	// Printed rather than refused: an operator who genuinely wants druid can still have it,
+	// and can clear Aurora by hand at teardown. Refusing would be rackctl deciding a
+	// landing-zone limitation is a policy. But it must not be a surprise discovered halfway
+	// through a destroy, with the cluster already half gone.
+	if st.Config.Addons.Druid {
+		note(st, "addons.druid: true — WARNING, this cluster will not tear down cleanly. druid's Aurora "+
+			"cluster cannot be destroyed by terraform in ANY environment (its module sets no "+
+			"final-snapshot identifier and the tenants input cannot supply one), and its three "+
+			"per-tenant buckets have no force-destroy escape, with deepstorage never empty on a "+
+			"working cluster. `rackctl destroy` will halt there and the VPC, NAT gateways and "+
+			"control plane keep billing until Aurora is cleared by hand. Every other component "+
+			"rackctl applies, it also destroys")
 	}
 
 	// Say exactly what model-import provisions, and — more importantly — what it does

@@ -161,21 +161,84 @@ type NodeGroup struct {
 	DesiredSize   int      `json:"desiredSize"`
 }
 
+// NetworkMode selects whether this platform owns its VPC or participates in one it does not.
+type NetworkMode string
+
+const (
+	// ModeCreate builds the VPC, subnets, endpoints and egress. The default, and what a
+	// day-0 hub normally wants.
+	ModeCreate NetworkMode = "create"
+	// ModeAdopt participates in a VPC someone else owns — a shared VPC in this account, or
+	// one shared in over AWS RAM. landing-zone's network component builds nothing in this
+	// mode: it resolves the VPC, subnets, CIDR and AZs from the adopt inputs and re-exports
+	// them through the same outputs, so a consuming cluster wires identically either way.
+	ModeAdopt NetworkMode = "adopt"
+)
+
+// adoptMinPrivateSubnets is landing-zone's `max_azs` default (3), which its adopt preflight
+// asserts the adopted private subnets span. rackctl cannot know a subnet's AZ without an AWS
+// call, but N subnets can never cover more than N zones — so requiring at least this many
+// distinct private subnet IDs is a sound necessary condition, checkable from the config alone.
+const adoptMinPrivateSubnets = 3
+
 type ClusterNet struct {
 	VPCCIDR     string `json:"vpcCidr"`
 	NATGateways int    `json:"natGateways"`
+
+	// Mode selects create (default) or adopt. See NetworkMode.
+	//
+	// The committed workload leaves are all create-by-omission, and landing-zone's only
+	// adopt example lives outside every workload account (live/aws/reference-adopt/) because
+	// it wires the adopt inputs from a `dependency` on another account's state — and an
+	// environment that depends on another account's state cannot be brought up on its own.
+	//
+	// rackctl has no such problem: it has an operator, who knows their VPC id. It injects
+	// network_mode and the adopt inputs as TF_VAR_*, which beat a leaf's `inputs`, so there
+	// is no dependency block, no cross-account state read, and no need for that tree. Which
+	// means rackctl can offer adopt in a workload environment precisely where the committed
+	// tree cannot.
+	//
+	// This was already reachable before it was a field, and that is why it is one:
+	// internal/exec passes os.Environ() into every terragrunt invocation, so an operator
+	// could always export TF_VAR_network_mode=adopt and have it take effect — unvalidated,
+	// undocumented, and with none of the guards below. On staging and production it would
+	// also have failed, because those leaves pin create-mode values that adopt rejects.
+	Mode NetworkMode `json:"mode,omitempty"`
+	// AdoptVPCID is the VPC to participate in. Required under adopt, rejected under create.
+	AdoptVPCID string `json:"adoptVpcId,omitempty"`
+	// AdoptPrivateSubnetIDs are the private subnets in the adopted VPC — where nodes run.
+	// Required and non-empty under adopt, rejected under create. Must span at least
+	// adoptMinPrivateSubnets distinct zones, which landing-zone asserts at plan time.
+	AdoptPrivateSubnetIDs []string `json:"adoptPrivateSubnetIds,omitempty"`
+	// AdoptPublicSubnetIDs are the public subnets, and empty is VALID — a private-only
+	// cluster is a supported adopt shape. Rejected under create.
+	//
+	// Leaving it empty has a consequence worth knowing: cluster-bootstrap publishes the
+	// public subnet list into the kube-system/network-config ConfigMap, and the Kyverno rule
+	// that injects load-balancer subnets guards on that entry being non-empty. So an
+	// internet-facing Service or Ingress on a private-only adopt cluster gets no subnet
+	// annotation and does not provision. Internal load balancers are unaffected.
+	//
+	// The ConfigMap is the artifact to check — `kubectl -n kube-system get cm network-config
+	// -o jsonpath='{.data.public_subnet_ids}'`. cluster-bootstrap ALSO stamps a
+	// network/public-subnet-ids annotation on the ArgoCD cluster Secret, for ApplicationSet
+	// generators that cannot see in-cluster resources, and under adopt that annotation is
+	// present-but-empty. Nothing reads it. Someone debugging a load balancer finds a key that
+	// looks like the right lever and is empty, which reads as confirmation rather than as a
+	// wrong turn.
+	AdoptPublicSubnetIDs []string `json:"adoptPublicSubnetIds,omitempty"`
 
 	// The four fields below are the create-mode network levers. They opt a day-0 hub out
 	// of the committed live tree's plain literal-CIDR VPC with local NAT and into the
 	// org's IPAM / transit-gateway topology. Each rides a TF_VAR_* onto landing-zone's
 	// network component at apply time (see internal/phases/network.go), same idiom as
 	// TF_VAR_cluster_name — the committed tree stays generic, rackctl layers the per-run
-	// choice over it. All default off (empty / 0 / false); day-0 bootstrap is create mode
-	// by definition (the hub mints its own VPC), so these are the only network levers, and
-	// the adopt path is an eks-fleet/spoke concern, out of rackctl's scope.
+	// choice over it. All default off (empty / 0 / false), and all four are rejected under
+	// adopt: a VPC this platform does not own has its CIDR, its egress and its
+	// transit-gateway attachment decided by the owner.
 	//
-	// Validate mirrors landing-zone's own create-mode preconditions so a contradictory
-	// combination fails here, in a second, instead of ~20 minutes into a tofu apply.
+	// Validate mirrors landing-zone's own preconditions so a contradictory combination
+	// fails here, in a second, instead of seconds-to-minutes into a tofu run.
 
 	// IPAMPoolID draws the VPC CIDR from an IPAM pool instead of the literal VPCCIDR
 	// (cross-account, the org IPAM env sub-pool shared in over RAM). Empty = literal
@@ -210,8 +273,9 @@ type Addons struct {
 
 // ObservabilityTier selects which observability substrate a cluster runs. It mirrors
 // landing-zone's cluster-bootstrap var.observability_tier, which publishes it as the
-// `observability/tier` label on the ArgoCD cluster Secret — and eight eks-gitops
-// ApplicationSet generators select on that label.
+// `observability/tier` label on the ArgoCD cluster Secret, which the tier-aware eks-gitops
+// ApplicationSets select on — and which several of them also derive Helm parameters from,
+// so the label decides more than which Applications exist.
 type ObservabilityTier string
 
 const (
@@ -438,13 +502,30 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Sprintf("cluster.endpointAllowlist[%d] %q must be a CIDR block, e.g. 203.0.113.4/32", i, cidr))
 		}
 	}
-	// create-mode network levers. rackctl day-0 bootstrap is always create mode (the hub
-	// mints its own VPC), so only landing-zone's create-mode preconditions apply — mirror
-	// them here so a contradictory combination fails in a second rather than ~20 minutes
-	// into a tofu apply, where the same conditions live as variable preconditions on
-	// landing-zone's network component.
+	// Network mode, then the levers. Mirrors landing-zone's own variable validations so a
+	// contradictory combination fails in a second rather than seconds-to-minutes into a tofu
+	// run, and adds the checks landing-zone cannot make from a variable block.
 	n := c.Cluster.Network
+	errs = append(errs, validateNetworkMode(n)...)
 	switch {
+	case n.Adopt() && n.IPAMPoolID != "":
+		// A pool under adopt has already been rejected outright, so the relationship checks
+		// below would add a second, misleading error — "ipamNetmaskLength must be between 16
+		// and 20" alongside "ipamPoolId does not apply under adopt" reads as though setting a
+		// netmask would help. landing-zone emits one error here for the same reason: its
+		// ipam_netmask_length validation references only ipam_pool_id, never network_mode, so
+		// a pool set under adopt fails on ipam_pool_id alone.
+		//
+		// The condition is `adopt AND a pool`, not `adopt`, and the difference is a real hole
+		// rather than a refinement. Skipping the whole switch under adopt made adopt strictly
+		// MORE permissive than create for one field: `mode: adopt` with `ipamNetmaskLength: 18`
+		// and no pool validated clean, while the identical create config was rejected — and
+		// adoptEnv never injects that variable, so the value was dropped invisibly, absent even
+		// from a dry-run. An operator converting a create config to adopt comments out
+		// ipamPoolId, forgets the netmask beside it, and keeps a line in their committed
+		// rackctl.yaml that looks load-bearing and is not. With a pool required to take this
+		// arm, that config falls through to the `IPAMPoolID == ""` case and is rejected in both
+		// modes, with one error either way.
 	case n.IPAMPoolID == "":
 		// No IPAM pool ⇒ literal allocation, which must not carry a netmask.
 		if n.IPAMNetmaskLength != 0 {
@@ -463,14 +544,16 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Sprintf("cluster.network.ipamNetmaskLength must be between 16 and 20 when cluster.network.ipamPoolId is set, got %d — subnets are carved 8 bits smaller than the VPC block, so a base longer than /20 falls below AWS's /28 minimum", n.IPAMNetmaskLength))
 		}
 	}
-	// A transit-gateway attachment requires an IPAM-allocated CIDR — a raw literal vpcCidr
-	// can overlap another attached VPC and break TGW routing.
-	if n.TransitGatewayID != "" && n.IPAMPoolID == "" {
-		errs = append(errs, "cluster.network.transitGatewayId requires an IPAM-allocated CIDR (set cluster.network.ipamPoolId) — a literal vpcCidr can overlap another attached VPC and break transit-gateway routing")
-	}
-	// Centralized egress has nothing to route the default egress to without a TGW.
-	if n.CentralizedEgress && n.TransitGatewayID == "" {
-		errs = append(errs, "cluster.network.centralizedEgress requires cluster.network.transitGatewayId — there is nothing to route the private default egress to without a transit gateway")
+	if !n.Adopt() {
+		// A transit-gateway attachment requires an IPAM-allocated CIDR — a raw literal vpcCidr
+		// can overlap another attached VPC and break TGW routing.
+		if n.TransitGatewayID != "" && n.IPAMPoolID == "" {
+			errs = append(errs, "cluster.network.transitGatewayId requires an IPAM-allocated CIDR (set cluster.network.ipamPoolId) — a literal vpcCidr can overlap another attached VPC and break transit-gateway routing")
+		}
+		// Centralized egress has nothing to route the default egress to without a TGW.
+		if n.CentralizedEgress && n.TransitGatewayID == "" {
+			errs = append(errs, "cluster.network.centralizedEgress requires cluster.network.transitGatewayId — there is nothing to route the private default egress to without a transit gateway")
+		}
 	}
 	switch c.Observability.Tier {
 	case TierFloor, TierFull:

@@ -196,23 +196,73 @@ var destroyCmd = &cobra.Command{
 			fmt.Println(ui.Warn("dry-run — no cloud changes (pass --apply to destroy)"))
 		}
 
+		// Point kubectl at the cluster being destroyed, FIRST, and treat a failure as
+		// disqualifying for the two sweeps that act on ambient Kubernetes state.
+		//
+		// reap.All and reap.UnstickTerminating run `kubectl delete
+		// platforms|tenants|nodeclaims|pvc --all -A` and patch finalizers off CRs against
+		// whatever context kubectl currently resolves. Their only guard is a `/readyz`
+		// probe, which tests liveness, never identity. Nothing else in this command
+		// touches the kubeconfig, and the environment passes through, so
+		// `rackctl destroy --apply -c staging.yaml` from a shell pointed at a healthy
+		// development cluster deleted every Platform, Tenant, NodeClaim and PVC in
+		// DEVELOPMENT — and then stripped their finalizers.
+		//
+		// The engine's rollback path holds this invariant with State.KubeconfigCluster;
+		// this command does not use the engine, so it has to establish the same fact
+		// itself. Same posture as the cluster phase: repoint, and only claim the fact if
+		// the repoint succeeded.
+		//
+		// It is not merely a guard — it is also a fix for the aimed-at-nothing case. An
+		// operator whose context is stale would previously have had the sweeps silently
+		// skip a cluster that WAS reachable under its own name, leaving the controller-owned
+		// resources for the component teardown to trip over.
+		reaping := true
+		if err := reap.PointAt(ctx, run, cfg.ClusterName()); err != nil {
+			reaping = false
+			fmt.Println(ui.Warn(fmt.Sprintf(
+				"could not point kubectl at %s (%v) — skipping the in-cluster reap. The component "+
+					"teardown still runs, and terraform state is scoped by state key, so nothing "+
+					"belonging to another cluster can be touched. But a Platform or PVC left behind "+
+					"here may stop that teardown on a DeleteConflict or an in-use security group; "+
+					"if so, fix the kubeconfig and re-run.", cfg.ClusterName(), err)))
+		}
+
 		// Let the operator delete the AWS resources it — not Terraform — created,
 		// while it is still running to do so. Destroying the cluster first orphans
 		// them and makes agent-iam fail on DeleteConflict, halting the teardown with
 		// the cluster already gone. See reap.go.
-		reap.All(ctx, run, os.Stdout)
+		if reaping {
+			reap.All(ctx, run, os.Stdout)
+		}
 
 		// Force-delete the IAM roles the operator mints per Platform, in case its
 		// finalizer did not (a crashlooping or already-pruned operator, or one stuck on
 		// the node role). agent-iam destroys the tenant baseline policy those roles
 		// attach; a survivor stops the whole teardown on DeleteConflict. This runs before
 		// the component loop reaches agent-iam, and needs no cluster. See reap.go.
-		reap.OperatorRoles(ctx, run, os.Stdout)
+		//
+		// Scoped to this cluster's roles by name. IAM is global and the operator's tenant
+		// path carries no cluster segment, so an account running more than one cluster has
+		// them all under one prefix — an unscoped sweep tears down a sibling cluster's live
+		// tenant roles as a side effect of destroying this one.
+		reap.OperatorRoles(ctx, run, os.Stdout, cfg.ClusterName())
 
 		// With the roles gone, any Platform/Tenant still pinned in Terminating is
 		// guarding nothing — free it, so an interrupted teardown does not wedge. Must
 		// follow OperatorRoles (never orphan AWS state), and runs while the API is up.
-		reap.UnstickTerminating(ctx, run, os.Stdout)
+		//
+		// Gated on the same repoint, and here the gate is load-bearing in a way it was not
+		// before OperatorRoles became cluster-scoped. Stripping a finalizer is only safe
+		// because the roles it guards have already been force-deleted — that is the whole
+		// argument in reap.go. Against the WRONG cluster, OperatorRoles now correctly
+		// declines to touch that cluster's roles, so an ungated UnstickTerminating would
+		// remove finalizers from CRs whose AWS state is deliberately still alive, orphaning
+		// exactly what this package exists never to orphan. Narrowing the IAM sweep without
+		// gating this one would have made the wrong-cluster case worse than it was.
+		if reaping {
+			reap.UnstickTerminating(ctx, run, os.Stdout)
+		}
 
 		// Backstop the NodeClaim reap above. It needs a reachable cluster and a live
 		// Karpenter; a teardown is often run against neither. Any instance Karpenter

@@ -1,10 +1,15 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
+
+	"github.com/rackctl/rackctl/internal/config"
+	"github.com/rackctl/rackctl/internal/exec"
 )
 
 // recPhase records run/teardown calls into a shared log, so a test can assert
@@ -249,5 +254,105 @@ func TestEngineStillRollsBackWhatItBuilt(t *testing.T) {
 		if log[i] != want[i] {
 			t.Fatalf("want %v, got %v", want, log)
 		}
+	}
+}
+
+// The rollback's reap sweep acts on AMBIENT state — `kubectl delete platforms|tenants|
+// nodeclaims|pvc --all -A` against whatever context the kubeconfig currently resolves —
+// and rackctl repoints the kubeconfig in exactly one place, the cluster phase.
+//
+// So a failure BEFORE that point used to reach the sweep with the kubeconfig still aimed
+// at whatever the operator was doing beforehand. Bootstrapping staging from a laptop
+// pointed at a healthy development cluster, a failed `scripts/init-backend-aws.sh` in the
+// identity phase deleted every Platform and PVC in development — and identity, unlike
+// assertComponentRoots, is not wrapped in NoRollbackError, so nothing stopped it.
+//
+// This is the same class as TestEngineNeverRollsBackAPlatformItDidNotBuild, one layer down:
+// there the engine demolished a platform this run did not create, here it demolishes a
+// cluster this run never even pointed at.
+func TestEngineDoesNotReapBeforeItHasACluster(t *testing.T) {
+	var out bytes.Buffer
+	run := exec.New(&out)
+	run.DryRun = true // the reap helpers print their intent and mutate nothing
+
+	eng := &Engine{
+		Phases: []Phase{
+			recPhase{id: "identity", enabled: true, fail: true, log: new([]string)},
+		},
+		Out:         &out,
+		CleanOnFail: true,
+	}
+	// KubeconfigCluster is zero: the cluster phase never ran, so nothing repointed kubectl.
+	_ = eng.Run(context.Background(), &State{Runner: run, Config: &config.Config{}})
+
+	// Inverted on purpose: assert that NOTHING reap-like ran, rather than listing the strings
+	// today's four calls happen to print.
+	//
+	// A whitelist of forbidden substrings only covers the calls that exist when it is written.
+	// reap.UnstickTerminating and reap.OrphanedNodes print neither "reap controller-owned
+	// resources" nor "force-delete operator-minted", so a version of this test that listed
+	// those two strings stayed green when UnstickTerminating was moved OUT of the gate —
+	// including the finalizer strip, which is the call that orphans live AWS state. And
+	// reap.OrphanedVolumes, already called from two other places, would match nothing at all.
+	//
+	// The gate's comment claims it holds "for every phase before the cluster exists, including
+	// ones nobody has written yet". This assertion has to be the same shape as that claim, or
+	// it only pins the calls someone remembered.
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.Contains(line, "(dry-run)") || strings.Contains(line, "reap") {
+			t.Fatalf("the identity phase failed before any cluster existed, and the rollback still "+
+				"reached the ambient-context sweep: %q\n\nEvery resource it can see belongs to "+
+				"someone else — the kubeconfig still points wherever the operator left it.\n\n%s",
+				strings.TrimSpace(line), out.String())
+		}
+	}
+}
+
+// The converse: once the cluster phase has repointed the kubeconfig, the sweep MUST run.
+// It is what stops a rollback tearing the cluster down on top of live PVCs and Platform CRs,
+// orphaning EBS volumes and IAM roles nothing will ever collect.
+func TestEngineDoesReapOnceTheKubeconfigIsOurs(t *testing.T) {
+	var out bytes.Buffer
+	run := exec.New(&out)
+	run.DryRun = true
+
+	eng := &Engine{
+		Phases: []Phase{
+			recPhase{id: "gitops", enabled: true, fail: true, log: new([]string)},
+		},
+		Out:         &out,
+		CleanOnFail: true,
+	}
+	st := &State{Runner: run, Config: &config.Config{}, KubeconfigCluster: "development-platform"}
+	_ = eng.Run(context.Background(), st)
+
+	if !strings.Contains(out.String(), "reap controller-owned resources") {
+		t.Fatalf("this run built the cluster and the kubeconfig points at it — the rollback must "+
+			"reap what the controllers own before destroying it, or a failed install strands "+
+			"unattached volumes and orphaned IAM roles.\n\n%s", out.String())
+	}
+}
+
+// And the sweep must be told WHICH cluster, because it force-deletes IAM roles by name out
+// of an account-wide, cluster-agnostic path. A blank name there reaps nothing (see
+// reap.reapOperatorRoles), so the wiring — not just the gate — has to be right.
+func TestEngineNamesTheClusterItReaps(t *testing.T) {
+	var out bytes.Buffer
+	run := exec.New(&out)
+	run.DryRun = true
+
+	eng := &Engine{
+		Phases:      []Phase{recPhase{id: "gitops", enabled: true, fail: true, log: new([]string)}},
+		Out:         &out,
+		CleanOnFail: true,
+	}
+	_ = eng.Run(context.Background(), &State{
+		Runner: run, Config: &config.Config{}, KubeconfigCluster: "development-platform",
+	})
+
+	if !strings.Contains(out.String(), "development-platform-*") {
+		t.Fatalf("the IAM sweep must be scoped to this cluster's roles by name — the operator's "+
+			"tenant path carries no cluster segment, so an unscoped sweep reaches every cluster "+
+			"in the account.\n\n%s", out.String())
 	}
 }

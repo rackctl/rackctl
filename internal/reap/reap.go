@@ -99,7 +99,7 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 			"--all", "--all-namespaces", "--wait", "--timeout=5m", "--ignore-not-found"); err != nil {
 			fmt.Fprintln(out, ui.Fail(fmt.Sprintf(
 				"%s did not finalize — the operator could not delete the IAM roles it created. "+
-					"agent-iam will fail on DeleteConflict. Look for <env>-<platform>-{tenant,session} "+
+					"agent-iam will fail on DeleteConflict. Look for <cluster>-<platform>-{tenant,session} "+
 					"roles and anything under: aws iam list-roles --path-prefix /eks-agent-platform/", kind)))
 		}
 	}
@@ -153,17 +153,67 @@ type execer interface {
 // delete inline policies, delete the role — but does not need the operator, or even a
 // reachable cluster, to do it. IAM is global, so no region is needed either.
 //
-// Enumeration is by IAM path: the operator mints every tenant and session role under
-// /eks-agent-platform/ (its default TenantIAMPath, which the catalog does not override).
-// An org that repoints TenantIAMPath elsewhere would have to widen this prefix to match.
-func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer) {
-	reapOperatorRoles(ctx, run, run.DryRun, out)
+// Enumeration is by IAM path AND by cluster name, and BOTH halves are load-bearing.
+//
+// The path is /eks-agent-platform/tenants/, not /eks-agent-platform/. The operator mints
+// every tenant and session role under the deeper path (its TenantIAMPath default, which the
+// catalog does not override — operators/internal/controller/platform_iam.go and
+// platform_session_iam.go). The shallower prefix ALSO matches the one ROLE agent-iam's own
+// terraform owns and is about to destroy in the ordinary way: <cluster>-agent-platform-operator,
+// at path /eks-agent-platform/ (components/aws/agent-iam/main.tf). It is named for the
+// cluster, so the name filter below does not exclude it — only the path does. Sweeping it
+// force-deletes a resource terraform still holds in state, so the subsequent destroy plans a
+// delete for a role that no longer exists. This function exists to make a teardown succeed;
+// deleting terraform's own resources out from under it is the opposite.
+//
+// The tenant permissions boundary and tenant baseline live at that same shallow path but are
+// aws_iam_policy, not roles, so `aws iam list-roles` never returned them at either depth.
+// They are the DeleteConflict victims this whole function protects, not sweep candidates.
+//
+// The cluster-name filter is what keeps the sweep inside the cluster being torn down. IAM is
+// global and the path carries neither an environment nor a cluster segment, so an account
+// hosting development and staging clusters has every cluster's tenant roles under one prefix.
+// Every role under this path is named for its cluster — tenantRoleName and sessionRoleName
+// both compose `clusterName + "-" + platform + suffix`, and their >64-char truncation branch
+// keeps that same `clusterName + "-"` prefix. Without the filter, tearing down staging
+// deletes development's live tenant roles, and the agent pods there start failing AssumeRole
+// with nothing to explain why.
+//
+// It is a PREFIX match, not an identity check, and the difference has one reachable edge: a
+// cluster whose base name extends another's with a hyphen. Tearing down `dev-plat` also
+// matches `dev-plat-gpu`'s roles, because `dev-plat-` prefixes `dev-plat-gpu-web-tenant`. No
+// filter over names alone can fix it — cluster `dev-hub` + platform `gpu-web` and cluster
+// `dev-hub-gpu` + platform `web` compose the identical role name, and the operator's role
+// tags carry PlatformId, Tenant and Environment but no cluster key. Closing it properly means
+// intersecting these candidates with `kubectl get platforms` when the cluster is reachable,
+// which costs this function its deliberate "needs no reachable cluster" property. Until then:
+// do not name two co-located clusters where one base name is a hyphen-prefix of the other.
+// config.Validate cannot catch that — it sees one cluster at a time.
+//
+// One class of operator-minted role is NOT covered, and it is a pre-existing gap this filter
+// does not change: the eventBridgeScheduler capability mints `<environment>-<platform>-scheduler-invoke`
+// at the ROOT path with no Path set, keyed on the environment rather than the cluster
+// (platform_capability_policy.go). The path prefix above excludes it before the name filter is
+// ever reached. It carries the tenant permissions boundary agent-iam destroys, so a Platform
+// declaring that capability whose finalizer did not complete can still wedge a teardown on
+// DeleteConflict — the case this function otherwise removes. Covering it needs a second
+// enumeration scoped by ENVIRONMENT, not by cluster name.
+func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer, cluster string) {
+	reapOperatorRoles(ctx, run, run.DryRun, out, cluster)
 }
 
-func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writer) {
-	const pathPrefix = "/eks-agent-platform/"
+func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster string) {
+	const pathPrefix = "/eks-agent-platform/tenants/"
 	if dryRun {
-		fmt.Fprintln(out, ui.Step("force-delete operator-minted IAM roles under "+pathPrefix+" (agent-iam DeleteConflict backstop)"))
+		fmt.Fprintln(out, ui.Step("force-delete operator-minted IAM roles under "+pathPrefix+
+			" named "+cluster+"-* (agent-iam DeleteConflict backstop)"))
+		return
+	}
+
+	// A blank cluster name would make the prefix filter below match everything, turning the
+	// scoping this function documents into an account-wide sweep. There is no cluster whose
+	// roles could be named for it, so there is nothing to reap.
+	if cluster == "" {
 		return
 	}
 
@@ -175,7 +225,12 @@ func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writ
 	if err != nil {
 		return // no credentials, or IAM unreachable — not a teardown failure
 	}
-	roles := strings.Fields(strings.TrimSpace(names))
+	var roles []string
+	for _, name := range strings.Fields(strings.TrimSpace(names)) {
+		if strings.HasPrefix(name, cluster+"-") {
+			roles = append(roles, name)
+		}
+	}
 	if len(roles) == 0 {
 		return
 	}
@@ -400,4 +455,35 @@ func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, clust
 		}
 		fmt.Fprintln(out, ui.OK("deleted "+v))
 	}
+}
+
+// PointAt aims kubectl at the cluster whose resources are about to be reaped, and reports
+// whether it succeeded. A non-nil error means the ambient sweeps — All and UnstickTerminating —
+// MUST be skipped.
+//
+// Those two run `kubectl delete platforms|tenants|nodeclaims|pvc --all -A` and patch finalizers
+// off CRs against whatever context kubectl currently resolves, and their only guard is a
+// /readyz probe, which tests liveness and never identity. So "which cluster am I pointed at"
+// is not a detail of the sweep, it is the sweep's entire safety argument.
+//
+// `rackctl destroy` had no answer to that question. It never touched the kubeconfig, and the
+// environment passes through, so a teardown of staging launched from a shell pointed at a
+// healthy development cluster deleted every Platform, Tenant, NodeClaim and PVC in
+// DEVELOPMENT and then stripped their finalizers. The engine's rollback path holds the same
+// invariant through State.KubeconfigCluster; that command does not use the engine, so it has
+// to establish the fact itself.
+//
+// Repointing rather than merely comparing is deliberate: it also fixes the aimed-at-nothing
+// case. An operator whose context was stale would otherwise have the sweeps skip a cluster
+// that WAS reachable under its own name, leaving controller-owned resources for the component
+// teardown to trip over on a DeleteConflict or an in-use security group.
+func PointAt(ctx context.Context, run *exec.Runner, cluster string) error {
+	return pointAt(ctx, run, cluster)
+}
+
+func pointAt(ctx context.Context, run execer, cluster string) error {
+	if cluster == "" {
+		return fmt.Errorf("no cluster name to point kubectl at")
+	}
+	return run.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", cluster)
 }

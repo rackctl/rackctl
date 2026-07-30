@@ -33,11 +33,17 @@ var componentGateRemedy = map[string]string{
 // completed phases back down: the operator pays for a cluster, waits for it, and watches
 // it be destroyed over a path that could have been checked in a millisecond.
 //
-// This is not hypothetical, and it is not about an exotic component. landing-zone's live
-// tree is authored per environment, and agent-iam — which CoreComponents appends BY
-// DEFAULT, because AgentPlatform.Enable nil means enabled — has a leaf only under
-// workload-development. Every `rackctl init --apply` with environment: staging or
-// production ends exactly this way today.
+// This was not hypothetical when it was written. landing-zone's live tree is authored per
+// environment, and agent-iam — which CoreComponents appends BY DEFAULT, because
+// AgentPlatform.Enable nil means enabled — had a leaf only under workload-development, so
+// every `rackctl init --apply` with environment: staging or production ended exactly this
+// way.
+//
+// Upstream has since added the missing leaves: all three workload environments now carry
+// every component CoreComponents can emit, and this guard passes on the happy path for all
+// of them. That is what a precondition should look like once the thing it guards is
+// correct, and it is the reason to keep it rather than to delete it — one os.Stat per
+// component, holding a property nothing else holds, ready for the next divergence.
 //
 // The check is generic rather than a per-component environment allow-list on purpose.
 // Hard-coding which environments carry which leaves would copy landing-zone's live-tree

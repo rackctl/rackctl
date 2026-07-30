@@ -112,7 +112,7 @@ func TestOperatorRoles_ForceDeletesEachRole(t *testing.T) {
 	f.inline["dev-ops-tenant"] = []string{"session-inline"}
 	f.attached["dev-ops-session"] = []string{"arn:aws:iam::1:policy/attribution"}
 
-	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{})
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "dev")
 
 	for _, r := range []string{"dev-ops-tenant", "dev-ops-session"} {
 		if !f.deleted[r] {
@@ -130,7 +130,7 @@ func TestOperatorRoles_OneFailureDoesNotAbortTheRest(t *testing.T) {
 	f.detachFails["dev-wedged-tenant"] = true
 	f.attached["dev-ok-session"] = []string{"arn:aws:iam::1:policy/y"}
 
-	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{})
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "dev")
 
 	if f.deleted["dev-wedged-tenant"] {
 		t.Errorf("a role whose detach failed must not be deleted (it would DeleteConflict)")
@@ -143,7 +143,7 @@ func TestOperatorRoles_OneFailureDoesNotAbortTheRest(t *testing.T) {
 func TestOperatorRoles_NoRolesIsClean(t *testing.T) {
 	f := newFakeIAM()
 	buf := &bytes.Buffer{}
-	reapOperatorRoles(context.Background(), f, false, buf)
+	reapOperatorRoles(context.Background(), f, false, buf, "dev")
 	if len(f.runs) != 0 {
 		t.Fatalf("no roles under the prefix => no mutations; got %v", f.runs)
 	}
@@ -152,7 +152,7 @@ func TestOperatorRoles_NoRolesIsClean(t *testing.T) {
 func TestOperatorRoles_DryRunTouchesNothing(t *testing.T) {
 	f := newFakeIAM()
 	f.attached["dev-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
-	reapOperatorRoles(context.Background(), f, true, &bytes.Buffer{})
+	reapOperatorRoles(context.Background(), f, true, &bytes.Buffer{}, "dev")
 	if len(f.runs) != 0 {
 		t.Fatalf("dry-run must not mutate; got %v", f.runs)
 	}
@@ -259,5 +259,138 @@ func TestUnstickTerminating_NoClusterIsClean(t *testing.T) {
 	unstickTerminating(context.Background(), k, false, &bytes.Buffer{})
 	if len(k.patched) != 0 {
 		t.Fatalf("unreachable cluster => nothing to do; got %v", k.patched)
+	}
+}
+
+// The sweep is account-wide by construction — IAM is global, and the operator's tenant path
+// carries neither an environment nor a cluster segment — so the ONLY thing keeping it inside
+// the cluster being torn down is the name filter.
+//
+// An account hosting development and staging has both clusters' tenant roles under
+// /eks-agent-platform/tenants/. Without the filter, `rackctl destroy` against staging
+// force-detaches and deletes development's live tenant roles: the agent pods there keep
+// running with cached credentials until they rotate, then start failing AssumeRole with
+// nothing in the cluster to explain why, because the thing that deleted their role was a
+// teardown of a different cluster in a different environment.
+func TestOperatorRoles_LeavesAnotherClustersRolesAlone(t *testing.T) {
+	f := newFakeIAM()
+	f.attached["staging-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+	f.attached["development-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "staging-ops")
+
+	if !f.deleted["staging-ops-tenant"] {
+		t.Errorf("the torn-down cluster's own role must still be reaped; runs=%v", f.runs)
+	}
+	if f.deleted["development-ops-tenant"] {
+		t.Fatalf("destroying staging deleted a DEVELOPMENT tenant role — the sweep is scoped by "+
+			"name because the IAM path is shared across every cluster in the account; runs=%v", f.runs)
+	}
+	for _, r := range f.runs {
+		if flag(r, "--role-name") == "development-ops-tenant" {
+			t.Fatalf("no mutation may touch another cluster's role, not even a detach; got %v", r)
+		}
+	}
+}
+
+// A cluster name of "" would make `HasPrefix(name, "-")`… match nothing by luck, but
+// `HasPrefix(name, cluster+"-")` with an empty cluster is one edit away from matching
+// everything, and a teardown is the wrong place to rely on luck. There is no cluster whose
+// roles could be named for an empty name, so the correct behaviour is to do nothing at all —
+// not to enumerate and filter.
+func TestOperatorRoles_BlankClusterReapsNothing(t *testing.T) {
+	f := &recordingIAM{fakeIAM: newFakeIAM()}
+	f.attached["development-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "")
+
+	if len(f.runs) != 0 {
+		t.Fatalf("a blank cluster name must reap nothing, not everything; got %v", f.runs)
+	}
+	// Asserting no MUTATION is not enough, and this is the whole reason the test exists.
+	// With the guard removed, HasPrefix(name, "-") matches nothing by accident, so the sweep
+	// enumerates, filters to zero and mutates nothing — a green test over a missing guard.
+	// The documented contract is "do nothing at all, not enumerate and filter", so the
+	// enumeration itself is what has to be absent.
+	if f.listArgs != nil {
+		t.Fatalf("a blank cluster name must not even enumerate: the empty prefix matching nothing "+
+			"is an accident of the name shape, not a guard, and one edit to the filter turns it "+
+			"into an account-wide sweep.\ngot: %v", f.listArgs)
+	}
+}
+
+// agent-iam's own terraform owns one ROLE at the SHALLOWER path /eks-agent-platform/ —
+// <cluster>-agent-platform-operator — and destroys it in the ordinary way moments later. It is
+// named for the cluster, so the name filter does not exclude it; the PATH is what does. (The
+// tenant boundary and baseline sit at that path too, but are aws_iam_policy, so list-roles
+// never returns them.)
+//
+// This asserts the path, because the two filters protect against different things and passing
+// on the name alone would leave terraform planning a delete for a role rackctl already
+// force-deleted. The fake serves list-roles for one prefix only, so seeding a role and
+// asserting the query is the way to pin it.
+func TestOperatorRoles_QueriesOnlyTheTenantPath(t *testing.T) {
+	f := &recordingIAM{fakeIAM: newFakeIAM()}
+	f.attached["development-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "development-ops")
+
+	if got := flag(f.listArgs, "--path-prefix"); got != "/eks-agent-platform/tenants/" {
+		t.Fatalf("list-roles asked for --path-prefix %q; the operator mints tenant and session "+
+			"roles under /eks-agent-platform/tenants/, while the shallower /eks-agent-platform/ "+
+			"also holds <cluster>-agent-platform-operator, which agent-iam's own terraform owns "+
+			"and is about to destroy itself", got)
+	}
+}
+
+// recordingIAM captures the list-roles argv so a test can assert the path prefix, which is
+// otherwise invisible: the fake answers every prefix identically.
+type recordingIAM struct {
+	*fakeIAM
+	listArgs []string
+}
+
+func (r *recordingIAM) Capture(ctx context.Context, name string, args ...string) (string, error) {
+	if len(args) > 1 && args[1] == "list-roles" {
+		r.listArgs = append([]string{name}, args...)
+	}
+	return r.fakeIAM.Capture(ctx, name, args...)
+}
+
+// PointAt is the safety argument for the two ambient sweeps, so it has to fail closed.
+//
+// reap.All and reap.UnstickTerminating act on whatever context kubectl resolves, guarded only
+// by a /readyz probe that tests liveness and never identity. `rackctl destroy` never touched
+// the kubeconfig at all, so a teardown of staging from a shell pointed at a healthy
+// development cluster deleted every Platform, Tenant, NodeClaim and PVC in development and
+// then stripped their finalizers — with the IAM roles those CRs guarded deliberately left
+// alive, which orphans exactly the AWS state this package exists never to orphan.
+func TestPointAt_NamesTheClusterBeingDestroyed(t *testing.T) {
+	f := newFakeIAM()
+	if err := pointAt(context.Background(), f, "staging-platform"); err != nil {
+		t.Fatalf("pointAt: %v", err)
+	}
+	var found bool
+	for _, r := range f.runs {
+		if len(r) >= 5 && r[1] == "eks" && r[2] == "update-kubeconfig" && flag(r, "--name") == "staging-platform" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the kubeconfig must be repointed at the cluster being torn down before anything "+
+			"sweeps ambient Kubernetes state; got %v", f.runs)
+	}
+}
+
+// A blank cluster name must be an error, not a no-op that reports success — the caller uses
+// the return value to decide whether the sweeps may run at all.
+func TestPointAt_RefusesABlankCluster(t *testing.T) {
+	f := newFakeIAM()
+	if err := pointAt(context.Background(), f, ""); err == nil {
+		t.Fatal("a blank cluster name must fail, so the caller skips the ambient sweeps rather " +
+			"than running them against whatever the operator was last pointed at")
+	}
+	if len(f.runs) != 0 {
+		t.Fatalf("nothing should be executed for a blank cluster; got %v", f.runs)
 	}
 }

@@ -298,7 +298,7 @@ func TestClusterNetworkEnv_InjectsLeversWhenSet(t *testing.T) {
 		TransitGatewayID:  "tgw-0abc123",
 		CentralizedEgress: true,
 	}
-	env := clusterNetworkEnv(testState(cfg))
+	env := clusterNetworkEnv(testState(cfg), "apply")
 	for _, want := range []string{
 		"TF_VAR_ipam_pool_id=ipam-pool-0abc123",
 		"TF_VAR_ipam_netmask_length=18",
@@ -311,13 +311,55 @@ func TestClusterNetworkEnv_InjectsLeversWhenSet(t *testing.T) {
 	}
 }
 
-// A day-0 hub with no levers set injects nothing — the committed tree's plain
+// A day-0 hub with no levers set injects nothing BUT the mode — the committed tree's plain
 // literal-CIDR VPC with local NAT is left exactly as it stands.
-func TestClusterNetworkEnv_EmptyWhenLeversOff(t *testing.T) {
+//
+// network_mode is the deliberate exception, and the reason is the same mechanism this test
+// protects: an ambient TF_VAR beats a leaf's `inputs`, so injecting a default-valued knob
+// silently overrides whatever that environment's leaf chose. That is why the levers below are
+// conditional. Mode is not per-environment tuning though — it is the operator's declaration
+// about who owns the VPC — and every committed workload leaf selects create by omission, so
+// sending "create" overrides nothing that exists.
+func TestClusterNetworkEnv_OnlyTheModeWhenLeversOff(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Cluster.Network = config.ClusterNet{VPCCIDR: "10.0.0.0/16", NATGateways: 1}
-	if env := clusterNetworkEnv(testState(cfg)); len(env) != 0 {
-		t.Errorf("no levers set, but TF_VARs were injected: %v", env)
+
+	env := clusterNetworkEnv(testState(cfg), "apply")
+	if !slices.Contains(env, "TF_VAR_network_mode=create") {
+		t.Errorf("the mode must always be sent, and an omitted mode means create; got %v", env)
+	}
+	if len(env) != 1 {
+		t.Errorf("no levers are set, so nothing beyond the mode may be injected — a "+
+			"default-valued TF_VAR silently overrides the leaf's own value.\ngot %v", env)
+	}
+}
+
+// natGateways is the knob where wiring it "for completeness" would be a real regression, so
+// this pins that it stays unwired in create mode.
+//
+// ApplyDefaults forces NATGateways to 1 whenever it is unset. The staging and production
+// network leaves pin nat_gateways = 3 for per-AZ NAT redundancy. Since an ambient TF_VAR beats
+// a leaf's inputs, injecting the field unconditionally would silently downgrade both
+// environments to a single shared NAT gateway — an HA regression produced by wiring a knob
+// that looks inert. vpcCidr has the same shape and is harmless only because rackctl's default
+// happens to equal the leaves' value.
+//
+// Under ADOPT, nat_gateways IS injected (as 1) together with enable_flow_logs=false, and that
+// is not a contradiction: those are the two values staging's and production's leaves pin that
+// landing-zone rejects under adopt, so neutralizing them is what makes adopt selectable there.
+// vpc_cidr is injected in NEITHER mode — no workload network leaf pins it, and a non-default
+// value is rejected outright under adopt. See adoptEnv.
+func TestClusterNetworkEnv_DoesNotInjectCreateModeSizing(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Cluster.Network = config.ClusterNet{VPCCIDR: "10.0.0.0/16", NATGateways: 1}
+
+	for _, e := range clusterNetworkEnv(testState(cfg), "apply") {
+		for _, forbidden := range []string{"TF_VAR_nat_gateways=", "TF_VAR_vpc_cidr=", "TF_VAR_enable_flow_logs="} {
+			if strings.HasPrefix(e, forbidden) {
+				t.Errorf("create mode injected %q — staging and production pin nat_gateways = 3 and "+
+					"enable_flow_logs = true deliberately, and an ambient TF_VAR overrides them", e)
+			}
+		}
 	}
 }
 
@@ -410,7 +452,7 @@ func TestComponentEnv_ScopesVariablesToTheComponentThatDeclaresThem(t *testing.T
 	st := testState(cfg)
 	st.Runner.DryRun = true
 
-	netEnv, err := componentEnv(context.Background(), st, "network")
+	netEnv, err := componentEnv(context.Background(), st, "network", "apply")
 	if err != nil {
 		t.Fatalf("componentEnv(network): %v", err)
 	}
@@ -421,7 +463,7 @@ func TestComponentEnv_ScopesVariablesToTheComponentThatDeclaresThem(t *testing.T
 		t.Errorf("network must receive the create-mode levers it declares; got %v", netEnv)
 	}
 
-	clusterEnv, err := componentEnv(context.Background(), st, "cluster")
+	clusterEnv, err := componentEnv(context.Background(), st, "cluster", "apply")
 	if err != nil {
 		t.Fatalf("componentEnv(cluster): %v", err)
 	}
@@ -433,7 +475,7 @@ func TestComponentEnv_ScopesVariablesToTheComponentThatDeclaresThem(t *testing.T
 	}
 
 	// A component with no per-run inputs gets nothing at all.
-	if env, err := componentEnv(context.Background(), st, "secrets"); err != nil || len(env) != 0 {
+	if env, err := componentEnv(context.Background(), st, "secrets", "apply"); err != nil || len(env) != 0 {
 		t.Errorf("secrets declares no per-run inputs, so it must receive none; got %v (err %v)", env, err)
 	}
 }
@@ -505,5 +547,167 @@ func TestCoreComponents_DruidIsOptInAndReachable(t *testing.T) {
 	cfg.Addons.Druid = true
 	if comps := CoreComponents(cfg); indexOf(comps, "druid") < 0 {
 		t.Fatalf("addons.druid must reach the apply list; got %v", comps)
+	}
+}
+
+// adoptState builds a valid adopt config plus a dry-run state, so the assertions below are
+// about what would reach terragrunt rather than about validation (which network_test.go in
+// internal/config covers).
+func adoptState(t *testing.T, public ...string) (*engine.State, *strings.Builder) {
+	t.Helper()
+	cfg := &config.Config{}
+	cfg.Cluster.Network = config.ClusterNet{
+		Mode:                  config.ModeAdopt,
+		AdoptVPCID:            "vpc-0abc123",
+		AdoptPrivateSubnetIDs: []string{"subnet-a1", "subnet-b2", "subnet-c3"},
+		AdoptPublicSubnetIDs:  public,
+		VPCCIDR:               "10.0.0.0/16",
+		NATGateways:           1,
+	}
+	var out strings.Builder
+	run := exec.New(&out)
+	run.DryRun = true
+	return &engine.State{Config: cfg, Runner: run}, &out
+}
+
+// The three inputs landing-zone needs, in the form it needs them. The subnet lists are
+// list(string), and TF_VAR_ carries a complex type as an HCL expression — JSON array syntax
+// satisfies that, and a bare comma-joined string would not.
+func TestAdoptEnv_InjectsTheAdoptInputs(t *testing.T) {
+	st, _ := adoptState(t, "subnet-x9", "subnet-y8", "subnet-z7")
+	env := clusterNetworkEnv(st, "apply")
+
+	for _, want := range []string{
+		"TF_VAR_network_mode=adopt",
+		"TF_VAR_adopt_vpc_id=vpc-0abc123",
+		`TF_VAR_adopt_private_subnet_ids=["subnet-a1","subnet-b2","subnet-c3"]`,
+		`TF_VAR_adopt_public_subnet_ids=["subnet-x9","subnet-y8","subnet-z7"]`,
+	} {
+		if !slices.Contains(env, want) {
+			t.Errorf("adopt mode must inject %q; got %v", want, env)
+		}
+	}
+}
+
+// The two neutralizers, and this is the assertion that makes adopt usable at all outside
+// development.
+//
+// nat_gateways and enable_flow_logs both carry an adopt-rejecting validation upstream, and the
+// staging and production network leaves pin exactly the values that trip them: nat_gateways = 3
+// and enable_flow_logs = true. Without these overrides, `mode: adopt` fails tofu validation on
+// both variables in staging and production while working fine in development — which is the
+// least useful possible behaviour, and the kind that gets discovered in a real install.
+//
+// Overriding them is semantically empty rather than a change: under adopt neither input builds
+// anything, and the VPC owner runs both egress and flow logging.
+func TestAdoptEnv_NeutralizesTheLeversTheLeafPins(t *testing.T) {
+	st, _ := adoptState(t)
+	env := clusterNetworkEnv(st, "apply")
+
+	for _, want := range []string{"TF_VAR_nat_gateways=1", "TF_VAR_enable_flow_logs=false"} {
+		if !slices.Contains(env, want) {
+			t.Fatalf("adopt must send %q. The staging and production network leaves pin "+
+				"nat_gateways = 3 and enable_flow_logs = true, both of which landing-zone REJECTS "+
+				"under adopt — so without this, adopt works in development and fails tofu "+
+				"validation everywhere else.\ngot %v", want, env)
+		}
+	}
+}
+
+// An empty public list is a valid adopt shape, so it must still be sent — explicitly, as [].
+// Omitting the variable would let the leaf's value stand, and it must be sent as a JSON array
+// rather than as an empty string, which tofu cannot decode as a list(string).
+func TestAdoptEnv_SendsAnEmptyPublicListExplicitly(t *testing.T) {
+	st, _ := adoptState(t)
+	if env := clusterNetworkEnv(st, "apply"); !slices.Contains(env, "TF_VAR_adopt_public_subnet_ids=[]") {
+		t.Fatalf("a private-only adopt cluster must send an explicit empty list; got %v", env)
+	}
+}
+
+// The create-mode levers must not ride along under adopt. Every one of them has an
+// adopt-rejecting validation upstream, so injecting one would fail the plan — and the config
+// validation that rejects them is a separate mechanism from this one.
+func TestAdoptEnv_SendsNoCreateModeLevers(t *testing.T) {
+	st, _ := adoptState(t)
+	for _, e := range clusterNetworkEnv(st, "apply") {
+		for _, forbidden := range []string{"TF_VAR_ipam_pool_id=", "TF_VAR_ipam_netmask_length=", "TF_VAR_transit_gateway_id=", "TF_VAR_centralized_egress=", "TF_VAR_vpc_cidr="} {
+			if strings.HasPrefix(e, forbidden) {
+				t.Errorf("adopt injected the create-mode lever %q, which landing-zone rejects under adopt", e)
+			}
+		}
+	}
+}
+
+// A private-only adopt cluster has a real consequence the operator cannot infer, so the run
+// has to say it: cluster-bootstrap publishes the public subnet list for the Kyverno rule that
+// injects load-balancer subnets, and that rule guards on a non-empty list. So an
+// internet-facing Service or Ingress silently fails to provision.
+func TestAdoptEnv_DisclosesThePrivateOnlyConsequence(t *testing.T) {
+	st, out := adoptState(t)
+	clusterNetworkEnv(st, "apply")
+	if !strings.Contains(out.String(), "internet-facing") {
+		t.Fatalf("a private-only adopt cluster cannot provision an internet-facing load balancer; "+
+			"a run that does not say so leaves the operator debugging a Service that never gets an "+
+			"address.\ngot:\n%s", out.String())
+	}
+}
+
+// And the adopt variables must be scoped to the network component. componentEnv is the seam
+// that guarantees it; an ambient TF_VAR beats a leaf's inputs, which is how
+// TF_VAR_cluster_name reached six components that never declared it.
+func TestComponentEnv_AdoptVarsOnlyReachNetwork(t *testing.T) {
+	st, _ := adoptState(t)
+	for _, comp := range []string{"cluster", "secrets", "agent-iam", "cluster-addons", "cluster-bootstrap"} {
+		env, err := componentEnv(context.Background(), st, comp, "apply")
+		if err != nil {
+			continue // the cluster case may probe for an egress IP; not what this asserts
+		}
+		for _, e := range env {
+			if strings.HasPrefix(e, "TF_VAR_adopt_") || strings.HasPrefix(e, "TF_VAR_network_mode=") {
+				t.Errorf("%s received %q — only components/aws/network declares these", comp, e)
+			}
+		}
+	}
+}
+
+// druid is the one component rackctl applies that it cannot destroy — in ANY environment,
+// including development. Its Aurora module sets neither skip_final_snapshot nor
+// final_snapshot_identifier and the `tenants` object type exposes neither, so no TF_VAR shape
+// reaches them; its three per-tenant buckets have no force_destroy_buckets input and no
+// development carve-out; and deepstorage has neither versioning nor expiry, so on a working
+// cluster it is never empty.
+//
+// That breaks the rule every other component here keeps. The operator must learn it at apply
+// time, not halfway through a destroy with the cluster already half gone and the VPC still
+// billing.
+func TestSubstrate_WarnsThatDruidCannotBeTornDown(t *testing.T) {
+	var out strings.Builder
+	run := exec.New(&out)
+	run.DryRun = true
+	cfg := baseCfg()
+	cfg.Addons.Druid = true
+	st := &engine.State{Config: cfg, Runner: run, Repos: engine.Repos{LandingZone: t.TempDir()}}
+
+	_ = (substrate{}).Run(context.Background(), st)
+
+	if !strings.Contains(out.String(), "will not tear down cleanly") {
+		t.Fatalf("enabling druid must disclose that the cluster cannot be destroyed — every other "+
+			"component rackctl applies, it also destroys, and discovering this mid-teardown leaves "+
+			"a half-gone cluster billing.\ngot:\n%s", out.String())
+	}
+}
+
+// And it must stay quiet when druid is off, which is the default — a warning that fires on
+// every run is one nobody reads.
+func TestSubstrate_SaysNothingAboutDruidWhenItIsOff(t *testing.T) {
+	var out strings.Builder
+	run := exec.New(&out)
+	run.DryRun = true
+	st := &engine.State{Config: baseCfg(), Runner: run, Repos: engine.Repos{LandingZone: t.TempDir()}}
+
+	_ = (substrate{}).Run(context.Background(), st)
+
+	if strings.Contains(out.String(), "druid") {
+		t.Fatalf("druid is off; nothing should mention it.\ngot:\n%s", out.String())
 	}
 }
