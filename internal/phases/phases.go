@@ -23,8 +23,8 @@ import (
 // CoreComponents returns the landing-zone apply order for the core path; destroy
 // runs it in reverse.
 //
-// The list is derived from the config rather than fixed, because three components
-// are conditional and the old fixed list omitted all three — so a config that asked
+// The list is derived from the config rather than fixed, because four components
+// are conditional and the old fixed list omitted three of them — so a config that asked
 // for them applied nothing, and the cluster came up subtly broken:
 //
 //   - agent-iam creates the eks-agent-platform operator's IAM role. Without it the
@@ -34,24 +34,66 @@ import (
 //   - managed-monitoring provisions AMP + AMG and writes the endpoints to SSM.
 //     cluster-bootstrap READS those SSM params (grafana_url, amp_endpoint,
 //     amp_workspace_id) to stamp them onto the ArgoCD cluster Secret, so it must be
-//     applied BEFORE cluster-bootstrap or the read fails. It is gated on
-//     addons.observability because AMP and AMG both cost money — it is never
-//     applied unless asked for.
+//     applied BEFORE cluster-bootstrap or the read fails. It is gated on the FULL
+//     observability tier, and that gate is the whole invariant: tier=full means the
+//     full-tier OTel gateway will mount AMP_REMOTE_WRITE_URL from a Secret that
+//     external-secrets syncs out of AWS Secrets Manager, and this component is the only thing
+//     that writes that entry. Nothing in Terraform can check that cross-root fact — rackctl
+//     is the only place it can be held.
 //
 //   - dns creates the hosted zone + external-dns identity; gated on a dns block.
 //
-// Ordering is load-bearing and is NOT enforced by terragrunt (these roots declare
-// no dependency blocks) — this slice is the only thing that sequences them.
+//   - model-import provisions the account+region substrate for Bedrock Custom Model
+//     Import — an S3 staging bucket and the IAM role Bedrock assumes during a
+//     CreateModelImportJob. Unlike managed-monitoring, its POSITION here is not
+//     load-bearing: its live leaf declares no terragrunt dependency, the component reads
+//     only aws_caller_identity and aws_partition, and nothing on the platform resolves
+//     its SSM parameters programmatically (only the human import runbook does). It sits
+//     last among the conditionals for readability, and a future reader may move it. It is
+//     gated because it is per-environment substrate an org may never want, and it is
+//     destroyed with everything else — landing-zone scopes it by environment and gives it a
+//     teardown posture (force_destroy unconditional in development, opt-in elsewhere), so
+//     there is nothing here that has to outlive the cluster that asked for it.
+//
+// Ordering is load-bearing and terragrunt's own dependency graph does not express it:
+// the orderings that matter here are substrate-before-consumer (cluster-addons' Pod
+// Identity associations before ArgoCD deploys the pods that need them; managed-monitoring's
+// SSM parameters before cluster-bootstrap reads them), and no `dependency` block in these
+// roots encodes that. This slice, plus the phase boundary that splits it, is what
+// sequences them.
 func CoreComponents(cfg *config.Config) []string {
 	comps := []string{"network", "cluster", "secrets"}
 	if cfg.AgentPlatform.Enabled() {
 		comps = append(comps, "agent-iam")
 	}
-	if cfg.Addons.Observability {
+	if cfg.FullObservability() {
 		comps = append(comps, "managed-monitoring") // must precede cluster-bootstrap
+	}
+	// observability is NOT conditional, and it is gated on nothing: it publishes the three
+	// /eks-agent-platform/<cluster>/observability/alerts_{critical,warning,info}_topic_arn
+	// parameters unconditionally, and it is their sole producer. rackctl applied it nowhere at
+	// all until now, so every rackctl-installed cluster had consumers of that contract and no
+	// producer.
+	//
+	// Its POSITION here is currently arbitrary — no component rackctl applies reads those
+	// parameters, so only the phase boundary (substrate before gitops) is load-bearing. It is
+	// placed early because the consumer that WILL bind is eks-agent-platform's kill-switch,
+	// whose burn-rate rules resolve both topic ARNs through unguarded `data` blocks at PLAN
+	// time. rackctl does not apply that tree yet; when it does, this ordering stops being
+	// arbitrary and starts being required.
+	comps = append(comps, "observability")
+	// druid is the per-tenant analytics substrate (Aurora Serverless + optionally MSK), gated
+	// because it is real money and most platforms never need it. Its live leaf is
+	// self-sufficient — it carries its own `tenants` sizing map — and it depends on network and
+	// cluster, both of which the cluster phase applied before this one.
+	if cfg.Addons.Druid {
+		comps = append(comps, "druid")
 	}
 	if cfg.DNS != nil && cfg.DNS.HostedZone != "" {
 		comps = append(comps, "dns")
+	}
+	if cfg.AgentPlatform.Enabled() && cfg.AgentPlatform.ModelImport {
+		comps = append(comps, "model-import")
 	}
 
 	// cluster-addons before cluster-bootstrap. This documents the order; the two are
@@ -115,15 +157,87 @@ func componentDir(st *engine.State, component string) string {
 	return fmt.Sprintf("live/aws/workload-%s/%s/%s/%s", env, st.Config.Cloud.Region, env, component)
 }
 
-// apply / destroy run a landing-zone Terragrunt component for the current env.
+// apply / destroy run a landing-zone Terragrunt component for the current env, with the
+// TF_VARs that component declares and no others.
+//
+// Scoping is the point. The Runner is shared by every phase for the whole run, so the old
+// idiom — `st.Runner.Env = append(st.Runner.Env, ...)` in the cluster phase — did not
+// configure the cluster component, it configured EVERY terragrunt invocation that followed
+// it. TF_VAR_cluster_name reached secrets, agent-iam, managed-monitoring, dns, cluster-addons
+// and cluster-bootstrap, whose own envcommon simultaneously hands them
+// `cluster_name = <environment>-<base>`. And an ambient TF_VAR beats a terragrunt `inputs`
+// value, so the leaked base name won that argument silently.
+//
+// A variable is scoped to the invocation that needs it, or it is a global — there is no
+// third thing, and `cmd/tgenv.go` is where the genuine globals live.
 func apply(ctx context.Context, st *engine.State, component string) error {
-	return tg(ctx, st, "apply", component)
+	env, err := componentEnv(ctx, st, component)
+	if err != nil {
+		return err
+	}
+	return tg(ctx, st, "apply", component, env...)
 }
+
 func destroy(ctx context.Context, st *engine.State, component string) error {
-	return tg(ctx, st, "destroy", component)
+	env, err := componentEnv(ctx, st, component)
+	if err != nil {
+		return err
+	}
+	return tg(ctx, st, "destroy", component, env...)
 }
-func tg(ctx context.Context, st *engine.State, verb, component string) error {
+
+// Destroy runs one component's teardown with its scoped env. Exported for `rackctl destroy`,
+// which walks CoreComponents in reverse outside the phase engine.
+//
+// It exists so that path cannot drift from this one. It used to restate the init+destroy
+// sequence itself and build its env from tgEnv alone — so a standalone `rackctl destroy`
+// passed none of the per-component variables the apply had, and the cluster component fell
+// back to its own default name. Restating what a shared helper already does is the mistake
+// substrateComponents was written to prevent; this is the same mistake one layer down.
+func Destroy(ctx context.Context, st *engine.State, component string) error {
+	return destroy(ctx, st, component)
+}
+
+// componentEnv returns the TF_VARs a single landing-zone component declares. Components not
+// named here take nothing beyond the globals in tgEnv.
+//
+// Every entry must correspond to a variable that component actually declares. TF_VAR_cluster_name
+// used to be injected into `network` as well, on the stated grounds that "network and cluster
+// must agree on it or Karpenter/ELB discovery breaks" — but components/aws/network declares no
+// cluster_name variable at all, and its own comment says the cluster-ownership and
+// Karpenter-discovery tags are per-cluster and applied by the CLUSTER component via
+// aws_ec2_tag, precisely because the VPC is shared per environment and cluster-agnostic.
+// The injection was inert and the reasoning was backwards.
+func componentEnv(ctx context.Context, st *engine.State, component string) ([]string, error) {
+	switch component {
+	case "network":
+		// The create-mode levers are network variables: ipam_pool_id, ipam_netmask_length,
+		// transit_gateway_id, centralized_egress.
+		return clusterNetworkEnv(st), nil
+	case "cluster":
+		// cluster_name plus the endpoint posture, all three cluster variables. The endpoint
+		// builder may detect this host's egress IP, so it can fail and must be able to say so.
+		env := []string{"TF_VAR_cluster_name=" + st.Config.Cluster.Name}
+		endpointEnv, err := clusterEndpointEnv(ctx, st)
+		if err != nil {
+			return nil, err
+		}
+		return append(env, endpointEnv...), nil
+	default:
+		return nil, nil
+	}
+}
+
+func tg(ctx context.Context, st *engine.State, verb, component string, extraEnv ...string) error {
 	dir := componentDir(st, component)
+
+	// Scope extraEnv to this invocation — both commands below, then restored. Copied rather
+	// than appended in place so the restore cannot be defeated by a shared backing array.
+	if len(extraEnv) > 0 {
+		prev := st.Runner.Env
+		st.Runner.Env = append(append([]string(nil), prev...), extraEnv...)
+		defer func() { st.Runner.Env = prev }()
+	}
 
 	// Always init first.
 	//
@@ -307,7 +421,7 @@ func forkOrSync(ctx context.Context, st *engine.State, org string) error {
 	fork := org + "/eks-gitops"
 
 	if _, err := st.Runner.Capture(ctx, "gh", "repo", "view", fork, "--json", "name"); err != nil || st.Runner.DryRun {
-		note(st, "forking nanohype/eks-gitops → %s (the operator owns the addon catalog for IRSA writeback)", fork)
+		note(st, "forking nanohype/eks-gitops → %s (ArgoCD syncs the catalog from the org's fork, never upstream)", fork)
 		return st.Runner.Run(ctx, "gh", "repo", "fork", "nanohype/eks-gitops",
 			"--org", org, "--fork-name", "eks-gitops", "--clone=false")
 	}
@@ -344,9 +458,14 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 	// phase can install from the local chart (mirrors the operator fallback).
 	if st.Config.ControlPlane.Portal {
 		note(st, "cloning nanohype/portal (day-2 UI) for its local chart")
-		return cloneOrUpdate(ctx, st, "https://github.com/nanohype/portal.git", st.Repos.Portal)
+		if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/portal.git", st.Repos.Portal); err != nil {
+			return err
+		}
 	}
-	return nil
+	// Every component this config will apply must have a live root in the tree just
+	// cloned. This is the first phase at which a tree exists to check, and the last
+	// before anything is provisioned.
+	return assertComponentRoots(st)
 }
 
 // --- Phase 2: identity & state backend ---
@@ -355,7 +474,8 @@ type identity struct{ base }
 func (identity) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	c := st.Config
-	note(st, "generating account.hcl (account %s) and the versioned S3 tfstate backend", c.Cloud.AccountID)
+	note(st, "creating the versioned, encrypted, public-access-blocked S3 tfstate backend %s-%s-tfstate",
+		c.Cloud.AccountID, c.Cloud.Region)
 	return st.Runner.Run(ctx, "scripts/init-backend-aws.sh", c.Cloud.AccountID, c.Cloud.Region)
 }
 
@@ -364,31 +484,17 @@ type cluster struct{ base }
 
 func (cluster) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
-	// The cluster base rides TF_VAR_cluster_name into landing-zone's network + cluster
-	// modules (their var.cluster_name), which compose <environment>-<cluster_name> — the
-	// same string ClusterName() returns. network.hcl no longer pins cluster_name in its
-	// inputs, so this TF_VAR is what names the cluster and its VPC subnet-discovery tags;
-	// network and cluster must agree on it or Karpenter/ELB discovery breaks.
-	st.Runner.Env = append(st.Runner.Env, "TF_VAR_cluster_name="+st.Config.Cluster.Name)
 
-	// The endpoint posture rides the same seam. landing-zone's committed cluster tree is
+	// Both components' per-run inputs are supplied by componentEnv, scoped to the one
+	// invocation that declares them: the create-mode levers to `network`, and cluster_name
+	// plus the endpoint posture to `cluster`. landing-zone's committed cluster tree is
 	// private-by-default and fail-closed — a public API endpoint with no allow-list is
-	// rejected at plan time. rackctl owns the fragile per-run input: it supplies the bool
-	// and, when public, the CIDR allow-list (auto-detecting the operator's egress IP when
-	// none is given). Both are cluster-component variables, so they belong here, layered
-	// over the generic committed tree exactly like TF_VAR_cluster_name.
-	endpointEnv, err := clusterEndpointEnv(ctx, st)
-	if err != nil {
-		return err
-	}
-	st.Runner.Env = append(st.Runner.Env, endpointEnv...)
-
-	// The create-mode network levers ride the same seam into landing-zone's network
-	// component (applied first, below). Off by default — a day-0 hub owns a plain
-	// literal-CIDR VPC unless the config opts it into IPAM / transit-gateway / centralized
-	// egress. Config validation has already rejected any contradictory combination.
-	st.Runner.Env = append(st.Runner.Env, clusterNetworkEnv(st)...)
-
+	// rejected at plan time — and rackctl owns that fragile input, auto-detecting the
+	// operator's egress IP when the allow-list is empty. Config validation has already
+	// rejected any contradictory network combination.
+	//
+	// This phase deliberately sets nothing on st.Runner.Env. It used to, and those variables
+	// then rode into every phase after it; see the comment on apply().
 	note(st, "provisioning VPC then EKS control plane (network → cluster; strict ordering)")
 	for _, comp := range []string{"network", "cluster"} {
 		if err := apply(ctx, st, comp); err != nil {
@@ -419,8 +525,9 @@ type bootstrap struct{ base }
 // substrateComponents is the AWS substrate the GitOps layer consumes: every landing-zone
 // component ArgoCD depends on but that does not itself need ArgoCD. Derived from
 // CoreComponents (never restated) so the conditional components (agent-iam,
-// managed-monitoring, dns) can only ever be applied in the one order CoreComponents
-// documents — restating the list is what let those three silently go missing once.
+// managed-monitoring, dns, model-import) can only ever be applied in the one order
+// CoreComponents documents — restating the list is what let three of them silently go
+// missing once.
 //
 // It is CoreComponents minus the components other phases own: network and cluster (the
 // cluster phase), and cluster-bootstrap (the gitops phase — ArgoCD is the CONSUMER of the
@@ -464,6 +571,48 @@ type substrate struct{ base }
 func (substrate) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	note(st, "building the AWS substrate the catalog consumes (IAM, Pod Identity, buckets, monitoring)")
+
+	// Disclose the tier, because rackctl injects it over whatever the leaf pinned and every
+	// other lever that does that prints what it would land (see network.go). floor gets the
+	// louder line: it is the one value that can PRUNE a running cluster's telemetry, since
+	// re-running init is normal and an ambient TF_VAR wins over the leaf.
+	if st.Config.FullObservability() {
+		note(st, "observability tier: full — applying managed-monitoring (AMP + AMG) and labelling the cluster "+
+			"observability/tier=full, which is what the in-cluster LGTM stack and the AMP remote-write Secret "+
+			"select on")
+	} else {
+		note(st, "observability tier: FLOOR — managed-monitoring is NOT applied. Metrics go to CloudWatch as EMF, "+
+			"logs to CloudWatch Logs, traces to X-Ray. On a cluster that previously ran full this PRUNES Loki, "+
+			"Tempo, grafana-operator and the dashboards, with a telemetry gap while it converges — see "+
+			"eks-gitops/docs/runbooks/observability-tier.md")
+	}
+
+	// Say exactly what model-import provisions, and — more importantly — what it does
+	// not. It is easy to read "model import is on" as "an open-weight model will work",
+	// and three separate things stand between here and that. The import itself is an
+	// out-of-band human act. landing-zone's agent-iam expands a tenant's Bedrock grant
+	// only to foundation-model and inference-profile ARNs, and its own variable doc says
+	// custom/imported models are not matched. And independently, the operator's
+	// bedrock-model-scoping inline policy is a Deny whose NotResource is that same
+	// expanded list, so it excludes an imported-model ARN even if the baseline allowed
+	// it. An `imported` ModelGateway route therefore gets AccessDenied at InvokeModel
+	// until BOTH repos change — which is why the note names both rather than implying
+	// one upstream fix is enough.
+	if st.Config.AgentPlatform.ModelImport {
+		note(st, "model-import: provisioning the Bedrock Custom Model Import substrate for %s in account %s / %s — "+
+			"the S3 staging bucket %s-%s-%s-model-import, the import service role model-import-%s-%s, and the SSM "+
+			"discovery parameters /eks-agent-platform/%s/model-import/{staging_bucket_name,import_role_arn}. It imports "+
+			"NO model: that "+
+			"is a deliberate out-of-band step (eks-agent-platform/docs/runbooks/import-open-weight-model.md). Nor does a "+
+			"tenant reach an imported model yet — landing-zone's agent-iam baseline cannot express an imported-model ARN, "+
+			"and the operator's own bedrock-model-scoping policy denies everything outside the foundation-model and "+
+			"inference-profile ARNs it expands, so an imported route needs a coordinated change in both repos",
+			st.Config.Environment, st.Config.Cloud.AccountID, st.Config.Cloud.Region,
+			st.Config.Environment, st.Config.Cloud.AccountID, st.Config.Cloud.Region,
+			st.Config.Environment, st.Config.Cloud.Region,
+			st.Config.Environment)
+	}
+
 	for _, comp := range substrateComponents(st.Config) {
 		if err := apply(ctx, st, comp); err != nil {
 			return err
@@ -481,15 +630,32 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 	// here, there is nothing to correct.
 	env := string(st.Config.Environment)
 	if st.Runner.DryRun {
-		note(st, "FOOTGUN GUARD: (apply) substitutes the account id into eks-gitops/addons/*/values-%s.yaml, then commits & pushes the fork", env)
+		note(st, "account-id writeback: (apply) scans eks-gitops/addons/**/values-%s.yaml for %s placeholders and, "+
+			"if any are found, commits & pushes the fork. The current catalog carries none — it is public, so addons "+
+			"bind their IAM roles through EKS Pod Identity and the one ApplicationSet that needs a role ARN reads it "+
+			"from an annotation on the ArgoCD cluster Secret", env, gitops.Placeholder)
 		return nil
 	}
-	note(st, "IRSA writeback: substituting account id into eks-gitops/addons/*/values-%s.yaml", env)
+	note(st, "account-id writeback: scanning eks-gitops/addons/**/values-%s.yaml", env)
 	n, changed, err := gitops.WriteBack(st.Repos.EKSGitops, env, st.Config.Cloud.AccountID)
 	if err != nil {
 		return err
 	}
-	note(st, "replaced %d placeholder(s) across %d file(s)", n, len(changed))
+	// Zero matches is the NORMAL case against the current catalog, and saying "replaced 0
+	// placeholder(s)" invites the reader to think something went wrong. Nothing did: the
+	// catalog is public, so it commits no account id at all. Almost every addon binds its
+	// IAM role through EKS Pod Identity, which needs no ARN in the values; the one that
+	// does need an ARN reads it from an annotation cluster-bootstrap stamps on the ArgoCD
+	// cluster Secret. The writeback substitutes into whatever DOES carry a placeholder,
+	// which against this catalog is nothing.
+	if n == 0 {
+		note(st, "no %s placeholders in the fork — the current catalog commits no account id: addons bind their "+
+			"IAM roles through EKS Pod Identity, and the one ApplicationSet that needs a role ARN templates it from "+
+			"an annotation cluster-bootstrap stamps on the ArgoCD cluster Secret. Nothing to write back, nothing to "+
+			"push", gitops.Placeholder)
+	} else {
+		note(st, "replaced %d placeholder(s) across %d file(s)", n, len(changed))
+	}
 	if len(changed) > 0 {
 		st.Runner.Dir = st.Repos.EKSGitops
 		// Stage by name (never `git add -A`).
@@ -510,7 +676,7 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	comps := substrateComponents(st.Config)
-	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply
+	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply, no exceptions
 		if err := destroy(ctx, st, comps[i]); err != nil {
 			return err
 		}
@@ -533,8 +699,26 @@ func (gitopsPhase) Run(ctx context.Context, st *engine.State) error {
 		return err
 	}
 
+	// Wait on the health STATUS, not on a condition. ArgoCD publishes no `Healthy`
+	// condition — `ApplicationConditionType` carries only error and warning types
+	// (InvalidSpecError, ComparisonError, SyncError, SharedResourceWarning,
+	// OrphanedResourceWarning, …). Health lives at `.status.health.status`, which is
+	// exactly what the diagnostic below already reads.
+	//
+	// So `--for=condition=Healthy` could never be satisfied: every install, including a
+	// perfect one, burned the full 30 minutes and then failed. That is the worst shape a
+	// failure can take — the platform is up and converged, and the tool that built it
+	// reports otherwise after half an hour of silence.
+	//
+	// This is the same bug as phase 9's `--for=condition=Ready` on a Platform, and it was
+	// written twice in one file. `kubectl wait --for=condition=X` is only ever valid when
+	// something actually writes a condition of type X; a status field that happens to be
+	// spelled like a condition is not one. The other two waits in this phase pipeline are
+	// fine because they name real built-in conditions — `Established` on a CRD and
+	// `Available` on a Deployment are both written by Kubernetes itself.
 	note(st, "waiting for ArgoCD applications to converge (sync-waves 0→52)")
-	if err := st.Runner.Run(ctx, "kubectl", "-n", "argocd", "wait", "--for=condition=Healthy",
+	if err := st.Runner.Run(ctx, "kubectl", "-n", "argocd", "wait",
+		"--for=jsonpath={.status.health.status}=Healthy",
 		"applications", "--all", "--timeout=30m"); err != nil {
 		// The cloud is provisioned. ArgoCD is running and has generated the catalog.
 		// Something on the cluster has not settled — which is NOT a reason to destroy
@@ -662,18 +846,92 @@ func (portal) Teardown(ctx context.Context, st *engine.State) error {
 }
 
 // --- Phase 9 (optional): first-tenant smoke test ---
+
+// tenantControlPlaneNamespace is where charts/tenant plants a tenant's control-plane CRs.
+//
+// It is the chart's `controlPlaneNamespace` VALUE that decides this — not the Helm
+// release namespace. The Platform, BudgetPolicy, ModelGateway, AgentFleet and EvalSuite
+// templates all set `namespace: {{ .Values.controlPlaneNamespace | default
+// .Release.Namespace }}`, and the value defaults to eks-agent-platform. So rackctl
+// passes the same string as `--namespace` AND as `--set controlPlaneNamespace=`: pinning
+// only one leaves the other free to drift, and the two disagreeing is precisely how a
+// namespace-blind `kubectl wait` ends up looking for a Platform in the kubeconfig's
+// current namespace and failing NotFound against a tenant that is up and healthy.
+const tenantControlPlaneNamespace = "eks-agent-platform"
+
+// smoke vends the first tenant from eks-agent-platform's charts/tenant and waits for the
+// operator to reconcile it. It is the end-to-end proof that the platform can actually
+// take a tenant, which is the thing every earlier phase was building toward.
+//
+// Two traps live in these three lines, and this phase fell into both.
+//
+// The chart's values are nested under `platform.` — platform.name, platform.tenant,
+// platform.persona. rackctl used to pass bare `tenant=` and `persona=`, and never passed
+// platform.name at all. Helm accepts unknown --set paths silently, so those became three
+// orphan values no template reads, and the render died on the chart's own
+// `fail "platform.name is required"` guard before a single object was created. Silence is
+// why it survived: --set on a path nothing reads produces no warning, and the phase is
+// opt-in, so an install that never enabled a firstTenant looked entirely healthy.
+//
+// And a Platform never gets a `Ready` CONDITION. The operator reports readiness as
+// status.phase == "Ready" (that is what the CRD's printcolumn reads); the only conditions
+// it ever writes are Suspended, ModelAccessScoped, NamespaceReady and VClusterReady.
+// `kubectl wait --for=condition=Ready` therefore cannot ever be satisfied — it blocks for
+// the entire 15-minute timeout and then fails the phase against a tenant that came up
+// fine, which is the worst possible shape for a failure: the platform works, and the tool
+// that just built it says it does not.
 type smoke struct{ base }
 
 func (smoke) Run(ctx context.Context, st *engine.State) error {
 	ft := st.Config.FirstTenant
+	ns := tenantControlPlaneNamespace
 	st.Runner.Dir = st.Repos.AgentPlatform
-	note(st, "installing first tenant %q (persona=%s) from charts/tenant, then waiting for Ready", ft.Name, ft.Persona)
-	if err := st.Runner.Run(ctx, "helm", "upgrade", "--install", ft.Name, "charts/tenant",
-		"--set", "tenant="+ft.Tenant,
-		"--set", "persona="+ft.Persona,
-		"--set", fmt.Sprintf("budget.monthlyUsd=%d", ft.MonthlyBudgetUSD)); err != nil {
+
+	note(st, "vending first tenant %q (tenant=%s persona=%s, $%d/mo) from charts/tenant into %s",
+		ft.Name, ft.Tenant, ft.Persona, ft.MonthlyBudgetUSD, ns)
+	note(st, "this proves the vending + identity path only: charts/tenant emits displayName/persona/tenant/"+
+		"isolation/budget/identity.{allowedModelFamilies,extraPolicyArns}/compliance, and cannot express "+
+		"spec.datastores, spec.identity.capabilities or spec.identity.directSecretReads — so the tenant's AWS "+
+		"datastore and capability grants are not exercised here")
+
+	// The config's model boundary and compliance flags must reach the tenant, not just
+	// the operator's IAM. charts/tenant exposes exactly the matching paths, and passing
+	// neither would vend the first tenant against the chart's own defaults — so a config
+	// declaring `hipaa: true` or a narrowed model family would produce a Platform that
+	// silently contradicts it. Rendering a tenant that disagrees with the config that
+	// asked for it is the failure class this repo exists to kill, and it is worse here
+	// than anywhere: phase 9 is the run's proof that vending works.
+	args := []string{"upgrade", "--install", ft.Name, "charts/tenant",
+		"--namespace", ns,
+		"--set", "controlPlaneNamespace=" + ns,
+		"--set", "platform.name=" + ft.Name,
+		"--set", "platform.tenant=" + ft.Tenant,
+		"--set", "platform.persona=" + ft.Persona,
+		"--set", fmt.Sprintf("budget.monthlyUsd=%d", ft.MonthlyBudgetUSD),
+		"--set", fmt.Sprintf("platform.compliance.soc2=%t", st.Config.AgentPlatform.Compliance.SOC2),
+		"--set", fmt.Sprintf("platform.compliance.hipaa=%t", st.Config.AgentPlatform.Compliance.HIPAA),
+	}
+	// helm's --set parses commas as list separators, so a families list rides the
+	// {a,b} literal form rather than repeated --set calls.
+	if fams := st.Config.AgentPlatform.BedrockModelFamilies; len(fams) > 0 {
+		args = append(args, "--set", "identity.allowedModelFamilies={"+strings.Join(fams, ",")+"}")
+	}
+	if err := st.Runner.Run(ctx, "helm", args...); err != nil {
 		return err
 	}
-	return st.Runner.Run(ctx, "kubectl", "wait", "--for=condition=Ready",
-		"platform/"+ft.Name, "--timeout=15m")
+	return st.Runner.Run(ctx, "kubectl", "-n", ns, "wait",
+		"--for=jsonpath={.status.phase}=Ready", "platform/"+ft.Name, "--timeout=15m")
+}
+
+// Teardown removes the tenant BEFORE the substrate underneath it goes away.
+//
+// This is load-bearing, not tidiness. The engine tears completed phases down in reverse,
+// so deleting the Platform here happens while the operator is still running — which is
+// the only time its finalizer can drop the per-tenant IAM role. If that role survives,
+// the substrate phase's `terragrunt destroy` of agent-iam fails on DeleteConflict trying
+// to delete the tenant baseline policy the role attaches, and a teardown that cannot run
+// is how a half-built platform stays billing. Mirrors portal.Teardown.
+func (smoke) Teardown(ctx context.Context, st *engine.State) error {
+	return st.Runner.Run(ctx, "helm", "uninstall", st.Config.FirstTenant.Name,
+		"-n", tenantControlPlaneNamespace, "--ignore-not-found")
 }

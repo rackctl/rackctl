@@ -202,8 +202,6 @@ var destroyCmd = &cobra.Command{
 		// the cluster already gone. See reap.go.
 		reap.All(ctx, run, os.Stdout)
 
-		env := string(cfg.Environment)
-
 		// Force-delete the IAM roles the operator mints per Platform, in case its
 		// finalizer did not (a crashlooping or already-pruned operator, or one stuck on
 		// the node role). agent-iam destroys the tenant baseline policy those roles
@@ -224,22 +222,26 @@ var destroyCmd = &cobra.Command{
 		// billing. Runs BEFORE the components, unlike the volume sweep.
 		reap.OrphanedNodes(ctx, run, os.Stdout, cfg.ClusterName(), cfg.Cloud.Region)
 
+		// Reverse of the apply order, through the SAME helper the phases use.
+		//
+		// This loop used to restate terragrunt's init+destroy sequence and build its env from
+		// tgEnv alone — so a standalone `rackctl destroy` passed none of the per-component
+		// variables the apply had injected, and the cluster component fell back to its own
+		// default name while its fail-closed endpoint precondition had nothing to satisfy it.
+		// phases.Destroy owns both, so the two paths cannot drift.
+		//
+		// Every component is destroyed, with no exceptions. An earlier pass carved model-import
+		// out as account-scoped substrate that must survive; landing-zone has since scoped it by
+		// environment and given it a teardown posture (force_destroy unconditional in
+		// development, opt-in elsewhere via force_destroy_buckets), so the carve-out is gone.
+		// rackctl destroys everything it builds — if something must outlive a cluster, rackctl
+		// should not be the thing creating it.
+		st := &engine.State{Config: cfg, Runner: run, Repos: engine.RepoPaths(cfg.Org.Name)}
 		comps := phases.CoreComponents(cfg)
 		for i := len(comps) - 1; i >= 0; i-- {
 			c := comps[i]
 			fmt.Println(ui.Step("destroy " + c))
-			dir := fmt.Sprintf("live/aws/workload-%s/%s/%s/%s", env, cfg.Cloud.Region, env, c)
-			// init first — a destroy needs its modules installed exactly as much as an
-			// apply does. A stale .terragrunt-cache (it lives in the checkout and
-			// survives every run) makes tofu fail with "Module not installed" the moment
-			// a component gains a module, and a teardown that cannot run is how a
-			// half-built platform stays billing. See tg() in internal/phases.
-			if err := run.Run(ctx, "terragrunt", "--working-dir", dir,
-				"--non-interactive", "init"); err != nil {
-				return err
-			}
-			if err := run.Run(ctx, "terragrunt", "--working-dir", dir,
-				"--non-interactive", "destroy", "-auto-approve"); err != nil {
+			if err := phases.Destroy(ctx, st, c); err != nil {
 				return err
 			}
 		}

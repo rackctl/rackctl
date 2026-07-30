@@ -23,7 +23,7 @@ import (
 // Every other Application was Healthy. The AMG workspace was up. The token was valid.
 func TestTGEnv_PassesManagedMonitoringWhenObservabilityIsOn(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Addons.Observability = true
+	cfg.Observability.Tier = config.TierFull
 
 	if !slices.Contains(tgEnv(cfg), "TF_VAR_enable_managed_monitoring=true") {
 		t.Fatalf("observability is on, but cluster-bootstrap is not told — it will not stamp "+
@@ -39,7 +39,7 @@ func TestTGEnv_PassesManagedMonitoringWhenObservabilityIsOn(t *testing.T) {
 // different bug rather than a fix.
 func TestTGEnv_DoesNotClaimMonitoringWhenObservabilityIsOff(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Addons.Observability = false
+	cfg.Observability.Tier = config.TierFloor
 
 	if !slices.Contains(tgEnv(cfg), "TF_VAR_enable_managed_monitoring=false") {
 		t.Fatalf("observability is off — cluster-bootstrap must be told so, or its SSM read of "+
@@ -47,26 +47,52 @@ func TestTGEnv_DoesNotClaimMonitoringWhenObservabilityIsOff(t *testing.T) {
 	}
 }
 
-// The flag and the component must agree, always.
+// One tier field drives three things — whether managed-monitoring is applied, the tier
+// label, and the Grafana flag — and this asserts all three stay consistent for every tier.
 //
-// enable_managed_monitoring exists to say "managed-monitoring has already applied and
-// published its SSM parameters". CoreComponents is what decides whether that is true. If
-// the two ever disagree, cluster-bootstrap either reads a parameter that does not exist
-// (plan fails) or skips an annotation that should be stamped (dashboards go Degraded, and
-// nothing says why). Bind them here so they cannot drift.
-func TestTGEnv_MonitoringFlagAgreesWithCoreComponents(t *testing.T) {
-	for _, observability := range []bool{true, false} {
+// enable_managed_monitoring means "managed-monitoring has already applied and published its
+// SSM parameters", and CoreComponents is what decides whether that is true. If the two ever
+// disagree, cluster-bootstrap either reads a parameter that does not exist (plan fails) or
+// skips an annotation that should be stamped (dashboards go Degraded, and nothing says why).
+//
+// The label half is the one that bites hardest. cluster-bootstrap takes observability_tier
+// and enable_managed_monitoring as INDEPENDENT variables with nothing relating them, and
+// every committed leaf pins tier=full. So the old `addons.observability: false` set the flag
+// false, left the leaf's tier=full standing, and produced a cluster LABELLED full with no
+// AMP behind it — the tier-gated secret-stores ExternalSecret then looked for an AMP
+// endpoint that was never published and sat in permanent SecretSyncedError. Deriving both
+// from one field is what makes that unreachable.
+func TestTGEnv_TierDrivesTheComponentAndBothFlags(t *testing.T) {
+	for _, tc := range []struct {
+		tier       config.ObservabilityTier
+		wantMonito bool
+	}{
+		{config.TierFull, true},
+		{config.TierFloor, false},
+	} {
 		cfg := &config.Config{}
-		cfg.Addons.Observability = observability
+		cfg.Observability.Tier = tc.tier
+		env := tgEnv(cfg)
 
 		componentRuns := slices.Contains(phases.CoreComponents(cfg), "managed-monitoring")
-		flagSet := slices.Contains(tgEnv(cfg), "TF_VAR_enable_managed_monitoring=true")
+		flagSet := slices.Contains(env, "TF_VAR_enable_managed_monitoring=true")
 
+		if componentRuns != tc.wantMonito {
+			t.Errorf("tier=%s: CoreComponents applies managed-monitoring=%v, want %v",
+				tc.tier, componentRuns, tc.wantMonito)
+		}
 		if componentRuns != flagSet {
-			t.Errorf("observability=%v: CoreComponents runs managed-monitoring=%v but "+
+			t.Errorf("tier=%s: CoreComponents applies managed-monitoring=%v but "+
 				"TF_VAR_enable_managed_monitoring=%v — the flag means 'that component has run "+
 				"and published its SSM parameters', so these can never disagree",
-				observability, componentRuns, flagSet)
+				tc.tier, componentRuns, flagSet)
+		}
+		// The label must always be sent, and must always match the tier. A cluster whose
+		// label disagrees with its substrate is the SecretSyncedError case above; a cluster
+		// with a blank label matches no generator at all and gets the node agent only.
+		if want := "TF_VAR_observability_tier=" + string(tc.tier); !slices.Contains(env, want) {
+			t.Errorf("tier=%s: %q not injected — eight eks-gitops ApplicationSet generators "+
+				"select on this label; got %v", tc.tier, want, env)
 		}
 	}
 }
@@ -83,5 +109,20 @@ func TestTGEnv_PassesTheOrgsForkNotUpstream(t *testing.T) {
 	if !slices.Contains(env, "TF_VAR_gitops_repo_url=https://github.com/acme/eks-gitops.git") {
 		t.Fatalf("the org's fork must be passed to terragrunt, or app-of-apps syncs from "+
 			"upstream and the fork is inert.\ngot: %v", env)
+	}
+}
+
+// addons.accelerators must reach the label that makes it mean something. It was documented
+// in the shipped example config and read by nothing, so setting it produced a cluster with
+// no accelerator label and no GPU addons — the config said yes and the platform said nothing.
+func TestTGEnv_PassesTheAcceleratorLabel(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		cfg := &config.Config{}
+		cfg.Addons.Accelerators = on
+		want := "TF_VAR_enable_accelerators=" + map[bool]string{true: "true", false: "false"}[on]
+		if !slices.Contains(tgEnv(cfg), want) {
+			t.Errorf("accelerators=%v: %q not injected — without it the accelerators ApplicationSet "+
+				"never targets the cluster and the config knob is inert", on, want)
+		}
 	}
 }

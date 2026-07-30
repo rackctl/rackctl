@@ -48,10 +48,28 @@ quotas:
   autoRequest: true               # file L-1216C47A (EC2 vCPU) etc. before provisioning
   vcpu: 256
 
+observability:
+  tier: full                      # full | floor. Published as the observability/tier label on the ArgoCD cluster
+                                  # Secret; eight eks-gitops ApplicationSet generators select on it.
+                                  #   full  (default) — the in-cluster LGTM stack (Loki, Tempo, kube-state-metrics,
+                                  #                     grafana-operator) plus Amazon Managed Prometheus / Grafana.
+                                  #                     rackctl applies managed-monitoring, which is what publishes
+                                  #                     the AMP endpoint the tier-gated ExternalSecret reads.
+                                  #   floor           — CloudWatch only: ContainerInsights metrics plus the OTel
+                                  #                     gateway exporting EMF metrics and logs to CloudWatch Logs.
+                                  #                     No AMP/AMG cost.
+                                  # Both tiers run the OTel node agent and a gateway on the same endpoint, so a
+                                  # tenant chart is byte-identical across tiers — only the exporters differ.
+                                  # One field on purpose: the tier and managed-monitoring cannot be set to disagree,
+                                  # because a cluster labelled full with no AMP behind it sits in permanent
+                                  # SecretSyncedError.
+
 addons:
-  observability: true             # managed-monitoring (AMP+AMG)
-  druid: false
-  accelerators: false             # gpu-operator / neuron
+  druid: false                    # per-tenant analytics substrate (Aurora Serverless, optionally MSK). Real money;
+                                  # its live leaf carries its own tenant sizing map
+  accelerators: false             # label the cluster so the accelerators ApplicationSet (gpu-operator,
+                                  # nvidia-dra-driver) targets it. Leave false without GPU nodes — the driver
+                                  # cannot pull its image without an NGC key and has nothing to schedule on
 
 dns:
   hostedZone: acme.example.com
@@ -59,6 +77,18 @@ dns:
 agentPlatform:
   enable: true
   bedrockModelFamilies: [anthropic, amazon-nova]
+  modelImport: false            # off by default. Applies landing-zone's model-import component, which provisions
+                                # ONLY the Bedrock Custom Model Import substrate for this environment: the S3
+                                # staging bucket <environment>-<account>-<region>-model-import, the import service
+                                # role model-import-<environment>-<region>, and the SSM discovery parameters
+                                # /eks-agent-platform/<environment>/model-import/{staging_bucket_name,import_role_arn}.
+                                # It imports NO model — that is a deliberate, infrequent, out-of-band human act
+                                # (eks-agent-platform/docs/runbooks/import-open-weight-model.md). Requires
+                                # agentPlatform.enable and a region where Custom Model Import runs (us-west-2,
+                                # us-east-1, us-east-2, eu-central-1); rackctl rejects the rest at validation,
+                                # because the component applies cleanly elsewhere and is silently unusable.
+                                # Destroyed with everything else — landing-zone scopes it by environment and gives
+                                # it a teardown posture, so nothing here outlives its cluster.
   compliance:
     soc2: true
     hipaa: false
@@ -67,7 +97,12 @@ controlPlane:
   eksFleet: false                 # opt-in: Crossplane cluster control plane
   portal: false                   # opt-in: day-2 operator UI
 
-firstTenant:                      # optional smoke test
+firstTenant:                      # optional smoke test (phase 9). Vends this tenant from
+                                  # eks-agent-platform/charts/tenant into the eks-agent-platform namespace and
+                                  # waits for status.phase: Ready. It proves the vending + identity path only —
+                                  # charts/tenant cannot express spec.datastores, spec.identity.capabilities or
+                                  # spec.identity.directSecretReads, which is where a tenant's AWS grants now
+                                  # come from.
   name: blank
   persona: generic
   tenant: example
