@@ -126,3 +126,56 @@ func TestTGEnv_PassesTheAcceleratorLabel(t *testing.T) {
 		}
 	}
 }
+
+// enable_agent_platform must track agentPlatform.enable. Without it, agentPlatform.enable:
+// false still leaves cluster-bootstrap's default true, so ArgoCD installs an operator whose
+// IAM role was never created (agent-iam is also skipped). The flag and the component gate
+// have to agree.
+func TestTGEnv_AgentPlatformFlagTracksTheConfig(t *testing.T) {
+	for _, tc := range []struct {
+		enable *bool
+		want   string
+	}{
+		{nil, "TF_VAR_enable_agent_platform=true"}, // omitted = on
+		{boolPtr(true), "TF_VAR_enable_agent_platform=true"},
+		{boolPtr(false), "TF_VAR_enable_agent_platform=false"},
+	} {
+		cfg := &config.Config{}
+		cfg.AgentPlatform.Enable = tc.enable
+		if !slices.Contains(tgEnv(cfg), tc.want) {
+			t.Errorf("enable=%v: want %q in tgEnv, got %v", tc.enable, tc.want, tgEnv(cfg))
+		}
+	}
+}
+
+// enable_external_dns must track whether the dns component is applied. Every committed
+// workload leaf pins it true and the development leaf depends on dns — a config with no
+// dns: block fails cluster-bootstrap on a missing SSM parameter without this override.
+func TestTGEnv_ExternalDNSTracksTheDNSBlock(t *testing.T) {
+	off := &config.Config{}
+	if !slices.Contains(tgEnv(off), "TF_VAR_enable_external_dns=false") {
+		t.Fatalf("no dns block: enable_external_dns must be false, or the leaf's true fails the "+
+			"SSM read. got %v", tgEnv(off))
+	}
+
+	on := &config.Config{DNS: &config.DNS{HostedZone: "acme.example.com"}}
+	if !slices.Contains(tgEnv(on), "TF_VAR_enable_external_dns=true") {
+		t.Fatalf("dns block set: enable_external_dns must be true. got %v", tgEnv(on))
+	}
+}
+
+// enable_portal_reader follows controlPlane.portal so a portal-enabled install actually
+// gets the reader SA. Leaving it at the leaf default (false) made the portal knob inert.
+func TestTGEnv_PortalReaderTracksThePortalFlag(t *testing.T) {
+	off := &config.Config{}
+	if !slices.Contains(tgEnv(off), "TF_VAR_enable_portal_reader=false") {
+		t.Fatalf("portal off: enable_portal_reader must be false. got %v", tgEnv(off))
+	}
+	on := &config.Config{}
+	on.ControlPlane.Portal = true
+	if !slices.Contains(tgEnv(on), "TF_VAR_enable_portal_reader=true") {
+		t.Fatalf("portal on: enable_portal_reader must be true. got %v", tgEnv(on))
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }

@@ -71,29 +71,59 @@ func TestKubectlWaits_OnlyNameConditionsSomethingWrites(t *testing.T) {
 			t.Fatalf("parse %s: %v", name, err)
 		}
 		scanned++
+		// Walk CallExprs, not individual string lits. A wait is almost always split across
+		// several args (`"wait", "--for=condition=Healthy", "provider/…"`), and the resource
+		// kind is what decides whether Healthy is the ArgoCD trap or a real Crossplane
+		// condition. Joining every string arg in the call is what makes that distinction.
 		ast.Inspect(file, func(n ast.Node) bool {
-			lit, ok := n.(*ast.BasicLit)
-			if !ok || lit.Kind != token.STRING {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
 				return true
 			}
-			val, err := strconv.Unquote(lit.Value)
-			if err != nil {
+			var parts []string
+			var pos token.Pos
+			for _, a := range call.Args {
+				lit, ok := a.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				val, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					continue
+				}
+				if pos == 0 {
+					pos = lit.Pos()
+				}
+				parts = append(parts, val)
+			}
+			if len(parts) == 0 {
 				return true
 			}
-			for _, m := range re.FindAllStringSubmatch(val, -1) {
+			joined := strings.Join(parts, " ")
+			if !strings.Contains(joined, "kubectl") && !strings.Contains(joined, "wait") {
+				// Still scan: Run(ctx, "kubectl", …) puts kubectl in an arg, not the fun.
+			}
+			for _, m := range re.FindAllStringSubmatch(joined, -1) {
 				cond := m[1]
 				if _, ok := allowed[cond]; ok {
 					continue
 				}
-				pos := fset.Position(lit.Pos())
+				// Crossplane's package controller writes Healthy on Provider packages.
+				// Accept only when the same call names a provider resource, so an
+				// Application wait cannot smuggle Healthy back in.
+				if cond == "Healthy" && (strings.Contains(joined, "provider/") ||
+					strings.Contains(joined, "provider.pkg.crossplane.io")) {
+					continue
+				}
+				p := fset.Position(pos)
 				if why, bad := notConditions[cond]; bad {
 					t.Errorf("%s:%d waits on --for=condition=%s, which nothing writes: %s",
-						name, pos.Line, cond, why)
+						name, p.Line, cond, why)
 					continue
 				}
 				t.Errorf("%s:%d waits on --for=condition=%s, which is not in this test's allow-list. "+
 					"Before adding it, name the controller that writes that condition — if none does, "+
-					"the wait can never be satisfied and will hang until its timeout.", name, pos.Line, cond)
+					"the wait can never be satisfied and will hang until its timeout.", name, p.Line, cond)
 			}
 			return true
 		})

@@ -12,6 +12,45 @@ func valid() *Config {
 	return c
 }
 
+// Default() pins the same cluster_version landing-zone does, so a config that trusts the
+// example is not silently lying about which Kubernetes the leaf will install.
+func TestDefault_ClusterVersionMatchesLandingZone(t *testing.T) {
+	if got := Default().Cluster.Version; got != "1.36" {
+		t.Fatalf("Default().Cluster.Version = %q, want 1.36 — landing-zone's cluster_version default", got)
+	}
+}
+
+// TenantsGitSSHURL is what cluster-bootstrap's tenants_repo_url wants. Bare, https and
+// already-SSH forms all land on git@github.com:… so the deploy-key wiring parses them.
+func TestTenantsGitSSHURL(t *testing.T) {
+	cases := map[string]string{
+		"":                                    "",
+		"github.com/acme/tenants":             "git@github.com:acme/tenants.git",
+		"https://github.com/acme/tenants.git": "git@github.com:acme/tenants.git",
+		"git@github.com:acme/tenants.git":     "git@github.com:acme/tenants.git",
+	}
+	for in, want := range cases {
+		got := OrgGitOps{TenantsRepo: in}.TenantsGitSSHURL()
+		if got != want {
+			t.Errorf("TenantsGitSSHURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// BedrockModelIDGlobs maps the config's family names onto agent-iam's IAM globs. The
+// default families must produce landing-zone's own default so a default-valued config
+// injects nothing.
+func TestBedrockModelIDGlobs(t *testing.T) {
+	got := Default().AgentPlatform.BedrockModelIDGlobs()
+	want := []string{"anthropic.*", "amazon.nova-*"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("Default globs = %v, want %v — must match agent-iam's default so we inject nothing", got, want)
+	}
+	if g := (AgentPlatform{BedrockModelFamilies: []string{"anthropic"}}).BedrockModelIDGlobs(); len(g) != 1 || g[0] != "anthropic.*" {
+		t.Fatalf("anthropic → anthropic.*, got %v", g)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	if err := valid().Validate(); err != nil {
 		t.Fatalf("valid config errored: %v", err)
@@ -45,6 +84,8 @@ func TestValidate(t *testing.T) {
 			c.AgentPlatform.ModelImport = true
 			c.AgentPlatform.Enable = boolPtr(false)
 		},
+		"cluster.version with a patch component": func(c *Config) { c.Cluster.Version = "1.36.2" },
+		"cluster.version with a leading v":       func(c *Config) { c.Cluster.Version = "v1.36" },
 	}
 	for name, mutate := range cases {
 		c := valid()

@@ -11,22 +11,19 @@ cloud:
   accountId: "111111111111"
   region: us-west-2
   profile: workload-development  # AWS SSO profile
-  identityCenter:
-    manage: true
-    adminUser: jane-admin
 
 environment: development         # development | staging | production
 
 cluster:
   name: platform                 # cluster base; the EKS cluster is <environment>-<name> (development-platform). Required, unique per account+env, must != environment
-  version: "1.35"
+  version: "1.36"                # Kubernetes major.minor. Matches landing-zone's default. Injected as TF_VAR_cluster_version ONLY when it differs from this default — an ambient TF_VAR would otherwise silently override a leaf that pins a different version
   endpointPublicAccess: true     # prod MUST be false (needs bastion/VPN). landing-zone is private-by-default; rackctl supplies this posture at apply time
   endpointAllowlist: []          # CIDRs allowed to reach the public API endpoint. Empty + public => rackctl auto-detects this host's egress IP as <ip>/32 (never 0.0.0.0/0). Explicit entries win, e.g. [203.0.113.4/32]
   systemNodes:
     instanceTypes: [m7g.xlarge]
     minSize: 2
     maxSize: 6
-    desiredSize: 2
+    desiredSize: 2               # injected as system_node_* ONLY when any field differs from these defaults, so staging/production leaf pins stand
   network:
     mode: create                  # create (default) | adopt
                                   #   create — this platform owns its VPC: builds the VPC, subnets, endpoints,
@@ -44,10 +41,12 @@ cluster:
                                   # a VPC this platform does not own, so overriding them changes nothing real.
     vpcCidr: 10.0.0.0/16          # create mode only. The DEFAULT shown here is accepted under adopt — it is the
                                   # sentinel for "not overridden", so adopt does not make you delete this line — but
-                                  # any OTHER value is rejected there, because an adopted VPC's CIDR is the owner's
+                                  # any OTHER value is rejected there, because an adopted VPC's CIDR is the owner's.
+                                  # Injected as TF_VAR_vpc_cidr only when it differs from this default.
     natGateways: 1                # create mode only; 1 (shared NAT) or equal to the AZ count (per-AZ HA).
-                                  # NOTE rackctl does not inject this — staging and production pin 3 in their own
-                                  # leaves for per-AZ redundancy, and an injected TF_VAR would silently override it
+                                  # Injected as TF_VAR_nat_gateways ONLY when it differs from 1 — staging and
+                                  # production pin 3 in their own leaves for per-AZ redundancy, and an injected
+                                  # default would silently downgrade them.
     # --- adopt mode ----------------------------------------------------------------------
     # Required when mode: adopt, rejected under create. rackctl validates the shape up front
     # (ids well-formed, no subnet in both tiers, at least 3 distinct private subnets for the
@@ -62,7 +61,7 @@ cluster:
     #                                                                 # an internet-facing Service/Ingress will
     #                                                                 # NOT provision, because the Kyverno rule
     #                                                                 # that injects LB subnets needs a non-empty
-    #                                                                 # public list
+    #                                                                 # public list (from the network-config ConfigMap)
     #
     # --- create-mode levers ---------------------------------------------------------------
     # All off by default, and all rejected under adopt. These ride TF_VAR_* onto
@@ -76,7 +75,6 @@ cluster:
     # ipamNetmaskLength: 18           # netmask of the CIDR carved from the pool, 16–20 (required with ipamPoolId; subnets carve 8 bits smaller, so /20 is the smallest that clears AWS's /28 minimum)
     # transitGatewayId: tgw-0abc123   # attach the VPC to a transit gateway (10.0.0.0/8 → TGW); requires an IPAM-allocated CIDR so prefixes never overlap
     # centralizedEgress: true         # private default route via the TGW to a central egress VPC, zero local NAT gateways; requires transitGatewayId
-  ttlDays: 0                      # eks-fleet auto-reap; 0 = persistent
 
 quotas:
   autoRequest: true               # file L-1216C47A (EC2 vCPU) etc. before provisioning
@@ -101,19 +99,13 @@ observability:
 
 addons:
   druid: false                    # per-tenant analytics substrate (Aurora Serverless, optionally MSK). Real money;
-                                  # its live leaf carries its own tenant sizing map.
-                                  #
-                                  # WARNING: turning this on makes the cluster impossible to tear down cleanly, in
-                                  # EVERY environment including development. druid's Aurora cluster cannot be
-                                  # destroyed by terraform — its module sets no final-snapshot identifier and the
-                                  # `tenants` input cannot supply one — and its three per-tenant buckets have no
-                                  # force-destroy escape, with deepstorage never empty on a working cluster.
-                                  # `rackctl destroy` halts there while the VPC, NAT gateways and control plane keep
-                                  # billing, until Aurora is cleared by hand. This is a landing-zone limitation and
-                                  # a fix is filed; every other component rackctl applies, it also destroys.
+                                  # its live leaf carries its own tenant sizing map. Applied when true; lives under
+                                  # every workload environment. Teardown outside development needs the two-act
+                                  # force_destroy_buckets path (target 11) — development always allows it.
   accelerators: false             # label the cluster so the accelerators ApplicationSet (gpu-operator,
-                                  # nvidia-dra-driver) targets it. Leave false without GPU nodes — the driver
-                                  # cannot pull its image without an NGC key and has nothing to schedule on
+                                  # nvidia-dra-driver) targets it. Rides TF_VAR_enable_accelerators. Leave false
+                                  # without GPU nodes — the driver cannot pull its image without an NGC key and has
+                                  # nothing to schedule on
 
 dns:
   hostedZone: acme.example.com   # the zone this platform owns. Applies landing-zone's dns component, which creates
@@ -121,9 +113,12 @@ dns:
                                  # /eks-agent-platform/<environment>/dns/domain_filter, and requests one wildcard
                                  # ACM certificate for *.<zone> (SAN <zone>).
                                  #
-                                 # Omit the block entirely to skip DNS: nothing creates a zone and external-dns is
-                                 # left out. Every committed dns leaf pins a *.example.com placeholder in its own
-                                 # inputs, so this value is what makes the component operate on a real domain.
+                                 # Omit the block entirely to skip DNS: nothing creates a zone, and rackctl sets
+                                 # enable_external_dns=false so cluster-bootstrap does not try to read the missing
+                                 # SSM parameter (every committed leaf pins that flag true).
+                                 #
+                                 # Every committed dns leaf pins a *.example.com placeholder in its own inputs, so
+                                 # this value is what makes the component operate on a real domain.
                                  #
                                  # rackctl does NOT wait for the certificate to validate, and cannot: this apply is
                                  # creating the zone, so the registrar's NS records still point wherever they pointed
@@ -132,8 +127,12 @@ dns:
                                  # — ACM retries for 72 hours and the validation record is already in the zone.
 
 agentPlatform:
-  enable: true
-  bedrockModelFamilies: [anthropic, amazon-nova]
+  enable: true                    # rides TF_VAR_enable_agent_platform. false also skips agent-iam, so the two stay
+                                  # consistent: no operator without its IAM role, no IAM role without an operator
+  bedrockModelFamilies: [anthropic, amazon-nova]  # maps to agent-iam's bedrock_allowed_model_ids (anthropic.*,
+                                                  # amazon.nova-*). Injected only when the list differs from this
+                                                  # default, so narrowing the config also narrows the IAM baseline
+                                                  # rather than only the tenant CR
   modelImport: false            # off by default. Applies landing-zone's model-import component, which provisions
                                 # ONLY the Bedrock Custom Model Import substrate for this environment: the S3
                                 # staging bucket <environment>-<account>-<region>-model-import, the import service
