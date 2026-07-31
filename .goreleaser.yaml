@@ -46,3 +46,16 @@ release:
   github:
     owner: rackctl
     name: rackctl
+  # scripts/install.sh resolves the version from /releases/latest, which GitHub
+  # never answers with a prerelease. Without this, goreleaser defaults to
+  # prerelease=false and make_latest=true, so ANY tag — including a throwaway
+  # like v0.0.0-rc1 — becomes "Latest" and `curl rackctl.sh/install | sh` starts
+  # serving it. `auto` marks a tag as a prerelease when it carries a prerelease
+  # identifier, so suffixed tags can never displace the real release.
+  prerelease: auto
+  # Belt and braces on the same failure, via a different mechanism: .Prerelease
+  # is read straight off the tag's semver, not from the setting above, so this
+  # still holds if `auto` ever stops detecting. Two independent guards, because
+  # the blast radius is every `curl rackctl.sh/install | sh` until someone
+  # notices.
+  make_latest: '{{ if .Prerelease }}false{{ else }}true{{ end }}'
