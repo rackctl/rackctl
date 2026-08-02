@@ -62,10 +62,15 @@ func fail(n, d string) doctor.Result { return doctor.Result{Name: n, Status: doc
 func Run(ctx context.Context, env *Env) []doctor.Result {
 	return []doctor.Result{
 		CheckIdentity(ctx, env),
+		CheckSessionLifetime(ctx, env),
 		CheckQuota(ctx, env),
 		CheckStaleState(ctx, env),
 		CheckCollisions(ctx, env),
+		CheckBucketNames(ctx, env),
+		CheckHostedZone(ctx, env),
+		CheckBedrockLogging(ctx, env),
 		CheckSoftDeletedSecrets(ctx, env),
+		CheckCostAllocationTags(ctx, env),
 		CheckCatalogFork(ctx, env),
 		CheckGitHubToken(ctx, env),
 		CheckVendFreshness(ctx, env),
