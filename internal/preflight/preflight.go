@@ -64,6 +64,7 @@ func Run(ctx context.Context, env *Env) []doctor.Result {
 		CheckIdentity(ctx, env),
 		CheckSessionLifetime(ctx, env),
 		CheckQuota(ctx, env),
+		CheckVersionSkew(ctx, env),
 		CheckStaleState(ctx, env),
 		CheckCollisions(ctx, env),
 		CheckBucketNames(ctx, env),

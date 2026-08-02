@@ -65,7 +65,7 @@ func TestRun_EveryCheckIsRegistered(t *testing.T) {
 		names = append(names, r.Name)
 	}
 	for _, want := range []string{
-		"aws identity", "session lifetime", "vcpu quota", "terraform state",
+		"aws identity", "session lifetime", "vcpu quota", "version skew", "terraform state",
 		"orphan collisions", "bucket names", "hosted zone", "bedrock logging",
 		"soft-deleted secrets", "cost allocation", "catalog fork", "github token",
 		"local vend",

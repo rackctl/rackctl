@@ -23,11 +23,9 @@ curl -fsSL rackctl.com/install | sh
 rackctl plan     -c rackctl.yaml          # what a provision would do (read-only)
 rackctl apply    -c rackctl.yaml          # provision for real
 rackctl apply    -c rackctl.yaml --tui    # interactive progress view
-rackctl preflight -c rackctl.yaml         # "would this install succeed?" (rackctl apply runs it as a gate)
-rackctl doctor                            # check tools + cluster/ArgoCD health
+rackctl check    -c rackctl.yaml          # can this install succeed, and is a running one healthy
 rackctl destroy  -c rackctl.yaml --apply  # reverse-order teardown
 rackctl destroy  -c rackctl.yaml --apply --force-buckets  # ...also emptying non-emptyable buckets
-rackctl upgrade  -c rackctl.yaml          # bump the catalog + operator
 ```
 
 See [`examples/rackctl.yaml`](examples/rackctl.yaml) for the full config surface.
@@ -97,7 +95,7 @@ internal/
   exec/         dry-run-aware tool runner (tofu/terragrunt/kubectl/helm/aws/gh)
   engine/       phase interface + pipeline + teardown + events
   phases/       the 10 bootstrap phases (footgun guards encoded)
-  preflight/    "would this install succeed?" checks; gates `rackctl apply`
+  preflight/    "would this install succeed?" checks; gates `rackctl apply`, surfaced by `check`
   doctor/       day-2 health checks (tools, cluster, ArgoCD, wedged finalizers)
   reap/         sweeps what Terraform does not own (operator IAM roles, PVCs, nodes, volumes)
   gitops/       catalog account-id writeback
