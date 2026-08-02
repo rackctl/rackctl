@@ -65,8 +65,10 @@ func TestRun_EveryCheckIsRegistered(t *testing.T) {
 		names = append(names, r.Name)
 	}
 	for _, want := range []string{
-		"aws identity", "vcpu quota", "terraform state", "orphan collisions",
-		"soft-deleted secrets", "catalog fork", "github token", "local vend",
+		"aws identity", "session lifetime", "vcpu quota", "terraform state",
+		"orphan collisions", "bucket names", "hosted zone", "bedrock logging",
+		"soft-deleted secrets", "cost allocation", "catalog fork", "github token",
+		"local vend",
 	} {
 		if !slices.Contains(names, want) {
 			t.Errorf("check %q is not registered in Run() — it would never execute; got %v", want, names)
