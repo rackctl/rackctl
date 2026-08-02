@@ -57,7 +57,7 @@ func TestAssertComponentRoots_AllPresentPasses(t *testing.T) {
 //
 // agent-iam is appended to CoreComponents BY DEFAULT (AgentPlatform.Enable nil means
 // enabled) but landing-zone carries a live root for it only under workload-development.
-// Without this guard a `rackctl init --apply` with environment: staging builds a VPC and
+// Without this guard a `rackctl apply` with environment: staging builds a VPC and
 // an EKS control plane in the cluster phase, then hits a path that does not exist in the
 // substrate phase — and clean-on-failure destroys both. The guard turns that into a
 // one-second error, one phase after the clone and before anything is provisioned.

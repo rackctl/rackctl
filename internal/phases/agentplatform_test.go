@@ -257,7 +257,7 @@ func TestApplyAgentPlatform_RestoresTheRunnerEnvAndDir(t *testing.T) {
 // A dry-run must PLAN, never fail — and this one nearly shipped failing.
 //
 // captureOutputs returns immediately without --apply, so on the plan path every landing-zone
-// output is absent. needOutput's strict check then turned an ordinary `rackctl init` into a
+// output is absent. needOutput's strict check then turned an ordinary `rackctl apply` into a
 // phase failure, which CleanOnFail escalated into a full rollback sweep. A plan that cannot
 // run is worse than useless: it is the one command an operator runs to find out whether the
 // real one will work.

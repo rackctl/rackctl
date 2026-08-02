@@ -145,7 +145,7 @@ esac
 exit 0`)
 
 	r := CheckStaleState(context.Background(), testEnv())
-	mustFail(t, r, "rackctl destroy --apply")
+	mustFail(t, r, "rackctl destroy")
 }
 
 // The remedy must be DESTROY-then-maybe-purge, never purge-first.

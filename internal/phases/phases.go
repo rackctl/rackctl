@@ -770,7 +770,7 @@ func (gitopsPhase) Run(ctx context.Context, st *engine.State) error {
 		// operator could have fixed in ten seconds and re-run.
 		return &engine.NoRollbackError{Err: fmt.Errorf(
 			"installing ArgoCD failed. The cloud IS provisioned and the cluster is left "+
-				"standing — fix the cause and re-run `rackctl init` (it is re-runnable), or "+
+				"standing — fix the cause and re-run `rackctl apply` (it is re-runnable), or "+
 				"`rackctl destroy` if you want it gone: %w", err)}
 	}
 

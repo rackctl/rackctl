@@ -47,7 +47,7 @@ case "$1 $2" in
   *) exit 1 ;;
 esac`)
 	r := CheckBucketNames(context.Background(), testEnv())
-	mustFail(t, r, "rackctl destroy --apply")
+	mustFail(t, r, "rackctl destroy")
 	if !strings.Contains(r.Detail, "velero") {
 		t.Errorf("the failure must name the bucket and its component:\n%s", r.Detail)
 	}
