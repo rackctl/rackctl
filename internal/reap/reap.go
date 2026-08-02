@@ -27,6 +27,7 @@ package reap
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -126,6 +127,10 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 type execer interface {
 	Run(ctx context.Context, name string, args ...string) error
 	Capture(ctx context.Context, name string, args ...string) (string, error)
+	// Query is the read-only half. It executes even in dry-run, which is what lets a
+	// dry-run of a sweep DEMONSTRATE what it would select instead of describing its own
+	// filter. See exec.Runner.Query.
+	Query(ctx context.Context, name string, args ...string) (string, error)
 }
 
 // OperatorRoles force-deletes the IAM roles the eks-agent-platform operator mints per
@@ -184,11 +189,18 @@ type execer interface {
 // matches `dev-plat-gpu`'s roles, because `dev-plat-` prefixes `dev-plat-gpu-web-tenant`. No
 // filter over names alone can fix it — cluster `dev-hub` + platform `gpu-web` and cluster
 // `dev-hub-gpu` + platform `web` compose the identical role name, and the operator's role
-// tags carry PlatformId, Tenant and Environment but no cluster key. Closing it properly means
-// intersecting these candidates with `kubectl get platforms` when the cluster is reachable,
-// which costs this function its deliberate "needs no reachable cluster" property. Until then:
-// do not name two co-located clusters where one base name is a hyphen-prefix of the other.
-// config.Validate cannot catch that — it sees one cluster at a time.
+// tags carry PlatformId, Tenant and Environment but no cluster key. The ownership check below
+// does NOT close this one: both clusters' roles are genuinely ours, so a tag that proves
+// "belongs to this org" is satisfied by both. Closing it properly means intersecting these
+// candidates with `kubectl get platforms` when the cluster is reachable, which costs this
+// function its deliberate "needs no reachable cluster" property. Until then: do not name two
+// co-located clusters where one base name is a hyphen-prefix of the other. config.Validate
+// cannot catch that — it sees one cluster at a time.
+//
+// What the ownership check DOES close is the other half, and in a shared account it is the
+// half that matters: a role at this path whose name happens to start with this cluster's name
+// but which this run did not create. Nothing prevented that before — the sweep force-deleted
+// on the strength of a path and a string prefix.
 //
 // One class of operator-minted role is NOT covered: the eventBridgeScheduler capability
 // mints `<cluster>-<platform>-scheduler-invoke` at the ROOT path with no Path set
@@ -203,46 +215,120 @@ type execer interface {
 // is the tag sweep — 0546a92 tags these roles so a compromise sweep can pick them out of
 // the root path (platform_capability_policy.go:315-322) — or accepting that the finalizer
 // owns the delete, which it does whenever the operator is healthy.
-func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer, cluster string) {
-	reapOperatorRoles(ctx, run, run.DryRun, out, cluster)
+// A third filter now sits after those two, and it is the one that makes the sweep provable
+// rather than merely narrow: every candidate's TAGS must establish that it is ours.
+//
+// The path and the name are both structural guesses. The path says "something put this under
+// the operator's prefix"; the name says "something named this for our cluster". Neither is a
+// statement by the resource itself, and the name filter is a documented prefix match with a
+// known collision (see below). In an account holding one estate that is enough, because there
+// is nothing else it could be. This is not that account: it holds three estates, two of which
+// tag with an identical Project value, so "it looks like ours" and "it is ours" have come
+// apart. Owner.Proves closes that gap — see own.go for why Repository is the only key that
+// can. A candidate that cannot be proved is REPORTED and SKIPPED, never deleted.
+//
+// Skipping has a cost and it is named in the output: an operator-minted role that survives is
+// exactly what makes agent-iam fail on DeleteConflict, so a skip predicts the teardown failure
+// it declines to prevent. That is the correct trade. Force-deleting an untagged IAM role
+// because its name matched is how a teardown reaches outside itself, and IAM is global — no
+// region protects anything here.
+func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer, own Owner) {
+	reapOperatorRoles(ctx, run, run.DryRun, out, own)
 }
 
-func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster string) {
+func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writer, own Owner) {
 	const pathPrefix = "/eks-agent-platform/tenants/"
-	if dryRun {
-		fmt.Fprintln(out, ui.Step("force-delete operator-minted IAM roles under "+pathPrefix+
-			" named "+cluster+"-* (agent-iam DeleteConflict backstop)"))
-		return
-	}
 
 	// A blank cluster name would make the prefix filter below match everything, turning the
 	// scoping this function documents into an account-wide sweep. There is no cluster whose
 	// roles could be named for it, so there is nothing to reap.
-	if cluster == "" {
+	if own.Cluster == "" {
 		return
 	}
 
+	if dryRun {
+		fmt.Fprintln(out, ui.Step("force-delete operator-minted IAM roles under "+pathPrefix+
+			" named "+own.Cluster+"-* whose tags prove they are "+own.Org+"'s (agent-iam DeleteConflict backstop)"))
+	}
+
+	// Enumeration runs in dry-run too, and the line above is why that is an addition rather
+	// than a replacement. Stating the filter is worth doing — it is how an operator checks the
+	// scoping is what they expect. But it is a description of intent, and a description cannot
+	// be wrong in a way anyone notices. The dry-run used to stop there, so the one question a
+	// dry-run of a destructive sweep exists to answer — what would this actually select? — was
+	// answered by restating the filter back.
+	//
+	// Now it says what it will do and then does the read-only half for real, so
+	// `rackctl destroy` without --apply can be pointed at a live account and SHOWN to select
+	// nothing pre-existing. That is a negative test rather than a promise.
+	//
 	// --path-prefix is a server-side filter and the CLI auto-paginates, so this returns
 	// every matching role regardless of how many Platforms existed.
-	names, err := run.Capture(ctx, "aws", "iam", "list-roles",
+	names, err := run.Query(ctx, "aws", "iam", "list-roles",
 		"--path-prefix", pathPrefix,
 		"--query", "Roles[].RoleName", "--output", "text")
 	if err != nil {
-		return // no credentials, or IAM unreachable — not a teardown failure
+		// Still not a teardown failure — a teardown must work against an account it cannot
+		// fully reach. But it is no longer SILENT, and the difference is the point: "there are
+		// no roles" and "I could not find out whether there are roles" are opposite facts, and
+		// the old code rendered both as an empty line. An operator reading a clean teardown had
+		// no way to tell which one they got.
+		fmt.Fprintln(out, ui.Warn("could not enumerate IAM roles under "+pathPrefix+
+			" ("+err.Error()+") — this backstop did NOT run. If agent-iam fails on DeleteConflict, "+
+			"an operator-minted role is still there."))
+		return
 	}
-	var roles []string
+	var candidates []string
 	for _, name := range strings.Fields(strings.TrimSpace(names)) {
-		if strings.HasPrefix(name, cluster+"-") {
-			roles = append(roles, name)
+		if strings.HasPrefix(name, own.Cluster+"-") {
+			candidates = append(candidates, name)
 		}
 	}
-	if len(roles) == 0 {
+	if len(candidates) == 0 {
+		if dryRun {
+			fmt.Fprintln(out, ui.OK("no IAM roles under "+pathPrefix+" named "+own.Cluster+
+				"-* — this sweep selects nothing"))
+		}
+		return
+	}
+
+	var owned, refused []string
+	for _, name := range candidates {
+		tags, err := roleTags(ctx, run, name)
+		if err != nil {
+			refused = append(refused, name+" — could not read its tags ("+err.Error()+"), so ownership is unknown")
+			continue
+		}
+		if ok, why := own.Proves(tags); !ok {
+			refused = append(refused, name+" — "+why)
+			continue
+		}
+		owned = append(owned, name)
+	}
+
+	for _, r := range refused {
+		fmt.Fprintln(out, ui.Warn("REFUSING to delete IAM role "+r))
+	}
+	if len(refused) > 0 {
+		fmt.Fprintln(out, ui.Warn(fmt.Sprintf(
+			"%d role(s) matched this cluster's name under %s but could not be proved to belong to "+
+				"this run, so they were left alone. If agent-iam now fails on DeleteConflict, one of "+
+				"them is why — check its tags and remove it deliberately.", len(refused), pathPrefix)))
+	}
+	if len(owned) == 0 {
+		return
+	}
+
+	if dryRun {
+		fmt.Fprintln(out, ui.Step(fmt.Sprintf(
+			"(dry-run) would force-delete %d operator-minted IAM role(s): %s",
+			len(owned), strings.Join(owned, ", "))))
 		return
 	}
 
 	fmt.Fprintln(out, ui.Step(fmt.Sprintf(
-		"force-deleting %d operator-minted IAM role(s) a finalizer left behind (agent-iam would else fail on DeleteConflict)", len(roles))))
-	for _, name := range roles {
+		"force-deleting %d operator-minted IAM role(s) a finalizer left behind (agent-iam would else fail on DeleteConflict)", len(owned))))
+	for _, name := range owned {
 		if err := forceDeleteRole(ctx, run, name); err != nil {
 			fmt.Fprintln(out, ui.Fail(
 				"could not delete "+name+" — agent-iam may still fail on DeleteConflict: "+err.Error()))
@@ -376,27 +462,48 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 // The filter is exact rather than heuristic: Karpenter stamps every instance it launches
 // with karpenter.sh/managed-by=<cluster-name>. No instance carrying that tag belongs to
 // anything else, so this cannot touch a node the operator did not ask for.
+// The tag is a statement by the resource about which cluster owns it, which is a stronger
+// proof than the Repository check own.go applies elsewhere: Repository proves "ours", this
+// proves "ours AND this cluster's". So no additional ownership check is layered on here —
+// requiring a second tag would only add a way for the sweep to MISS, and a missed instance
+// wedges the teardown on DependencyViolation with the cluster already gone.
+//
+// Enumeration runs in dry-run so the selection can be shown rather than described.
 func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
-	if run.DryRun {
-		fmt.Fprintln(out, ui.Step("terminate EC2 instances Karpenter launched for "+cluster))
+	if cluster == "" {
 		return
 	}
-
-	ids, err := run.Capture(ctx, "aws", "ec2", "describe-instances",
+	ids, err := run.Query(ctx, "aws", "ec2", "describe-instances",
 		"--region", region,
 		"--filters",
 		"Name=instance-state-name,Values=running,pending,stopping,stopped",
 		"Name=tag:karpenter.sh/managed-by,Values="+cluster,
 		"--query", "Reservations[].Instances[].InstanceId", "--output", "text")
 	if err != nil {
-		return // no credentials, no region — not a teardown failure
+		// Loud, for the same reason as the IAM sweep: an instance this misses holds the node
+		// security group, and terraform cannot delete a security group that is in use. The
+		// teardown then stops with the cluster gone and the instance billing. An operator who
+		// was told the check did not run can look; one told nothing cannot.
+		fmt.Fprintln(out, ui.Warn("could not enumerate Karpenter instances for "+cluster+
+			" ("+err.Error()+") — this backstop did NOT run. A surviving node will stop the "+
+			"teardown on DependencyViolation deleting the node security group."))
+		return
 	}
 	ids = strings.TrimSpace(ids)
 	if ids == "" || ids == "None" {
+		if run.DryRun {
+			fmt.Fprintln(out, ui.OK("no EC2 instances tagged karpenter.sh/managed-by="+cluster+
+				" — this sweep selects nothing"))
+		}
 		return
 	}
 
 	insts := strings.Fields(ids)
+	if run.DryRun {
+		fmt.Fprintln(out, ui.Step(fmt.Sprintf("(dry-run) would terminate %d Karpenter instance(s): %s",
+			len(insts), strings.Join(insts, ", "))))
+		return
+	}
 	fmt.Fprintln(out, ui.Step(fmt.Sprintf("terminating %d Karpenter instance(s) left by %s", len(insts), cluster)))
 	args := append([]string{"ec2", "terminate-instances", "--region", region, "--instance-ids"}, insts...)
 	if err := run.Run(ctx, "aws", args...); err != nil {
@@ -424,34 +531,76 @@ func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster
 // then deleting PVCs — a long sequence with several ways to stall, run against a
 // cluster that is being demolished anyway.
 //
-// So this is the backstop, and it is deterministic. Every dynamically provisioned
-// volume is tagged kubernetes.io/cluster/<name>=owned by the EBS CSI driver. Once the
-// cluster is destroyed, no volume of its can still be attached — anything left with
-// that tag in `available` state is an orphan, by definition. Delete it.
+// So this is the backstop. It deletes only volumes carrying kubernetes.io/cluster/<name>,
+// which is a statement by the volume about which cluster owns it. Once the cluster is
+// destroyed, no volume of its can still be attached — anything left with that tag in
+// `available` state is an orphan, by definition.
 //
 // Runs after the cluster is destroyed, never before: an in-use volume is skipped by
 // the status filter, so this cannot detach a volume from anything living.
+//
+// # WHAT THIS SWEEP CANNOT SEE, AND WHY IT NOW SAYS SO
+//
+// This function used to assert that "every dynamically provisioned volume is tagged
+// kubernetes.io/cluster/<name>=owned by the EBS CSI driver". That is not established. The
+// driver is an EKS MANAGED ADDON declared at landing-zone components/aws/cluster/eks.tf:92-105
+// with no configuration_values block at all, so neither extraVolumeTags nor k8sTagClusterId is
+// set; and the gp3 StorageClass in eks-gitops sets no tagSpecification parameters. Without
+// one of those, a dynamically provisioned volume carries only the driver's provenance tags —
+// CSIVolumeName and kubernetes.io/created-for/* — which say a Kubernetes cluster made it and
+// do not say WHICH.
+//
+// The volumes that actually orphan are exactly those: Loki's 50Gi, Tempo's 50Gi, the kagent
+// database. Karpenter's node volumes do get the cluster tag, but they terminate with their
+// instances and were never the problem.
+//
+// So the filter may select nothing on a real teardown, and the old code then printed nothing
+// and returned success — a sweep that reports done having looked at one tag that may not
+// exist. That is the org's own recurring class (the gate is green, the function is absent)
+// living inside the backstop written to catch it.
+//
+// The fix is not to widen the DELETE. A volume with no cluster tag cannot be proved to belong
+// to this run, and this account holds three estates, so deleting on provenance alone is
+// exactly the overreach the standing rule forbids. The fix is to stop being silent: enumerate
+// available volumes that carry EBS CSI provenance and no cluster tag, and REPORT them, naming
+// the cost. An operator who is told "three volumes are probably yours and I will not guess"
+// can delete three volumes. An operator told nothing pays for them indefinitely.
+//
+// Tagging them properly is upstream work — a configuration_values block on the addon — and is
+// filed as such. This is what rackctl can do without it.
 func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
-	if run.DryRun {
-		fmt.Fprintln(out, ui.Step("sweep EBS volumes orphaned by "+cluster))
+	if cluster == "" {
 		return
 	}
+	reportUnprovableVolumes(ctx, run, out, cluster, region)
 
-	ids, err := run.Capture(ctx, "aws", "ec2", "describe-volumes",
+	ids, err := run.Query(ctx, "aws", "ec2", "describe-volumes",
 		"--region", region,
 		"--filters",
 		"Name=status,Values=available",
 		"Name=tag-key,Values=kubernetes.io/cluster/"+cluster,
 		"--query", "Volumes[].VolumeId", "--output", "text")
 	if err != nil {
-		return // no credentials, no region, nothing to do — not a teardown failure
+		fmt.Fprintln(out, ui.Warn("could not enumerate orphaned EBS volumes for "+cluster+
+			" ("+err.Error()+") — this sweep did NOT run. Any volume the cluster left behind is "+
+			"still billing; check `aws ec2 describe-volumes --filters Name=status,Values=available`."))
+		return
 	}
 	ids = strings.TrimSpace(ids)
 	if ids == "" || ids == "None" {
+		if run.DryRun {
+			fmt.Fprintln(out, ui.OK("no available EBS volumes tagged kubernetes.io/cluster/"+cluster+
+				" — this sweep selects nothing"))
+		}
 		return
 	}
 
 	vols := strings.Fields(ids)
+	if run.DryRun {
+		fmt.Fprintln(out, ui.Step(fmt.Sprintf("(dry-run) would delete %d orphaned EBS volume(s): %s",
+			len(vols), strings.Join(vols, ", "))))
+		return
+	}
 	fmt.Fprintln(out, ui.Step(fmt.Sprintf("sweeping %d EBS volume(s) orphaned by %s", len(vols), cluster)))
 	for _, v := range vols {
 		if err := run.Run(ctx, "aws", "ec2", "delete-volume", "--region", region, "--volume-id", v); err != nil {
@@ -460,6 +609,65 @@ func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, clust
 		}
 		fmt.Fprintln(out, ui.OK("deleted "+v))
 	}
+}
+
+// reportUnprovableVolumes names the available EBS volumes that a Kubernetes cluster clearly
+// created and that carry nothing saying which one.
+//
+// It deletes nothing and is deliberately not wired to a flag that would let it. The whole
+// point is the distinction the standing rule turns on: a volume tagged
+// kubernetes.io/cluster/<this cluster> is provably ours and gets deleted; a volume tagged only
+// CSIVolumeName is provably SOME cluster's and might be a sibling environment's in the same
+// account, so it gets named and left. Deleting it would be a guess, and this account holds
+// two estates besides this one.
+//
+// The provenance keys are the EBS CSI driver's own defaults, so a match is strong evidence of
+// origin even though it is no evidence of ownership.
+func reportUnprovableVolumes(ctx context.Context, run execer, out io.Writer, cluster, region string) {
+	raw, err := run.Query(ctx, "aws", "ec2", "describe-volumes",
+		"--region", region,
+		"--filters", "Name=status,Values=available",
+		"--query", "Volumes[].{VolumeId:VolumeId,Size:Size,Tags:Tags}", "--output", "json")
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return
+	}
+	var vols []struct {
+		VolumeId string
+		Size     int
+		Tags     []struct{ Key, Value string }
+	}
+	if err := json.Unmarshal([]byte(raw), &vols); err != nil {
+		return
+	}
+
+	var unprovable []string
+	for _, v := range vols {
+		var csi, clusterTagged bool
+		for _, t := range v.Tags {
+			switch {
+			case t.Key == "CSIVolumeName" || strings.HasPrefix(t.Key, "kubernetes.io/created-for/"):
+				csi = true
+			case strings.HasPrefix(t.Key, "kubernetes.io/cluster/"):
+				clusterTagged = true
+			}
+		}
+		if csi && !clusterTagged {
+			unprovable = append(unprovable, fmt.Sprintf("%s (%dGiB)", v.VolumeId, v.Size))
+		}
+	}
+	if len(unprovable) == 0 {
+		return
+	}
+
+	fmt.Fprintln(out, ui.Warn(fmt.Sprintf(
+		"%d available EBS volume(s) were provisioned by an EBS CSI driver but carry no "+
+			"kubernetes.io/cluster/* tag, so rackctl cannot prove they belong to %s and will NOT delete "+
+			"them: %s", len(unprovable), cluster, strings.Join(unprovable, ", "))))
+	fmt.Fprintln(out, ui.Warn(
+		"They will keep billing. If this teardown was the only cluster in the account they are almost "+
+			"certainly its Loki/Tempo/database volumes; delete them deliberately with "+
+			"`aws ec2 delete-volume --volume-id <id>`. The durable fix is upstream: set extraVolumeTags "+
+			"on the aws-ebs-csi-driver addon so the volumes say which cluster made them."))
 }
 
 // PointAt aims kubectl at the cluster whose resources are about to be reaped, and reports

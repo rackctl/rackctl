@@ -22,6 +22,14 @@ type fakeIAM struct {
 	deleted     map[string]bool     // role -> deleted
 	detachFails map[string]bool     // role -> detach-role-policy errors (models an API hiccup)
 	runs        [][]string          // every mutating command, in order
+	// tags is role -> IAM tags. A role with no entry is treated as carrying the tags the
+	// operator really stamps, so the tests that predate the ownership check keep testing what
+	// they were written to test — the DELETION mechanics — rather than all failing on a
+	// concern they were not about. Tests that care about ownership set this explicitly.
+	tags map[string]map[string]string
+	// tagsFail models a role whose tags cannot be read at all, which must refuse for a
+	// different reason than a role that is provably untagged.
+	tagsFail map[string]bool
 }
 
 func newFakeIAM() *fakeIAM {
@@ -30,7 +38,46 @@ func newFakeIAM() *fakeIAM {
 		inline:      map[string][]string{},
 		deleted:     map[string]bool{},
 		detachFails: map[string]bool{},
+		tags:        map[string]map[string]string{},
+		tagsFail:    map[string]bool{},
 	}
+}
+
+// ownedTags is what eks-agent-platform's operator actually puts on a tenant role
+// (operators/internal/controller/platform_iam.go:177-190).
+func ownedTags() map[string]string {
+	return map[string]string{
+		"ManagedBy":  "eks-agent-platform",
+		"Project":    "eks-agent-platform",
+		"Repository": "nanohype/eks-agent-platform",
+		"Component":  "tenant-iam",
+	}
+}
+
+func (f *fakeIAM) Query(ctx context.Context, name string, args ...string) (string, error) {
+	if name == "aws" && len(args) > 1 && args[1] == "list-role-tags" {
+		role := roleArg(args)
+		if f.tagsFail[role] {
+			return "", fmt.Errorf("AccessDenied reading tags for %s", role)
+		}
+		tags, ok := f.tags[role]
+		if !ok {
+			tags = ownedTags()
+		}
+		var b strings.Builder
+		b.WriteString(`{"Tags":[`)
+		first := true
+		for k, v := range tags {
+			if !first {
+				b.WriteString(",")
+			}
+			first = false
+			fmt.Fprintf(&b, `{"Key":%q,"Value":%q}`, k, v)
+		}
+		b.WriteString("]}")
+		return b.String(), nil
+	}
+	return f.Capture(ctx, name, args...)
 }
 
 func (f *fakeIAM) Capture(_ context.Context, name string, args ...string) (string, error) {
@@ -113,7 +160,7 @@ func TestOperatorRoles_ForceDeletesEachRole(t *testing.T) {
 	f.inline["dev-ops-tenant"] = []string{"session-inline"}
 	f.attached["dev-ops-session"] = []string{"arn:aws:iam::1:policy/attribution"}
 
-	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "dev")
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, Owner{Org: "nanohype", Cluster: "dev"})
 
 	for _, r := range []string{"dev-ops-tenant", "dev-ops-session"} {
 		if !f.deleted[r] {
@@ -131,7 +178,7 @@ func TestOperatorRoles_OneFailureDoesNotAbortTheRest(t *testing.T) {
 	f.detachFails["dev-wedged-tenant"] = true
 	f.attached["dev-ok-session"] = []string{"arn:aws:iam::1:policy/y"}
 
-	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "dev")
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, Owner{Org: "nanohype", Cluster: "dev"})
 
 	if f.deleted["dev-wedged-tenant"] {
 		t.Errorf("a role whose detach failed must not be deleted (it would DeleteConflict)")
@@ -144,7 +191,7 @@ func TestOperatorRoles_OneFailureDoesNotAbortTheRest(t *testing.T) {
 func TestOperatorRoles_NoRolesIsClean(t *testing.T) {
 	f := newFakeIAM()
 	buf := &bytes.Buffer{}
-	reapOperatorRoles(context.Background(), f, false, buf, "dev")
+	reapOperatorRoles(context.Background(), f, false, buf, Owner{Org: "nanohype", Cluster: "dev"})
 	if len(f.runs) != 0 {
 		t.Fatalf("no roles under the prefix => no mutations; got %v", f.runs)
 	}
@@ -153,7 +200,7 @@ func TestOperatorRoles_NoRolesIsClean(t *testing.T) {
 func TestOperatorRoles_DryRunTouchesNothing(t *testing.T) {
 	f := newFakeIAM()
 	f.attached["dev-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
-	reapOperatorRoles(context.Background(), f, true, &bytes.Buffer{}, "dev")
+	reapOperatorRoles(context.Background(), f, true, &bytes.Buffer{}, Owner{Org: "nanohype", Cluster: "dev"})
 	if len(f.runs) != 0 {
 		t.Fatalf("dry-run must not mutate; got %v", f.runs)
 	}
@@ -168,6 +215,10 @@ type fakeKube struct {
 	crds    map[string]bool   // kind -> installed
 	listing map[string]string // kind -> jsonpath output
 	patched [][]string        // recorded patch argv (after "kubectl")
+}
+
+func (k *fakeKube) Query(ctx context.Context, name string, args ...string) (string, error) {
+	return k.Capture(ctx, name, args...)
 }
 
 func (k *fakeKube) Capture(_ context.Context, name string, args ...string) (string, error) {
@@ -278,7 +329,7 @@ func TestOperatorRoles_LeavesAnotherClustersRolesAlone(t *testing.T) {
 	f.attached["staging-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
 	f.attached["development-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
 
-	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "staging-ops")
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, Owner{Org: "nanohype", Cluster: "staging-ops"})
 
 	if !f.deleted["staging-ops-tenant"] {
 		t.Errorf("the torn-down cluster's own role must still be reaped; runs=%v", f.runs)
@@ -303,7 +354,7 @@ func TestOperatorRoles_BlankClusterReapsNothing(t *testing.T) {
 	f := &recordingIAM{fakeIAM: newFakeIAM()}
 	f.attached["development-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
 
-	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "")
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, Owner{Org: "nanohype", Cluster: ""})
 
 	if len(f.runs) != 0 {
 		t.Fatalf("a blank cluster name must reap nothing, not everything; got %v", f.runs)
@@ -334,7 +385,7 @@ func TestOperatorRoles_QueriesOnlyTheTenantPath(t *testing.T) {
 	f := &recordingIAM{fakeIAM: newFakeIAM()}
 	f.attached["development-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
 
-	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, "development-ops")
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, Owner{Org: "nanohype", Cluster: "development-ops"})
 
 	if got := flag(f.listArgs, "--path-prefix"); got != "/eks-agent-platform/tenants/" {
 		t.Fatalf("list-roles asked for --path-prefix %q; the operator mints tenant and session "+
@@ -356,6 +407,19 @@ func (r *recordingIAM) Capture(ctx context.Context, name string, args ...string)
 		r.listArgs = append([]string{name}, args...)
 	}
 	return r.fakeIAM.Capture(ctx, name, args...)
+}
+
+// Query has to be overridden too, and the reason is worth stating because it is exactly what
+// this test caught. Enumeration moved from Capture to Query so a dry-run can demonstrate its
+// selection rather than describe it. Go embedding has no virtual dispatch, so fakeIAM.Query
+// calls fakeIAM.Capture — never this recorder — and the path-prefix assertion would have gone
+// quietly blind while still passing on a hardcoded default. It failed instead, which is the
+// behaviour a test asserting argv is supposed to have.
+func (r *recordingIAM) Query(ctx context.Context, name string, args ...string) (string, error) {
+	if len(args) > 1 && args[1] == "list-roles" {
+		r.listArgs = append([]string{name}, args...)
+	}
+	return r.fakeIAM.Query(ctx, name, args...)
 }
 
 // PointAt is the safety argument for the two ambient sweeps, so it has to fail closed.
@@ -433,4 +497,138 @@ type spokeExecer struct {
 func (s *spokeExecer) Run(context.Context, string, ...string) error { return nil }
 func (s *spokeExecer) Capture(context.Context, string, ...string) (string, error) {
 	return s.out, s.err
+}
+func (s *spokeExecer) Query(context.Context, string, ...string) (string, error) {
+	return s.out, s.err
+}
+
+// --- ownership: the sweep must prove a role is ours before force-deleting it ---
+//
+// The path and the name are structural guesses about a resource. The tags are the resource's
+// own statement about itself. In a dedicated account the difference is academic; in the
+// account this runs against it is not, because that account holds three estates and two of
+// them tag with an identical Project value — one of which owns the account's CloudTrail
+// bucket, its CUR bucket and its inbound mail.
+
+func TestOperatorRoles_RefusesARoleThatCannotBeProvedOurs(t *testing.T) {
+	cases := []struct {
+		name string
+		tags map[string]string
+		why  string
+	}{
+		{
+			name: "untagged",
+			tags: map[string]string{},
+			why:  "untagged means unknown, and unknown must be treated as someone else's",
+		},
+		{
+			name: "another estate under the same Project value",
+			tags: map[string]string{
+				"Project":    "landing-zone",
+				"ManagedBy":  "opentofu",
+				"Repository": "stxkxs/landing-zone",
+			},
+			why: "Project=landing-zone and ManagedBy=opentofu are shared across estates in this " +
+				"account; only Repository discriminates, and this one is not ours",
+		},
+		{
+			name: "the near-miss: right Project, no Repository",
+			tags: map[string]string{"Project": "eks-agent-platform", "Environment": "development"},
+			why:  "a matching Project is exactly the trap — it proves nothing on its own",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeIAM()
+			f.attached["dev-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+			f.tags["dev-ops-tenant"] = tc.tags
+
+			buf := &bytes.Buffer{}
+			reapOperatorRoles(context.Background(), f, false, buf, Owner{Org: "nanohype", Cluster: "dev"})
+
+			if f.deleted["dev-ops-tenant"] {
+				t.Fatalf("force-deleted a role it could not prove it owned: %s", tc.why)
+			}
+			if len(f.runs) != 0 {
+				t.Fatalf("a refused role must not be mutated at all (no detach, no delete); got %v", f.runs)
+			}
+			if !strings.Contains(buf.String(), "REFUSING") {
+				t.Fatalf("a refusal must be loud — a silent skip reads as a clean teardown and the "+
+					"operator only finds out when agent-iam fails on DeleteConflict.\n%s", buf.String())
+			}
+		})
+	}
+}
+
+// A role whose tags cannot be READ is a different failure from one that is provably untagged,
+// and collapsing them would be the wrong kind of safe: it would look like a decision when it
+// was an outage.
+func TestOperatorRoles_RefusesWhenTagsCannotBeRead(t *testing.T) {
+	f := newFakeIAM()
+	f.attached["dev-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+	f.tagsFail["dev-ops-tenant"] = true
+
+	buf := &bytes.Buffer{}
+	reapOperatorRoles(context.Background(), f, false, buf, Owner{Org: "nanohype", Cluster: "dev"})
+
+	if f.deleted["dev-ops-tenant"] {
+		t.Fatal("a role whose ownership could not be determined must not be force-deleted")
+	}
+	if !strings.Contains(buf.String(), "could not read its tags") {
+		t.Fatalf("the reason must distinguish 'unreadable' from 'not ours'.\n%s", buf.String())
+	}
+}
+
+// The other half, and the one that keeps the guard honest: a role that IS ours still gets
+// reaped. A predicate that refuses everything would pass every test above and break every
+// teardown.
+func TestOperatorRoles_StillReapsAProvablyOwnedRole(t *testing.T) {
+	f := newFakeIAM()
+	f.attached["dev-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+	f.tags["dev-ops-tenant"] = map[string]string{"Repository": "nanohype/eks-agent-platform"}
+	f.attached["dev-ops-session"] = []string{"arn:aws:iam::1:policy/y"}
+	f.tags["dev-ops-session"] = map[string]string{"ManagedBy": "eks-agent-platform"}
+
+	reapOperatorRoles(context.Background(), f, false, &bytes.Buffer{}, Owner{Org: "nanohype", Cluster: "dev"})
+
+	for _, r := range []string{"dev-ops-tenant", "dev-ops-session"} {
+		if !f.deleted[r] {
+			t.Errorf("%s is provably ours and must still be reaped; runs=%v", r, f.runs)
+		}
+	}
+}
+
+// The predicate belongs to the RUN's org, not to a hardcoded list of nanohype's repo names.
+// An operator installing from their own fork must not have every sweep refuse.
+func TestOwner_ProvesIsScopedToTheRunsOrg(t *testing.T) {
+	own := Owner{Org: "acme", Cluster: "dev-ops"}
+	if ok, _ := own.Proves(map[string]string{"Repository": "acme/landing-zone"}); !ok {
+		t.Fatal("a resource tagged with the run's own org must be provable")
+	}
+	if ok, _ := own.Proves(map[string]string{"Repository": "nanohype/landing-zone"}); ok {
+		t.Fatal("another org's resource must not be provable just because it is nanohype's")
+	}
+}
+
+// A dry-run must ENUMERATE, not just describe. The whole point of the negative test is that
+// `rackctl destroy` without --apply can be pointed at a live account and shown to select
+// nothing pre-existing; a dry-run that queries nothing cannot show anything.
+func TestOperatorRoles_DryRunEnumeratesSoItCanBeNegativeTested(t *testing.T) {
+	f := &recordingIAM{fakeIAM: newFakeIAM()}
+	f.attached["dev-ops-tenant"] = []string{"arn:aws:iam::1:policy/x"}
+
+	buf := &bytes.Buffer{}
+	reapOperatorRoles(context.Background(), f, true, buf, Owner{Org: "nanohype", Cluster: "dev"})
+
+	if f.listArgs == nil {
+		t.Fatal("a dry-run must actually enumerate: describing the filter back to the operator is " +
+			"not evidence about what the filter selects, and 'selects zero' is the claim the " +
+			"whole sweep rests on")
+	}
+	if len(f.runs) != 0 {
+		t.Fatalf("enumerating in dry-run must not become mutating in dry-run; got %v", f.runs)
+	}
+	if !strings.Contains(buf.String(), "dev-ops-tenant") {
+		t.Fatalf("the dry-run must name what it would delete.\n%s", buf.String())
+	}
 }

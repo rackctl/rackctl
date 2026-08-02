@@ -54,8 +54,7 @@ var componentGateRemedy = map[string]string{
 // Every failure is wrapped in engine.NoRollbackError, and that is load-bearing rather
 // than defensive. This guard's entire premise is that NOTHING has been provisioned yet,
 // so there is nothing for a rollback to reclaim — but the engine's teardown is not a
-// no-op on an empty run. It force-deletes every IAM role under /eks-agent-platform/
-// ACCOUNT-wide and runs `kubectl delete platforms|tenants|nodeclaims|pvc --all -A`
+// no-op on an empty run. It runs `kubectl delete platforms|tenants|nodeclaims|pvc --all -A`
 // against whatever cluster the kubeconfig currently points at. An operator bootstrapping
 // staging from a laptop pointed at a healthy development cluster would have this guard
 // fire correctly and then destroy the platform they were not touching. A precondition
