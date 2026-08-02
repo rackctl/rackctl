@@ -16,10 +16,10 @@ import (
 // it accumulates other environments, then other projects, then things that have nothing to
 // do with the platform at all.
 //
-// The deployment account this was written against holds three estates. Two of them tag with
-// the IDENTICAL Project value, because both follow the same org tagging standard, which pins
-// Project = "landing-zone" (nanohype/standards/resource-tagging.json). One of those two owns
-// the account's CloudTrail bucket, its CUR bucket, and its inbound mail. So:
+// And the org tagging standard is what makes the obvious keys useless for this. It pins
+// Project = "landing-zone" (nanohype/standards/resource-tagging.json), so every deployment that
+// follows the standard carries the same value — including ones this run has nothing to do with,
+// and including whichever of them owns the account's CloudTrail, its CUR, or its mail. So:
 //
 //	Project=landing-zone      does not discriminate — two estates share the value
 //	ManagedBy=opentofu        does not discriminate — every estate here uses it
