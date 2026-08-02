@@ -73,7 +73,7 @@ node pool tuned to evict half the fleet at once.`,
 		// which needs no cluster and is where that check belongs.
 		if out, err := run.Capture(ctx, "kubectl", "get", "nodes", "--no-headers"); err != nil || out == "" {
 			fmt.Println(ui.Fail("no cluster in kubeconfig — there is no platform to be healthy. " +
-				"Run `rackctl preflight` to check whether an install can succeed, then `rackctl init --apply`."))
+				"Run `rackctl preflight` to check whether an install can succeed, then `rackctl apply`."))
 			return fmt.Errorf("no provisioned platform to diagnose")
 		}
 		fmt.Println(ui.OK("cluster reachable"))
@@ -148,7 +148,7 @@ Read-only, and exits non-zero — so it can gate an init.`,
 			return fmt.Errorf("preflight failed — this install would not succeed; clear the above first")
 		}
 		fmt.Println()
-		fmt.Println(ui.OK("preflight clear — `rackctl init --apply` can proceed"))
+		fmt.Println(ui.OK("preflight clear — `rackctl apply` can proceed"))
 		return nil
 	},
 }
@@ -175,7 +175,8 @@ func printResults(results []doctor.Result) {
 
 var (
 	destroyConfig       string
-	destroyApply        bool
+	destroyDryRun       bool
+	destroyYes          bool
 	destroyForceBuckets bool
 )
 
@@ -184,7 +185,8 @@ var destroyCmd = &cobra.Command{
 	Short: "Tear down a provisioned platform (reverse order)",
 	Long: `Tear down a provisioned platform in reverse apply order.
 
-By default this is a dry-run plan. Pass --apply to destroy.
+This writes. It asks for confirmation first unless --yes is passed; --dry-run shows
+what it would do and touches nothing.
 
 A dry-run makes READ-ONLY AWS calls. The three sweeps that delete resources outside
 Terraform's state — operator-minted IAM roles, Karpenter's instances, orphaned EBS
@@ -217,13 +219,18 @@ wedge there until that lands upstream.`,
 		// and refuses where it must, so a dry-run is informative rather than dangerous.
 		ctx := context.Background()
 		run := exec.New(os.Stdout)
-		run.DryRun = !destroyApply
+		run.DryRun = destroyDryRun
 		run.Env = tgEnv(cfg)
 		run.Dir = engine.RepoPaths(cfg.Org.Name).LandingZone
 
 		fmt.Println(ui.Title(fmt.Sprintf("rackctl destroy — %s · %s · %s", cfg.Org.Name, cfg.Cloud.Region, cfg.Environment)))
 		if run.DryRun {
-			fmt.Println(ui.Warn("dry-run — no cloud changes (pass --apply to destroy)"))
+			fmt.Println(ui.Warn("dry-run — no cloud changes"))
+		}
+		if !run.DryRun {
+			if err := confirmDestroy(cfg.ClusterName(), string(cfg.Environment)); err != nil {
+				return err
+			}
 		}
 		if destroyForceBuckets {
 			fmt.Println(ui.Warn("force-buckets: will apply force_destroy_buckets=true on bucket-owning components before destroying"))
@@ -237,7 +244,7 @@ wedge there until that lands upstream.`,
 		// whatever context kubectl currently resolves. Their only guard is a `/readyz`
 		// probe, which tests liveness, never identity. Nothing else in this command
 		// touches the kubeconfig, and the environment passes through, so
-		// `rackctl destroy --apply -c staging.yaml` from a shell pointed at a healthy
+		// `rackctl destroy -c staging.yaml` from a shell pointed at a healthy
 		// development cluster deleted every Platform, Tenant, NodeClaim and PVC in
 		// DEVELOPMENT — and then stripped their finalizers.
 		//
@@ -416,6 +423,55 @@ wedge there until that lands upstream.`,
 	},
 }
 
+// confirmDestroy blocks until a human types the cluster name, or --yes was passed.
+//
+// destroy lost its --apply flag when the verbs became plan/apply/destroy, and something had to
+// take over the job that flag was doing. A flag is the wrong thing for it anyway: --apply made
+// the destructive invocation differ from the safe one by five characters at the END of a line,
+// where it is read last and copied first.
+//
+// Typing the cluster name is a deliberately worse ergonomic than a y/n, because y/n is answered
+// by reflex and the failure this guards is a reflex failure — tearing down the environment you
+// meant to keep. The name is the one thing you cannot type correctly while thinking about a
+// different cluster.
+//
+// --yes exists for CI, and for the campaign's own teardown loop, which must run unattended.
+// Not a TTY and no --yes is a refusal rather than a silent proceed: a teardown that cannot ask
+// is a teardown nobody authorised.
+func confirmDestroy(cluster, env string) error {
+	if destroyYes {
+		return nil
+	}
+	fmt.Printf("\nThis destroys the %s platform %q and everything under it.\n", env, cluster)
+	fmt.Printf("Type the cluster name to confirm: ")
+
+	// Read the answer, and treat "there was nothing to read" as its own refusal.
+	//
+	// An os.Stdin.Stat() ModeCharDevice test is the usual way to ask "am I a terminal", and it
+	// is wrong here: /dev/null IS a character device, so `rackctl destroy < /dev/null` sails
+	// past the check and lands on a prompt nobody can answer. The outcome was still safe — an
+	// empty answer does not match the cluster name — but the operator got "confirmation did not
+	// match" for a situation where nothing was ever asked, and a misleading reason on a refusal
+	// is how a guard gets worked around instead of understood.
+	//
+	// EOF answers the real question directly: not "is this a terminal" but "is there anyone
+	// there to type". Scanln also returns an error for an empty line, so the two are separated
+	// by whether anything was read at all.
+	var typed string
+	n, err := fmt.Scanln(&typed)
+	if n == 0 && err != nil && strings.Contains(err.Error(), "EOF") {
+		fmt.Println()
+		return fmt.Errorf(
+			"refusing to destroy %s: there is nobody to confirm with (stdin reached EOF). Pass "+
+				"--yes if this is a scripted teardown, or --dry-run to see what it would do", cluster)
+	}
+	if strings.TrimSpace(typed) != cluster {
+		return fmt.Errorf("confirmation did not match %q — nothing was destroyed", cluster)
+	}
+	fmt.Println()
+	return nil
+}
+
 // ---- upgrade ----
 
 var upgradeConfig string
@@ -459,7 +515,8 @@ func init() {
 	preflightCmd.Flags().StringVarP(&preflightConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	doctorCmd.Flags().StringVarP(&doctorConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
 	destroyCmd.Flags().StringVarP(&destroyConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
-	destroyCmd.Flags().BoolVar(&destroyApply, "apply", false, "actually destroy (default is a dry-run plan)")
+	destroyCmd.Flags().BoolVar(&destroyDryRun, "dry-run", false, "show what would be destroyed and touch nothing")
+	destroyCmd.Flags().BoolVar(&destroyYes, "yes", false, "skip the confirmation prompt (for CI and scripted teardowns)")
 	destroyCmd.Flags().BoolVar(&destroyForceBuckets, "force-buckets", false,
 		"before destroying, apply force_destroy_buckets=true on bucket-owning components so non-empty buckets can be emptied (two-act; required outside development for a reliable teardown)")
 	upgradeCmd.Flags().StringVarP(&upgradeConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")

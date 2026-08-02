@@ -185,7 +185,7 @@ func TestEngineDoesNotRollBackOnNoRollbackError(t *testing.T) {
 
 // A failure must NEVER destroy a platform this run did not build.
 //
-// `init --apply` is re-runnable by design: it is how an operator retries after a failure,
+// `rackctl apply` is re-runnable by design: it is how an operator retries after a failure,
 // and how they re-apply a config change to a platform that is already up. Against an
 // existing cluster every earlier phase "succeeds" as a NO-OP — the network is there, the
 // cluster is there, nothing is created — and is recorded as completed all the same.

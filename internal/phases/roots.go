@@ -36,7 +36,7 @@ var componentGateRemedy = map[string]string{
 // This was not hypothetical when it was written. landing-zone's live tree is authored per
 // environment, and agent-iam — which CoreComponents appends BY DEFAULT, because
 // AgentPlatform.Enable nil means enabled — had a leaf only under workload-development, so
-// every `rackctl init --apply` with environment: staging or production ended exactly this
+// every `rackctl apply` with environment: staging or production ended exactly this
 // way.
 //
 // Upstream has since added the missing leaves: all three workload environments now carry

@@ -61,7 +61,7 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 
 	// Rollback is only ever safe when this run BUILT the thing it is about to destroy.
 	//
-	// `init --apply` is re-runnable by design (#16): it is how an operator retries after a
+	// `rackctl apply` is re-runnable by design (#16): it is how an operator retries after a
 	// failure, and how they re-apply a config change to a platform that is already up.
 	// Against an existing cluster, phases 1-4 all "succeed" as no-ops — the network is
 	// there, the cluster is there, nothing is created. They are recorded as `completed`
@@ -117,7 +117,7 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 					fmt.Fprintln(e.Out, ui.Warn(
 						"the platform was already provisioned before this run — leaving it standing. "+
 							"Nothing was rolled back. Run `rackctl doctor` to see what is wrong, or "+
-							"`rackctl destroy --apply` to tear it down deliberately."))
+							"`rackctl destroy` to tear it down deliberately."))
 				}
 			case p.Optional():
 				// An OPTIONAL phase runs after the platform is already usable, and nothing
@@ -140,7 +140,7 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 					fmt.Fprintln(e.Out, ui.Warn(
 						"this is an optional phase and the platform underneath it is provisioned — "+
 							"leaving it standing. Nothing was rolled back. Run `rackctl doctor` to see "+
-							"what is wrong, or `rackctl destroy --apply` to tear it down deliberately."))
+							"what is wrong, or `rackctl destroy` to tear it down deliberately."))
 				}
 			case e.CleanOnFail && !errors.As(err, &noRollback):
 				// The phase that FAILED is torn down too. It failed partway, which

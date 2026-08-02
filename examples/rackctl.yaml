@@ -1,5 +1,5 @@
 # rackctl full-provision config — AWS, development.
-# `rackctl init -c examples/rackctl.yaml` (dry-run) then add --apply.
+# `rackctl plan -c examples/rackctl.yaml`, then `rackctl apply -c examples/rackctl.yaml`.
 org:
   name: acme
   gitops:
@@ -103,7 +103,7 @@ addons:
                                   # every workload environment.
                                   #
                                   # TEARDOWN: development tears down cleanly. Outside development it needs
-                                  # `rackctl destroy --apply --force-buckets`, which is two acts: the permitting
+                                  # `rackctl destroy --force-buckets`, which is two acts: the permitting
                                   # apply lands force_destroy on the per-tenant buckets AND clears the tenant
                                   # Aurora's deletion_protection, and only then does the destroy reach them. Without
                                   # the flag the destroy deletes the deepstorage segments (no versioning, no expiry,

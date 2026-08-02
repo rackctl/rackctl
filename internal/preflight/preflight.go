@@ -221,7 +221,7 @@ func CheckStaleState(ctx context.Context, env *Env) doctor.Result {
 		return fail(name, fmt.Sprintf(
 			"%s is gone, but these components still hold state — %s. This is a partially "+
 				"torn-down platform, not necessarily a stale one: their resources may still "+
-				"exist and still be billing. Run `rackctl destroy --apply` first; it tears "+
+				"exist and still be billing. Run `rackctl destroy` first; it tears "+
 				"down what is actually there. Purge the state objects under s3://%s/%s/ ONLY "+
 				"if destroy leaves state behind with no resources under it — purging state "+
 				"that still tracks live resources orphans them permanently.",
