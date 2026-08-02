@@ -102,13 +102,12 @@ addons:
                                   # its live leaf carries its own tenant sizing map. Applied when true; lives under
                                   # every workload environment.
                                   #
-                                  # TEARDOWN: development tears down cleanly. Outside development it does NOT, and
-                                  # `--force-buckets` does not fix it: landing-zone pins the tenant Aurora's
-                                  # deletion_protection = true in the staging and production leaves, inside a
-                                  # map(object) no TF_VAR can reach without replacing the leaf's sizing too. rackctl
-                                  # refuses that teardown rather than deleting the deepstorage segments (no
-                                  # versioning, no expiry, only copy) and then wedging on DeleteDBCluster with the
-                                  # cluster and VPC still billing. Clear deletion_protection out of band first.
+                                  # TEARDOWN: development tears down cleanly. Outside development it needs
+                                  # `rackctl destroy --apply --force-buckets`, which is two acts: the permitting
+                                  # apply lands force_destroy on the per-tenant buckets AND clears the tenant
+                                  # Aurora's deletion_protection, and only then does the destroy reach them. Without
+                                  # the flag the destroy deletes the deepstorage segments (no versioning, no expiry,
+                                  # only copy) and then wedges on DeleteDBCluster with the cluster and VPC billing.
   accelerators: false             # label the cluster so the accelerators ApplicationSet (gpu-operator,
                                   # nvidia-dra-driver) targets it. Rides TF_VAR_enable_accelerators. Leave false
                                   # without GPU nodes — the driver cannot pull its image without an NGC key and has

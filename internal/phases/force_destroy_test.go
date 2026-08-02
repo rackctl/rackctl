@@ -2,7 +2,6 @@ package phases
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -143,66 +142,42 @@ func druidCfg(t *testing.T, env config.Environment) *config.Config {
 	return cfg
 }
 
-// --force-buckets must REFUSE a druid teardown outside development rather than run act 1.
+// druid is torn down like any other bucket owner, in EVERY environment.
 //
-// landing-zone's d7c7ec4 closed two of druid's three teardown gates — force_destroy on the
-// per-tenant buckets and skip_final_snapshot on Aurora, both wired to
-// `local.allow_teardown`. It left `deletion_protection = var.tenant_config.deletion_protection`
-// (modules/tenant/aurora.tf:94), whose component default is true and which BOTH non-development
-// leaves pin true. The permitting apply cannot clear it: it lives inside a map(object), so the
-// only ambient channel is a wholesale TF_VAR_tenants that would also replace the leaf's ACU
-// and backup-window sizing.
+// It was not always. landing-zone's d7c7ec4 closed two of druid's three teardown gates —
+// force_destroy on the per-tenant buckets and skip_final_snapshot on Aurora — and left
+// deletion_protection wired straight from the tenant map, where no TF_VAR could reach it
+// without replacing the leaf's ACU and backup-window sizing wholesale. rackctl refused that
+// teardown rather than deleting the deepstorage segments and only then wedging on
+// DeleteDBCluster.
 //
-// Continuing anyway is worse than stopping. Act 2 deletes druid's deepstorage, indexlogs and
-// msq buckets — deepstorage has neither versioning nor expiry, so a tenant's Druid segments
-// have no other copy — and only then fails on DeleteDBCluster, halting the sweep before
-// cluster and network with the EKS cluster, VPC and NAT gateways still billing.
-func TestPermitBucketTeardown_RefusesDruidOutsideDevelopment(t *testing.T) {
-	for _, env := range []config.Environment{"staging", "production"} {
+// 94dff69 closed it, as the class rather than the instance: every teardown gate in a component
+// declaring force_destroy_buckets now resolves permissively on the lever-true branch and keeps
+// the leaf's pin otherwise. Verified end-to-end before this refusal was retired —
+// components/aws/druid/variables.tf:86 declares it, main.tf:24 passes it to the tenant module,
+// modules/tenant/variables.tf:58 receives it, and aurora.tf:20 folds it into
+// local.allow_teardown, which aurora.tf:105 uses for deletion_protection.
+//
+// So the permitting apply now clears protection via ModifyDBCluster in the same act that lands
+// force_destroy, and act 2 reaches the buckets and the DB cluster together. This test is what
+// notices if that stops being true: a druid config in any environment must produce a plan, not
+// a refusal.
+func TestPermitBucketTeardown_CoversDruidInEveryEnvironment(t *testing.T) {
+	for _, env := range []config.Environment{"development", "staging", "production"} {
 		t.Run(string(env), func(t *testing.T) {
 			var out strings.Builder
 			run := exec.New(&out)
 			run.DryRun = true
 			st := &engine.State{Runner: run, Config: druidCfg(t, env), Repos: engine.Repos{LandingZone: "lz"}}
 
-			err := PermitBucketTeardown(context.Background(), st)
-			if err == nil {
-				t.Fatal("expected a refusal — act 1 cannot clear Aurora deletion_protection, and act 2 " +
-					"would delete the deepstorage segments before wedging")
+			if err := PermitBucketTeardown(context.Background(), st); err != nil {
+				t.Fatalf("druid's deletion_protection is gated on force_destroy_buckets upstream "+
+					"(94dff69), so the permitting apply clears it — there is nothing left to refuse: %v", err)
 			}
-			// It must be a NoRollbackError: refusing to start a teardown is a precondition
-			// failure, and must never itself trigger a destructive sweep.
-			var norb *engine.NoRollbackError
-			if !errors.As(err, &norb) {
-				t.Fatalf("refusal must be a *engine.NoRollbackError, got %T", err)
-			}
-			// The operator has to learn WHICH gate stopped them, or they cannot clear it.
-			if !strings.Contains(err.Error(), "deletion_protection") {
-				t.Fatalf("the refusal must name deletion_protection as the gate:\n%s", err)
-			}
-			// And nothing may have been run OR announced: the refusal comes before the
-			// two-act notes, so the operator is never told about a plan that will not happen.
-			if s := out.String(); strings.Contains(s, "terragrunt") || strings.Contains(s, "force-buckets:") {
-				t.Fatalf("act 1 must neither run nor be announced before the refusal:\n%s", s)
+			if s := out.String(); !strings.Contains(s, "druid") {
+				t.Fatalf("druid must be in the permitting apply set for %s:\n%s", env, s)
 			}
 		})
-	}
-}
-
-// Development is the case that genuinely works: allow_teardown is true on environment alone,
-// so the permitting apply proceeds and druid is applied like any other bucket owner.
-func TestPermitBucketTeardown_AllowsDruidInDevelopment(t *testing.T) {
-	var out strings.Builder
-	run := exec.New(&out)
-	run.DryRun = true
-	st := &engine.State{Runner: run, Config: druidCfg(t, "development"), Repos: engine.Repos{LandingZone: "lz"}}
-
-	if err := PermitBucketTeardown(context.Background(), st); err != nil {
-		t.Fatalf("development must not be refused — landing-zone's allow_teardown is true on "+
-			"environment alone there: %v", err)
-	}
-	if !strings.Contains(out.String(), "druid") {
-		t.Fatalf("druid must be in the permitting apply in development:\n%s", out.String())
 	}
 }
 
