@@ -116,7 +116,7 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				if e.Hook == nil {
 					fmt.Fprintln(e.Out, ui.Warn(
 						"the platform was already provisioned before this run — leaving it standing. "+
-							"Nothing was rolled back. Run `rackctl doctor` to see what is wrong, or "+
+							"Nothing was rolled back. Run `rackctl check` to see what is wrong, or "+
 							"`rackctl destroy` to tear it down deliberately."))
 				}
 			case p.Optional():
@@ -139,7 +139,7 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				if e.Hook == nil {
 					fmt.Fprintln(e.Out, ui.Warn(
 						"this is an optional phase and the platform underneath it is provisioned — "+
-							"leaving it standing. Nothing was rolled back. Run `rackctl doctor` to see "+
+							"leaving it standing. Nothing was rolled back. Run `rackctl check` to see "+
 							"what is wrong, or `rackctl destroy` to tear it down deliberately."))
 				}
 			case e.CleanOnFail && !errors.As(err, &noRollback):

@@ -812,7 +812,7 @@ func (gitopsPhase) Run(ctx context.Context, st *engine.State) error {
 		}
 		return &engine.NoRollbackError{Err: fmt.Errorf(
 			"ArgoCD applications did not all reach Healthy within 30m. The cloud IS provisioned and " +
-				"the cluster is left standing — run `rackctl doctor` to see what has not settled, and " +
+				"the cluster is left standing — run `rackctl check` to see what has not settled, and " +
 				"`rackctl destroy` if you want it gone")}
 	}
 	return nil

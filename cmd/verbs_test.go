@@ -17,15 +17,25 @@ func TestVerbs_AreThePlanApplyDestroySet(t *testing.T) {
 	for _, c := range rootCmd.Commands() {
 		got[c.Name()] = true
 	}
-	for _, want := range []string{"plan", "apply", "destroy", "preflight", "doctor", "upgrade", "version"} {
+	for _, want := range []string{"plan", "apply", "destroy", "check", "version"} {
 		if !got[want] {
 			t.Errorf("command %q is not registered", want)
 		}
 	}
-	// `init` must be GONE, not aliased. A deprecation shim would keep the confusing verb alive
-	// and let a stale runbook keep working while meaning something different.
-	if got["init"] {
-		t.Error("`init` is still registered — the rename is a replacement, not an alias")
+	// Every one of these must be GONE, not aliased. A deprecation shim would keep a confusing
+	// verb alive and let a stale runbook go on working while meaning something different.
+	//
+	//   init      renamed; the verb now carries whether anything is written
+	//   preflight ┐ merged into `check`, which looks up whether a cluster exists rather than
+	//   doctor    ┘ making the operator answer that question to pick a command
+	//   upgrade   deleted; `apply` did strictly more. It only ran `git pull` in the local
+	//             catalog checkout, while apply's acquire phase runs `gh repo sync` against
+	//             upstream FIRST and then pulls — so `upgrade` could not even fetch the
+	//             changes it existed to fetch.
+	for _, gone := range []string{"init", "preflight", "doctor", "upgrade"} {
+		if got[gone] {
+			t.Errorf("`%s` is still registered — these are replacements, not aliases", gone)
+		}
 	}
 }
 

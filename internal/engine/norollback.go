@@ -19,7 +19,7 @@ package engine
 // forty minutes of provisioning, because one workload needed five more.
 //
 // A phase returning this says: the cloud is provisioned, something on it has not
-// settled, leave it standing and let `rackctl doctor` say what.
+// settled, leave it standing and let `rackctl check` say what.
 type NoRollbackError struct{ Err error }
 
 func (e *NoRollbackError) Error() string { return e.Err.Error() }
