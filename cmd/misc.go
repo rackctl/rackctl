@@ -186,6 +186,14 @@ var destroyCmd = &cobra.Command{
 
 By default this is a dry-run plan. Pass --apply to destroy.
 
+A dry-run makes READ-ONLY AWS calls. The three sweeps that delete resources outside
+Terraform's state — operator-minted IAM roles, Karpenter's instances, orphaned EBS
+volumes — each enumerate for real and print exactly what they would delete, and what
+they would refuse to delete because nothing proves it belongs to this run. That is
+the point of the dry-run: in an account holding more than this platform, "the sweep
+is correctly scoped" is a claim worth checking rather than asserting, and a dry-run
+that queried nothing could only ever restate its own filter back.
+
 Outside development, several S3 buckets (agent-iam artifacts, cluster-addons
 velero/loki/tempo, model-import staging, druid deepstorage) refuse a destroy
 when non-empty unless force_destroy has been applied into state first. Pass
@@ -306,7 +314,12 @@ wedge there until that lands upstream.`,
 		// path carries no cluster segment, so an account running more than one cluster has
 		// them all under one prefix — an unscoped sweep tears down a sibling cluster's live
 		// tenant roles as a side effect of destroying this one.
-		reap.OperatorRoles(ctx, run, os.Stdout, cfg.ClusterName())
+		//
+		// Scoped a third way as of this change: every candidate must carry a tag proving it
+		// belongs to this run before it is force-deleted. The path and the name are structural
+		// guesses; the tag is the resource's own statement. In an account that holds more than
+		// this deployment, those are not the same thing.
+		reap.OperatorRoles(ctx, run, os.Stdout, reap.Owner{Org: cfg.Org.Name, Cluster: cfg.ClusterName()})
 
 		// With the roles gone, any Platform/Tenant still pinned in Terminating is
 		// guarding nothing — free it, so an interrupted teardown does not wedge. Must

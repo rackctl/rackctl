@@ -212,7 +212,11 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 		// the things that failed), so the roles almost certainly survived and would stop the
 		// substrate teardown on agent-iam's DeleteConflict. Then free any CR the dead
 		// finalizer left pinned in Terminating (safe once the roles are gone).
-		reap.OperatorRoles(ctx, st.Runner, e.Out, st.KubeconfigCluster)
+		org := ""
+		if st.Config != nil {
+			org = st.Config.Org.Name
+		}
+		reap.OperatorRoles(ctx, st.Runner, e.Out, reap.Owner{Org: org, Cluster: st.KubeconfigCluster})
 		reap.UnstickTerminating(ctx, st.Runner, e.Out)
 
 		// And backstop the NodeClaim reap: a rollback runs against a half-built cluster,

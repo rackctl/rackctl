@@ -1053,6 +1053,30 @@ func (fleet) Run(ctx context.Context, st *engine.State) error {
 }
 
 func (fleet) Teardown(ctx context.Context, st *engine.State) error {
+	// Refuse if this hub has vended spokes, for the same reason `rackctl destroy` refuses
+	// (cmd/misc.go): deleting the XRD deletes the Cluster CRs, and uninstalling Crossplane
+	// removes the only control plane that could ever tear the real spoke clusters down. Those
+	// are EKS control planes, VPCs and NAT gateways, frequently in other AWS accounts, tracked
+	// nowhere but here. Stranding them is not something a rollback gets to do quietly, and no
+	// diff of THIS account would ever show it happened.
+	//
+	// This path is not currently reachable — Teardown is called only from engine.teardown,
+	// which runs only when a NON-optional phase fails, and every non-optional phase precedes
+	// fleet, so fleet is never in `completed`. The guard is here anyway, and that is the point:
+	// the same reasoning as the KubeconfigCluster gate in engine.teardown. An invariant that
+	// holds because of the current phase ORDER is one accident away from not holding, and the
+	// accident — adding a required phase after fleet — is invisible at the place it is made.
+	// Making it structural costs one read-only query.
+	if spokes := reap.FleetSpokes(ctx, st.Runner); len(spokes) > 0 {
+		return fmt.Errorf(
+			"refusing to tear down the eks-fleet control plane: %d spoke cluster(s) are still vended "+
+				"(%s). Each is a real EKS cluster — its own control plane, VPC and NAT gateways — often "+
+				"in another AWS account, and this hub is the only place they are tracked. Delete them "+
+				"first with `kubectl delete clusters.fleet.nanohype.dev --all -A --wait` and let "+
+				"Crossplane tear them down",
+			len(spokes), strings.Join(spokes, ", "))
+	}
+
 	// Crossplane + the XRD/composition are cluster-scoped. Tear them down only if we
 	// know where the checkout is; otherwise leave them — uninstalling Crossplane by
 	// name alone is fine, and is what a rollback needs.
