@@ -17,9 +17,8 @@ import (
 // The rest of preflight assumes the account is the platform's own and asks whether the last
 // attempt left wreckage in it. That assumption is not safe. rackctl's shipped topology is one
 // account per startup — rung one of the maturity ladder — and one account per startup means the
-// account fills up with everything else the startup does. The account this was written against
-// holds three estates: the deployment, a personal site estate, and a mail domain, with 12 live
-// Route53 zones, 25 S3 buckets and an already-configured Bedrock logging singleton between them.
+// account fills up with everything else the startup does: other environments, other projects,
+// a marketing site, a mail domain, whatever the business needed before it needed a platform.
 //
 // So the questions here are not "did we leave a mess" but "is the thing we are about to claim
 // already somebody's". Every one of them is knowable in seconds and none of them was checked.

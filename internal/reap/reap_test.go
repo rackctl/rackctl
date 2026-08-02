@@ -506,9 +506,9 @@ func (s *spokeExecer) Query(context.Context, string, ...string) (string, error) 
 //
 // The path and the name are structural guesses about a resource. The tags are the resource's
 // own statement about itself. In a dedicated account the difference is academic; in the
-// account this runs against it is not, because that account holds three estates and two of
-// them tag with an identical Project value — one of which owns the account's CloudTrail
-// bucket, its CUR bucket and its inbound mail.
+// account that has been used for anything else it is not, because the org tagging standard
+// pins one Project value for every deployment that follows it — including whichever one owns
+// the account's CloudTrail, its CUR, or its mail.
 
 func TestOperatorRoles_RefusesARoleThatCannotBeProvedOurs(t *testing.T) {
 	cases := []struct {

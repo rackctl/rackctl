@@ -222,10 +222,11 @@ type execer interface {
 // the operator's prefix"; the name says "something named this for our cluster". Neither is a
 // statement by the resource itself, and the name filter is a documented prefix match with a
 // known collision (see below). In an account holding one estate that is enough, because there
-// is nothing else it could be. This is not that account: it holds three estates, two of which
-// tag with an identical Project value, so "it looks like ours" and "it is ours" have come
-// apart. Owner.Proves closes that gap — see own.go for why Repository is the only key that
-// can. A candidate that cannot be proved is REPORTED and SKIPPED, never deleted.
+// is nothing else it could be. An account that has been used for anything else breaks that,
+// and the org tagging standard does not help — it pins one Project value for every deployment
+// that follows it, so "it looks like ours" and "it is ours" come apart. Owner.Proves closes
+// that gap; see own.go for why Repository is the only key that can. A candidate that cannot be
+// proved is REPORTED and SKIPPED, never deleted.
 //
 // Skipping has a cost and it is named in the output: an operator-minted role that survives is
 // exactly what makes agent-iam fail on DeleteConflict, so a skip predicts the teardown failure
@@ -560,8 +561,8 @@ func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster
 // living inside the backstop written to catch it.
 //
 // The fix is not to widen the DELETE. A volume with no cluster tag cannot be proved to belong
-// to this run, and this account holds three estates, so deleting on provenance alone is
-// exactly the overreach the standing rule forbids. The fix is to stop being silent: enumerate
+// to this run, and an account may hold more than this deployment, so deleting on provenance
+// alone is exactly the overreach the standing rule forbids. The fix is to stop being silent: enumerate
 // available volumes that carry EBS CSI provenance and no cluster tag, and REPORT them, naming
 // the cost. An operator who is told "three volumes are probably yours and I will not guess"
 // can delete three volumes. An operator told nothing pays for them indefinitely.
