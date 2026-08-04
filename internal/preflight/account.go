@@ -438,9 +438,31 @@ func CheckBedrockLogging(ctx context.Context, env *Env) doctor.Result {
 // It belongs in preflight rather than in the probe phase for exactly that reason: by the time a
 // probe could observe it, the data it would have needed is already unrecoverable.
 //
-// PlatformId is what the budget reconciler filters CUR on. Repository is what tells this
-// deployment's spend apart from anything else in the account — and in a shared account that
-// distinction is the difference between a tenant's bill and somebody's website.
+// # Two halves of one bill, and they are attributed by different mechanisms
+//
+// The check used to look for a bare `PlatformId` and report healthy when it found one. That
+// covers the tenant's DATASTORES and nothing else, because attribution by resource tag requires
+// a resource that can carry a tag — and a Bedrock model invocation is not one. No `resourceTags/`
+// key is ever populated on an invocation line.
+//
+// AWS attributes model spend by CALLING IDENTITY instead. Tags on the IAM user or role appear in
+// CUR under a separate prefix, `iamPrincipal/<key>`, alongside `resourceTags/<key>`, and the two
+// are activated separately — the Billing console has an IAM-principal tag type you filter for.
+// So the two keys attribute disjoint halves of the bill, and the half that resource tags cannot
+// see is the dominant cost. A check that looks only at the bare key reports healthy on an
+// account whose model spend is entirely unattributed.
+//
+// # And the IAM-principal half CANNOT be activated before the install
+//
+// "For Amazon Bedrock, tags only appear for activation after the IAM principal with the tags has
+// made at least one API call" — then up to 24 hours for the key to appear, and up to 24 more to
+// activate. So unlike the resource-tag half, this one is not a thing to do first. It is a thing
+// to do promptly AFTER the first invocations, and telling an operator to activate it now would
+// send them looking for a key that cannot exist yet.
+//
+// It also requires CUR 2.0: "If you are using the legacy CUR format, IAM principal fields will
+// not be available." landing-zone's org-cost models a CUR 2.0 Data Export with
+// INCLUDE_IAM_PRINCIPAL_DATA, which is the layer that satisfies this.
 func CheckCostAllocationTags(ctx context.Context, env *Env) doctor.Result {
 	const name = "cost allocation"
 
@@ -456,8 +478,15 @@ func CheckCostAllocationTags(ctx context.Context, env *Env) doctor.Result {
 		return warn(name, "could not read cost allocation tags")
 	}
 	active := map[string]bool{}
+	// A key may come back bare or carrying its CUR column prefix. Both forms are recorded so the
+	// resource-tag half and the IAM-principal half can be told apart rather than collapsed —
+	// collapsing them is what made this check report healthy over unattributed model spend.
+	iamPrincipal := map[string]bool{}
 	for _, k := range strings.Fields(raw) {
 		active[k] = true
+		if rest, ok := strings.CutPrefix(k, "iamPrincipal/"); ok {
+			iamPrincipal[rest] = true
+		}
 	}
 
 	var missing []string
@@ -466,10 +495,31 @@ func CheckCostAllocationTags(ctx context.Context, env *Env) doctor.Result {
 			missing = append(missing, k)
 		}
 	}
-	if len(missing) == 0 {
-		return ok(name, "PlatformId and Repository are active cost allocation tags")
+
+	// The model-spend half. Reported whether or not the resource-tag half is healthy, because
+	// "PlatformId is active" is precisely the observation that used to hide it.
+	modelSpend := ""
+	if !iamPrincipal["PlatformId"] && !active["iamPrincipal/PlatformId"] {
+		modelSpend = "No iamPrincipal/PlatformId is active, so MODEL spend is unattributed — and " +
+			"model spend is the dominant cost. A Bedrock invocation is not a taggable resource, so " +
+			"no resourceTags/ key is ever populated on one; AWS attributes it by calling identity " +
+			"instead, and IAM-principal tags are activated separately from resource tags (filter " +
+			"for the IAM principal tag type in Billing → Cost allocation tags). This one cannot be " +
+			"done yet if nothing has invoked a model: the key only appears for activation after a " +
+			"tagged principal has made at least one call, then takes up to 24h to appear and up to " +
+			"24h more to activate. It also needs CUR 2.0 — the legacy format carries no IAM " +
+			"principal fields at all. Do it once the platform is serving traffic, not before."
 	}
-	return warn(name, fmt.Sprintf(
+
+	switch {
+	case len(missing) == 0 && modelSpend == "":
+		return ok(name, "PlatformId and Repository are active, and iamPrincipal/PlatformId covers model spend")
+	case len(missing) == 0:
+		return warn(name, "PlatformId and Repository are active, which covers the tenant's "+
+			"datastores. "+modelSpend)
+	}
+
+	detail := fmt.Sprintf(
 		"%s %s not activated as cost allocation tag(s), so %s NULL in CUR. The budget reconciler "+
 			"filters on resource_tags_user_platform_id, and Repository is what separates this "+
 			"deployment's spend from anything else in the account. Activation is payer-level and "+
@@ -478,5 +528,9 @@ func CheckCostAllocationTags(ctx context.Context, env *Env) doctor.Result {
 			"Activate under Billing → Cost allocation tags.",
 		strings.Join(missing, " and "),
 		map[bool]string{true: "is", false: "are"}[len(missing) == 1],
-		map[bool]string{true: "it is", false: "they are"}[len(missing) == 1]))
+		map[bool]string{true: "it is", false: "they are"}[len(missing) == 1])
+	if modelSpend != "" {
+		detail += " SEPARATELY: " + modelSpend
+	}
+	return warn(name, detail)
 }
