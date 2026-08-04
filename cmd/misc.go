@@ -52,6 +52,10 @@ var (
 	destroyDryRun       bool
 	destroyYes          bool
 	destroyForceBuckets bool
+	// destroyAccountScoped permits removing the two eks-agent-platform roots under live/org.
+	// Off by default because they are shared by every environment in the account, so a single
+	// environment's teardown removing them is O14's failure arriving through the destroy door.
+	destroyAccountScoped bool
 )
 
 var destroyCmd = &cobra.Command{
@@ -267,17 +271,24 @@ wedge there until that lands upstream.`,
 		// are precisely what the teardown has not reached yet — so this reads them back rather
 		// than guessing or skipping.
 		//
-		// O5: bedrock and cost-pipeline still have no force_destroy_buckets. A destroy after
-		// the platform has run may wedge on those four buckets until upstream ships the input.
-		// Disclosed here so --force-buckets is not mistaken for covering that tree.
+		// Two of that tree's roots are account-scoped and are NOT torn down by default — see
+		// AgentPlatformTeardown. --account-scoped opts in; the phase names what it leaves or
+		// takes either way.
+		//
+		// O5 has landed upstream, so --force-buckets now reaches that tree too: cost-pipeline
+		// accepts force_destroy_buckets and bedrock-account derives force_destroy from its
+		// object-lock mode, which live/org pins to GOVERNANCE for this reason.
 		if cfg.AgentPlatform.Enabled() {
-			if destroyForceBuckets {
-				fmt.Println(ui.Warn("force-buckets does not cover eks-agent-platform bedrock/cost-pipeline " +
-					"(ledger O5) — those four buckets still have no force_destroy_buckets input"))
+			if destroyAccountScoped && !destroyForceBuckets {
+				fmt.Println(ui.Warn("--account-scoped without --force-buckets: the account buckets take " +
+					"writes from the first PUT, so the destroy will wedge on BucketNotEmpty"))
 			}
 			phases.CaptureLandingZoneOutputs(ctx, st)
 			fmt.Println(ui.Step("destroy agent-platform substrate"))
-			if err := phases.DestroyAgentPlatform(ctx, st); err != nil {
+			if err := phases.DestroyAgentPlatform(ctx, st, phases.AgentPlatformTeardown{
+				AccountScoped: destroyAccountScoped,
+				ForceBuckets:  destroyForceBuckets,
+			}); err != nil {
 				return err
 			}
 		}
@@ -352,4 +363,6 @@ func init() {
 	destroyCmd.Flags().BoolVar(&destroyYes, "yes", false, "skip the confirmation prompt (for CI and scripted teardowns)")
 	destroyCmd.Flags().BoolVar(&destroyForceBuckets, "force-buckets", false,
 		"before destroying, apply force_destroy_buckets=true on bucket-owning components so non-empty buckets can be emptied (two-act; required outside development for a reliable teardown)")
+	destroyCmd.Flags().BoolVar(&destroyAccountScoped, "account-scoped", false,
+		"also destroy the account-scoped agent-platform roots (Bedrock invocation logging, the cost pipeline). They are SHARED by every environment in this account — only for the last one. Pair with --force-buckets")
 }

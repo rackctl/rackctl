@@ -11,38 +11,88 @@ import (
 	"github.com/rackctl/rackctl/internal/engine"
 )
 
-// agentPlatformComponents is the apply order for eks-agent-platform/terraform. Destroy runs
-// it in reverse.
+// apComponent is one component of the eks-agent-platform tree together with the CARDINALITY of
+// its root, which is the thing this file exists to get right.
 //
-// Only ONE edge inside this tree is load-bearing, and it is already expressed: every
-// cost-pipeline leaf declares `dependency "bedrock"` and wires
-// bedrock_invocation_log_group from it. That dependency permits mock outputs for validate,
-// plan AND init — but not apply or destroy — so cost-pipeline can init against an unapplied
-// bedrock and then fail the apply. It goes last.
+// Two components own objects AWS keeps exactly one of per account and region — the Bedrock
+// invocation-logging configuration, and the Cost and Usage Report. Neither can be modelled per
+// environment without three roots fighting over one object, so upstream gave them their own
+// roots under live/org and left the rest per cluster. A single path template cannot address
+// both, which is how this phase came to abort before applying anything: it looked for
+// live/<env>-platform/cost-pipeline, a directory that no longer exists.
+type apComponent struct {
+	name string
+	// account marks a root applied ONCE for the account, at live/org/<name>, rather than once
+	// per environment. It changes three things: the path, the variables it is handed, and
+	// whether a teardown of one environment is allowed to remove it at all.
+	account bool
+}
+
+// agentPlatformComponents is the apply order. Destroy runs it in reverse, minus the account
+// roots unless a teardown explicitly asks for them.
 //
-// The coupling is real infrastructure, not just terragrunt bookkeeping: cost-pipeline creates
-// an aws_cloudwatch_log_subscription_filter on the log group bedrock owns. Removing the
-// dependency block would not remove the ordering.
+// The ordering is two chains joined at one point:
 //
-// batch-runtime is deliberately absent. It is a component with no live root in any
-// environment, so there is nothing here to apply — see assertAgentPlatformRoots, which says so
-// rather than letting terragrunt discover it.
-func agentPlatformComponents() []string {
-	return []string{
-		"bedrock",
-		"agent-egress",
-		"accelerator-pools",
-		"eval-runtime",
-		"kill-switch",
-		"cost-pipeline", // last: needs bedrock's invocation log group
+//	bedrock-account → cost-pipeline        the account chain, applied once
+//	bedrock → … → cost-access              the cluster chain
+//
+// bedrock-account first, because it is the only root here with no upstream dependency and
+// everything downstream reads what it publishes. cost-pipeline follows it: the account root
+// reads bedrock-account's invocation log-group name from SSM
+// (/eks-agent-platform/org/bedrock-account/invocation_log_group) and subscribes to the log group
+// bedrock-account owns.
+//
+// That ordering used to be expressed as a terragrunt `dependency "bedrock"` block, and the
+// comment here still said so long after it stopped being true. The dependency is real; the
+// mechanism is SSM now, which means terragrunt will NOT enforce it — a wrong order fails at
+// apply against a parameter that does not exist yet, rather than being reordered for us. So the
+// order in this slice is load-bearing in a way it was not before.
+//
+// cost-access goes last in the cluster chain because it is the join: it reads the account
+// contract cost-pipeline publishes under /eks-agent-platform/org/cost-pipeline/* AND landing-zone
+// agent-iam's operator role under /eks-agent-platform/<cluster>/agent-iam/*, then republishes the
+// account values under this cluster's key so the operator can resolve them by the same
+// cluster-scoped path it uses for everything else. It holds no substrate of its own — just the
+// IAM grant and that republish.
+//
+// batch-runtime is deliberately absent. It is a component with no live root in any environment,
+// so there is nothing here to apply — see assertAgentPlatformRoots, which says so rather than
+// letting terragrunt discover it.
+func agentPlatformComponents() []apComponent {
+	return []apComponent{
+		{name: "bedrock-account", account: true},
+		{name: "cost-pipeline", account: true}, // reads bedrock-account's log group over SSM
+		{name: "bedrock"},
+		{name: "agent-egress"},
+		{name: "accelerator-pools"},
+		{name: "eval-runtime"},
+		{name: "kill-switch"},
+		{name: "cost-access"}, // last: joins the account contract to this cluster's operator
 	}
 }
 
-// agentPlatformDir is the terragrunt path for one component of that tree. The layout is
-// live/<environment>-platform/<component> — note the "-platform" suffix on the environment
-// directory, which is this tree's own convention and not landing-zone's.
-func agentPlatformDir(st *engine.State, component string) string {
-	return fmt.Sprintf("terraform/live/%s-platform/%s", st.Config.Environment, component)
+// agentPlatformComponentNames is the display list, for notes that name what is being applied.
+func agentPlatformComponentNames(comps []apComponent) []string {
+	names := make([]string, 0, len(comps))
+	for _, c := range comps {
+		names = append(names, c.name)
+	}
+	return names
+}
+
+// agentPlatformDir is the terragrunt path for one component of that tree.
+//
+// Per cluster the layout is live/<environment>-platform/<component> — note the "-platform"
+// suffix on the environment directory, which is this tree's own convention and not
+// landing-zone's. Account roots live at live/org/<component> instead: `org` is the reserved
+// account-scope token from nanohype/standards/resource-naming.json, occupying the environment
+// slot rather than adding a tier above it, and live/org/env.hcl pins `environment = "org"` for
+// everything under it.
+func agentPlatformDir(st *engine.State, c apComponent) string {
+	if c.account {
+		return fmt.Sprintf("terraform/live/org/%s", c.name)
+	}
+	return fmt.Sprintf("terraform/live/%s-platform/%s", st.Config.Environment, c.name)
 }
 
 // agentPlatformEnv builds the TF_VARs this tree needs from what rackctl captured while
@@ -135,18 +185,66 @@ func agentPlatformEnv(st *engine.State) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The names differ across the two trees: landing-zone exports karpenter_node_role_name,
-	// this tree's variable is node_role_name. It is unambiguously the Karpenter node role —
-	// accelerator-pools attaches an inline policy to it so GPU and Neuron nodes can pull
-	// device-plugin images. The name is deterministic (<cluster>-karpenter-node); landing-zone
-	// pins it with node_iam_role_use_name_prefix = false precisely so it can be referenced.
-	nodeRole, err := needOutput(st, "karpenter_node_role_name", "cluster")
+	env = append(env, "TF_VAR_cluster_security_group_id="+sg)
+
+	// node_role_name is deliberately NOT sent, and this is a deletion rather than an omission.
+	//
+	// accelerator-pools used to attach an inline ec2:Describe* policy to the Karpenter node role
+	// for the AWS Neuron device plugin's topology discovery. There is no Neuron device plugin —
+	// eks-gitops installs the GPU Operator and the NVIDIA DRA driver and nothing else — so the
+	// whole Neuron half went upstream, and `var.node_role_name` and the data source resolving it
+	// went with it (accelerator-pools/variables.tf:11 records the absence deliberately).
+	//
+	// tofu ignores a TF_VAR_ naming a variable no root declares, so this was inert rather than
+	// broken. What was not inert was the `needOutput(st, "karpenter_node_role_name", "cluster")`
+	// behind it: a hard requirement that failed the whole phase before applying anything, to
+	// produce a value nothing reads. Ledger O24.
+
+	return env, nil
+}
+
+// agentPlatformAccountEnv builds the TF_VARs the two account-scoped roots need.
+//
+// A separate function rather than a filter over the cluster set, because the two are different
+// in kind rather than in degree. An account root is applied once for the account and must
+// produce the same thing whichever environment's install happens to reach it first — so the
+// interesting question is not "which of these variables does it use" but "which of them is it
+// safe to hand something environment-specific".
+//
+// Deliberately NOT sent:
+//
+//   - cluster_name. Neither account component declares it, and live/root.hcl merges it into a
+//     root's inputs only when the root has one. Sending it would be inert today and is exactly
+//     the kind of inert-until-it-isn't input that produces a resource named for a cluster in a
+//     place where there is no cluster.
+//   - environment. Both components declare it with `default = "org"` and a validation block
+//     pinning it to that literal. An ambient TF_VAR beats a leaf's inputs (ledger S1), so
+//     sending the config's environment here would rename every account-scoped bucket —
+//     development-<acct>-<region>-cost-* rather than org-… — except that upstream's validation
+//     refuses it first. Relying on somebody else's guard is not the same as not making the
+//     mistake, so it is not sent.
+//
+// What IS sent is the pair of CMK ARNs, and there is a real hazard in them worth stating where
+// it can be read. landing-zone mints one secrets CMK per ENVIRONMENT (there is no `org` secrets
+// root), so whichever environment installs first hands the account its cost and log key, and a
+// later install from a different environment repoints it. That is upstream's shape rather than
+// something rackctl can fix from here — see noteAccountScopedApply, which says so at apply time
+// instead of leaving it to be discovered.
+func agentPlatformAccountEnv(st *engine.State) ([]string, error) {
+	// AWS_ACCOUNT_ID, not a TF_VAR: live/org/env.hcl reads it with get_env() to build the state
+	// bucket name, which terragrunt resolves at PARSE time, before variables exist.
+	env := []string{"AWS_ACCOUNT_ID=" + st.Config.Cloud.AccountID}
+
+	dataKMS, err := needOutput(st, "kms_key_arn", "secrets")
 	if err != nil {
 		return nil, err
 	}
+	// bedrock-account takes only logs_kms_key_arn and does not declare a data key; cost-pipeline
+	// takes both. Sending both to both is inert on the one that does not declare it, and keeps
+	// the account chain from needing a per-component variable table.
 	env = append(env,
-		"TF_VAR_cluster_security_group_id="+sg,
-		"TF_VAR_node_role_name="+nodeRole)
+		"TF_VAR_logs_kms_key_arn="+logsKMSKey(st, dataKMS),
+		"TF_VAR_data_kms_key_arn="+dataKMS)
 
 	return env, nil
 }
@@ -298,7 +396,11 @@ func ensureAgentPlatformBackend(ctx context.Context, st *engine.State) error {
 // which is what the operator's budget reconciler queries — leaving it with no data source at
 // all.
 func applyAgentPlatform(ctx context.Context, st *engine.State) error {
-	env, err := agentPlatformEnv(st)
+	clusterEnv, err := agentPlatformEnv(st)
+	if err != nil {
+		return err
+	}
+	accountEnv, err := agentPlatformAccountEnv(st)
 	if err != nil {
 		return err
 	}
@@ -315,28 +417,55 @@ func applyAgentPlatform(ctx context.Context, st *engine.State) error {
 	// it, which is the rule componentEnv exists to enforce one repo over.
 	prevDir, prevEnv := st.Runner.Dir, st.Runner.Env
 	st.Runner.Dir = st.Repos.AgentPlatform
-	st.Runner.Env = append(append([]string(nil), prevEnv...), env...)
 	defer func() { st.Runner.Dir, st.Runner.Env = prevDir, prevEnv }()
 
 	if st.Runner.DryRun {
 		note(st, "agent-platform substrate: (apply) reads kms_key_arn and logs_kms_key_arn from "+
 			"landing-zone's secrets; vpc_id, private_subnet_ids and both route-table lists from "+
-			"network; cluster_security_group_id and karpenter_node_role_name from cluster — then "+
-			"hands them to this tree as TF_VAR_*. The <placeholders> below are those reads, not values")
+			"network; cluster_security_group_id from cluster — then hands them to this tree as "+
+			"TF_VAR_*. The <placeholders> below are those reads, not values")
 	}
 	noteAgentPlatformTeardown(st)
+	noteAccountScopedApply(st)
 
 	for _, c := range agentPlatformComponents() {
+		// The environment is rebuilt per component rather than once for the loop, because the
+		// account roots must not receive the cluster set. Assigning a fresh slice each time
+		// also keeps one component's variables from accumulating onto the next.
+		vars := clusterEnv
+		if c.account {
+			vars = accountEnv
+		}
+		st.Runner.Env = append(append([]string(nil), prevEnv...), vars...)
+
 		dir := agentPlatformDir(st, c)
 		if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", "init"); err != nil {
-			return fmt.Errorf("agent-platform %s: init: %w", c, err)
+			return fmt.Errorf("agent-platform %s: init: %w", c.name, err)
 		}
 		if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive",
 			"apply", "-auto-approve"); err != nil {
-			return fmt.Errorf("agent-platform %s: apply: %w", c, err)
+			return fmt.Errorf("agent-platform %s: apply: %w", c.name, err)
 		}
 	}
 	return nil
+}
+
+// noteAccountScopedApply discloses that two of these roots are not this environment's.
+//
+// Applying them is correct and idempotent — they are the same objects whichever environment
+// reaches them — but two consequences are invisible from inside a single-environment install
+// and expensive to discover from outside one.
+func noteAccountScopedApply(st *engine.State) {
+	note(st, "agent-platform substrate: bedrock-account and cost-pipeline apply at live/org, ONCE "+
+		"for the account rather than once per environment. AWS keeps exactly one Bedrock "+
+		"invocation-logging configuration and one Cost and Usage Report per account, so these are "+
+		"shared with every other environment installed here")
+	note(st, "agent-platform substrate: NOTE — the account's cost and log CMK comes from THIS "+
+		"environment's landing-zone secrets component, because landing-zone mints one secrets key "+
+		"per environment and there is no `org` secrets root. Installing a second environment here "+
+		"later repoints the account's key at that environment's, and objects already written stay "+
+		"encrypted under this one — so this key must not be destroyed while the account pipeline "+
+		"holds data it wrote")
 }
 
 // noteAgentPlatformTeardown says, at apply time, which of these components cannot be taken
@@ -354,13 +483,16 @@ func applyAgentPlatform(ctx context.Context, st *engine.State) error {
 // `var.object_lock_mode != "COMPLIANCE"`, so it resolves true. It does quietly require
 // s3:BypassGovernanceRetention on the caller, which rackctl neither declares nor checks.
 func noteAgentPlatformTeardown(st *engine.State) {
-	note(st, "agent-platform substrate: applying %s", strings.Join(agentPlatformComponents(), ", "))
-	note(st, "agent-platform substrate: NOTE — bedrock and cost-pipeline cannot be destroyed cleanly "+
-		"once the platform has run. Four S3 buckets between them carry no force-destroy setting "+
-		"(bedrock access-logs; cost-pipeline access-logs, cur, athena-results — two of them "+
-		"versioned), and all four take writes in normal operation, so a teardown meets "+
-		"BucketNotEmpty. Emptying them by hand is the workaround until the components gain the "+
-		"force_destroy_buckets input landing-zone's equivalents already have")
+	note(st, "agent-platform substrate: applying %s",
+		strings.Join(agentPlatformComponentNames(agentPlatformComponents()), ", "))
+	note(st, "agent-platform substrate: NOTE — the account-scoped buckets take writes from the first "+
+		"PUT (S3 server-access logs land immediately), so a teardown meets BucketNotEmpty unless "+
+		"force_destroy is landed in state first. cost-pipeline now accepts force_destroy_buckets and "+
+		"bedrock-account derives it from object_lock_mode != COMPLIANCE, which live/org pins to "+
+		"GOVERNANCE for exactly this reason — so `rackctl destroy --account-scoped --force-buckets` "+
+		"can now take them down, where before this had to be done by hand. Bedrock's invocations "+
+		"bucket still carries per-object GOVERNANCE retention, so that path needs "+
+		"s3:BypassGovernanceRetention on the caller")
 }
 
 // assertAgentPlatformRoots verifies each component has a live root in the checkout, for the
@@ -378,7 +510,7 @@ func noteAgentPlatformTeardown(st *engine.State) {
 // — so it is inert, and this comment exists so the next person to write a directory walk
 // knows it is there.
 func assertAgentPlatformRoots(st *engine.State) error {
-	var missing []string
+	var missing []apComponent
 	for _, c := range agentPlatformComponents() {
 		if _, err := os.Stat(filepath.Join(st.Repos.AgentPlatform, agentPlatformDir(st, c), "terragrunt.hcl")); err != nil {
 			missing = append(missing, c)
@@ -387,20 +519,21 @@ func assertAgentPlatformRoots(st *engine.State) error {
 	if len(missing) == 0 {
 		return nil
 	}
+	names := strings.Join(agentPlatformComponentNames(missing), ", ")
 	if st.Runner.DryRun {
-		note(st, "PLAN ONLY: this eks-agent-platform checkout has no live root for %s under %s-platform. "+
-			"A dry-run does not pull, so the tree on disk predates whatever upstream has now",
-			strings.Join(missing, ", "), st.Config.Environment)
+		note(st, "PLAN ONLY: this eks-agent-platform checkout has no live root for %s. A dry-run does "+
+			"not pull, so the tree on disk predates whatever upstream has now", names)
 		return nil
 	}
 	return &engine.NoRollbackError{Err: fmt.Errorf(
-		"eks-agent-platform has no live root for %s in the %s environment (%s).\n\n"+
-			"That tree authors its live roots per environment, and batch-runtime — the one component "+
-			"with no root in ANY environment — is excluded here for exactly this reason. If a root has "+
-			"gone missing upstream, this is the report; nothing in the agent-platform tree has been "+
+		"eks-agent-platform has no live root for %s (looked for %s).\n\n"+
+			"That tree authors its roots at two cardinalities: per environment under "+
+			"live/<environment>-platform, and once per account under live/org for the two components "+
+			"that own account+region singletons. batch-runtime — the one component with no root in ANY "+
+			"environment — is excluded here for exactly this reason. If a root has moved or gone "+
+			"missing upstream, this is the report; nothing in the agent-platform tree has been "+
 			"applied, so nothing needs unwinding",
-		strings.Join(missing, ", "), st.Config.Environment,
-		agentPlatformDir(st, missing[0]))}
+		names, agentPlatformDir(st, missing[0]))}
 }
 
 // DestroyAgentPlatform tears the tree down in reverse, and MUST run before landing-zone's
@@ -416,15 +549,18 @@ func assertAgentPlatformRoots(st *engine.State) error {
 // cluster.
 //
 // Exported for `rackctl destroy`, which walks the teardown outside the phase engine.
-func DestroyAgentPlatform(ctx context.Context, st *engine.State) error {
-	env, err := agentPlatformEnv(st)
+func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatformTeardown) error {
+	clusterEnv, err := agentPlatformEnv(st)
+	if err != nil {
+		return err
+	}
+	accountEnv, err := agentPlatformAccountEnv(st)
 	if err != nil {
 		return err
 	}
 
 	prevDir, prevEnv := st.Runner.Dir, st.Runner.Env
 	st.Runner.Dir = st.Repos.AgentPlatform
-	st.Runner.Env = append(append([]string(nil), prevEnv...), env...)
 	defer func() { st.Runner.Dir, st.Runner.Env = prevDir, prevEnv }()
 
 	comps := agentPlatformComponents()
@@ -432,20 +568,110 @@ func DestroyAgentPlatform(ctx context.Context, st *engine.State) error {
 		"read agent-iam's and observability's SSM parameters through unguarded data blocks, and a "+
 		"destroy PLAN resolves data sources too, so tearing landing-zone down first leaves them "+
 		"unable to plan their own teardown")
+	noteAccountScopedTeardown(st, comps, opts)
+
 	for i := len(comps) - 1; i >= 0; i-- {
 		c := comps[i]
+		if c.account && !opts.AccountScoped {
+			continue
+		}
+		vars := clusterEnv
+		if c.account {
+			vars = accountEnv
+			// Act 1 of the two-act bucket teardown, for the account chain specifically.
+			// force_destroy has no effect until an apply lands it in state, so a destroy that
+			// only passes the variable meets BucketNotEmpty exactly as if it had not.
+			if opts.ForceBuckets {
+				vars = append(append([]string(nil), vars...), "TF_VAR_force_destroy_buckets=true")
+			}
+		}
+		st.Runner.Env = append(append([]string(nil), prevEnv...), vars...)
+
 		dir := agentPlatformDir(st, c)
+		if c.account && opts.ForceBuckets {
+			note(st, "agent-platform substrate: %s — landing force_destroy_buckets=true before destroying", c.name)
+			if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", "init"); err != nil {
+				return fmt.Errorf("agent-platform %s: init: %w", c.name, err)
+			}
+			if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive",
+				"apply", "-auto-approve"); err != nil {
+				return fmt.Errorf("agent-platform %s: permitting bucket teardown: %w", c.name, err)
+			}
+		}
+
 		if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", "init"); err != nil {
-			return fmt.Errorf("agent-platform %s: init: %w", c, err)
+			return fmt.Errorf("agent-platform %s: init: %w", c.name, err)
 		}
 		if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive",
 			"destroy", "-auto-approve"); err != nil {
 			return fmt.Errorf("agent-platform %s: destroy: %w — if this is BucketNotEmpty, that "+
-				"component owns S3 buckets with no force-destroy setting and they have to be emptied "+
-				"by hand; see the note at apply time", c, err)
+				"component owns S3 buckets that need force_destroy landed in state first; "+
+				"`rackctl destroy --account-scoped --force-buckets` does that two-act sequence", c.name, err)
 		}
 	}
 	return nil
+}
+
+// AgentPlatformTeardown says how far a teardown of ONE environment may reach.
+//
+// The two fields exist because the account roots are not this environment's to delete by
+// default, and because reaching them at all is useless without also being allowed to empty what
+// they own.
+type AgentPlatformTeardown struct {
+	// AccountScoped permits destroying live/org/bedrock-account and live/org/cost-pipeline.
+	//
+	// Off by default, and that default is the whole point. Those two roots hold the account's
+	// single Bedrock invocation-logging configuration and its single Cost and Usage Report,
+	// shared by every environment installed here. Tearing down development with this on, while
+	// production is live, deletes production's invocation logging outright — no name to scope
+	// it by, nothing red, and invocation logging is the signal every budget decision reads.
+	// That is ledger O14's failure returning through the teardown door rather than the apply
+	// door, and an installer does not get to make that call implicitly.
+	//
+	// Leaving them standing costs a Bedrock logging configuration, a CUR and five buckets in an
+	// account with nothing left to use them, which is disclosed by name rather than left to a
+	// bill. Deleting production's telemetry costs production.
+	AccountScoped bool
+	// ForceBuckets lands force_destroy_buckets=true on the account cost-pipeline before
+	// destroying it. Only meaningful with AccountScoped.
+	//
+	// bedrock-account needs no equivalent: its force_destroy is `object_lock_mode !=
+	// "COMPLIANCE"`, and live/org/bedrock-account pins GOVERNANCE precisely so the account tears
+	// down cleanly. It does quietly require s3:BypassGovernanceRetention on the caller.
+	ForceBuckets bool
+}
+
+// noteAccountScopedTeardown says exactly what a teardown is about to leave behind, or about to
+// take from everyone else.
+//
+// Naming the survivors matters more here than in the usual disclosure, because target 5 verifies
+// a teardown as a set difference against a baseline: anything left standing shows up as an
+// unexplained resource unless it was declared in advance.
+func noteAccountScopedTeardown(st *engine.State, comps []apComponent, opts AgentPlatformTeardown) {
+	var account []string
+	for _, c := range comps {
+		if c.account {
+			account = append(account, c.name)
+		}
+	}
+	if len(account) == 0 {
+		return
+	}
+	if !opts.AccountScoped {
+		note(st, "agent-platform substrate: NOT destroying %s — they are account-scoped roots at "+
+			"live/org, shared with every other environment in this account. Destroying them from one "+
+			"environment's teardown deletes the account's ONLY Bedrock invocation-logging "+
+			"configuration and its ONLY cost pipeline, for every environment, silently. They will "+
+			"remain: the invocation-logging configuration, the CUR, and the org-<account>-<region>- "+
+			"bedrock/cost buckets. If this is the last environment in the account, re-run with "+
+			"--account-scoped (add --force-buckets, or the buckets wedge on BucketNotEmpty)",
+			strings.Join(account, " and "))
+		return
+	}
+	note(st, "agent-platform substrate: --account-scoped — DESTROYING %s, which are shared with "+
+		"every environment in this account. Any other environment still installed here loses its "+
+		"Bedrock invocation logging and its budget data source, with nothing going red",
+		strings.Join(account, " and "))
 }
 
 // CaptureLandingZoneOutputs re-reads the landing-zone outputs the agent-platform substrate

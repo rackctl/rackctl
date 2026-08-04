@@ -213,57 +213,164 @@ func TestAgentPlatformEnv_NamesTheProducerOfAMissingOutput(t *testing.T) {
 	}
 }
 
-// cost-pipeline goes last. Its leaf declares `dependency "bedrock"` whose mock outputs cover
-// validate, plan AND init — but not apply — so it inits happily against an unapplied bedrock
-// and then fails. The coupling is also real infrastructure: cost-pipeline puts a log
-// subscription filter on the log group bedrock owns.
-func TestAgentPlatformComponents_CostPipelineFollowsBedrock(t *testing.T) {
+// apIndex is the position of a component in the apply order, or -1.
+func apIndex(comps []apComponent, name string) int {
+	return slices.IndexFunc(comps, func(c apComponent) bool { return c.name == name })
+}
+
+// The apply order is two chains, and every edge in it is real.
+//
+// bedrock-account first: it is the only root with no upstream dependency, and the account cost
+// pipeline reads its invocation log-group name out of SSM. That edge USED to be a terragrunt
+// `dependency` block, which meant terragrunt would enforce it; it is an SSM read now, which
+// means nothing enforces it but this slice. Getting it backwards fails at apply against a
+// parameter that does not exist yet.
+//
+// cost-access last: it joins the account contract (/eks-agent-platform/org/cost-pipeline/*) to
+// this cluster's operator, and republishes the account values under the cluster key.
+func TestAgentPlatformComponents_OrderingHoldsBothChains(t *testing.T) {
 	comps := agentPlatformComponents()
-	b, c := slices.Index(comps, "bedrock"), slices.Index(comps, "cost-pipeline")
-	if b < 0 || c < 0 {
-		t.Fatalf("both components must be applied; got %v", comps)
+	for _, edge := range []struct{ first, then, why string }{
+		{"bedrock-account", "cost-pipeline",
+			"the account cost pipeline reads bedrock-account's invocation log group from SSM and " +
+				"subscribes to the log group it owns"},
+		{"cost-pipeline", "cost-access",
+			"cost-access reads the account contract cost-pipeline publishes under " +
+				"/eks-agent-platform/org/cost-pipeline/* and republishes it under this cluster's key"},
+	} {
+		a, b := apIndex(comps, edge.first), apIndex(comps, edge.then)
+		if a < 0 || b < 0 {
+			t.Fatalf("both %q and %q must be applied; got %v", edge.first, edge.then,
+				agentPlatformComponentNames(comps))
+		}
+		if a > b {
+			t.Errorf("%s (%d) must precede %s (%d): %s", edge.first, a, edge.then, b, edge.why)
+		}
 	}
-	if b > c {
-		t.Fatalf("bedrock (%d) must precede cost-pipeline (%d): cost-pipeline resolves "+
-			"bedrock_invocation_log_group from bedrock's state and subscribes to the log group it "+
-			"owns.\ngot %v", b, c, comps)
-	}
-}
-
-// batch-runtime has no live root in ANY environment, so applying it would fail on a directory
-// with no terragrunt.hcl. It is excluded by name rather than by a directory walk — which would
-// also stumble over live/production-platform/agent-iam, a stray holding a lock file and a
-// cache but no terragrunt.hcl.
-func TestAgentPlatformComponents_ExcludesTheRootlessComponent(t *testing.T) {
-	if slices.Contains(agentPlatformComponents(), "batch-runtime") {
-		t.Fatal("batch-runtime has no live root in any environment; applying it fails on a directory " +
-			"with no terragrunt.hcl")
-	}
-	if slices.Contains(agentPlatformComponents(), "agent-iam") {
-		t.Fatal("live/production-platform/agent-iam is a stray directory with no terragrunt.hcl — " +
-			"agent-iam is a LANDING-ZONE component")
+	// cost-access is the join and belongs at the end of the cluster chain.
+	if got := apIndex(comps, "cost-access"); got != len(comps)-1 {
+		t.Errorf("cost-access is at %d of %d; it reads landing-zone's agent-iam contract AND the "+
+			"account contract, so it is the last thing that can succeed", got, len(comps)-1)
 	}
 }
 
-// The path shape is this tree's own: live/<environment>-platform/<component>. The "-platform"
-// suffix is not landing-zone's convention, and getting it wrong points every invocation at a
-// directory that does not exist.
-func TestAgentPlatformDir_UsesTheEnvironmentPlatformLayout(t *testing.T) {
+// The components that no longer exist must be GONE, not merely joined by their replacements.
+//
+// cost-pipeline moved to live/org and cost-access took its place per cluster. A list still
+// naming a per-cluster cost-pipeline makes assertAgentPlatformRoots collect it as missing, and a
+// non-dry run then returns NoRollbackError — the phase aborts before applying anything, which is
+// exactly what shipped.
+func TestAgentPlatformComponents_MatchesTheTreeOnDisk(t *testing.T) {
+	comps := agentPlatformComponents()
+	names := agentPlatformComponentNames(comps)
+
+	for _, want := range []string{"bedrock-account", "cost-pipeline", "cost-access"} {
+		if apIndex(comps, want) < 0 {
+			t.Errorf("missing %q — the tree has it; not applying it leaves the platform without "+
+				"part of its substrate", want)
+		}
+	}
+	// batch-runtime has no live root in ANY environment, so applying it would fail on a
+	// directory with no terragrunt.hcl. Excluded by name rather than by a directory walk —
+	// which would also stumble over live/production-platform/agent-iam, a stray holding a lock
+	// file and a cache but no terragrunt.hcl.
+	for _, gone := range []string{"batch-runtime", "agent-iam"} {
+		if apIndex(comps, gone) >= 0 {
+			t.Errorf("%q has no live root to apply; %v", gone, names)
+		}
+	}
+	// And the cardinalities must be right, since the path template follows from them.
+	for _, c := range comps {
+		wantAccount := c.name == "bedrock-account" || c.name == "cost-pipeline"
+		if c.account != wantAccount {
+			t.Errorf("%q: account=%v, want %v — cardinality decides the path, the variables it is "+
+				"handed, and whether one environment's teardown may remove it",
+				c.name, c.account, wantAccount)
+		}
+	}
+}
+
+// Two path shapes, and a single template cannot express both. Per cluster it is
+// live/<environment>-platform/<component> — the "-platform" suffix is this tree's own convention
+// and not landing-zone's. Account roots are at live/org/<component>, with no environment token
+// at all, because there is exactly one of the thing they name.
+func TestAgentPlatformDir_AddressesBothCardinalities(t *testing.T) {
 	st, _ := apState(t)
-	if got, want := agentPlatformDir(st, "bedrock"), "terraform/live/development-platform/bedrock"; got != want {
-		t.Fatalf("agentPlatformDir = %q, want %q", got, want)
+	for _, tc := range []struct {
+		c    apComponent
+		want string
+	}{
+		{apComponent{name: "bedrock"}, "terraform/live/development-platform/bedrock"},
+		{apComponent{name: "cost-access"}, "terraform/live/development-platform/cost-access"},
+		{apComponent{name: "bedrock-account", account: true}, "terraform/live/org/bedrock-account"},
+		{apComponent{name: "cost-pipeline", account: true}, "terraform/live/org/cost-pipeline"},
+	} {
+		if got := agentPlatformDir(st, tc.c); got != tc.want {
+			t.Errorf("agentPlatformDir(%q, account=%v) = %q, want %q", tc.c.name, tc.c.account, got, tc.want)
+		}
+	}
+	// The account path must carry no environment token. Composing it from the config would put
+	// `development` where the tree pins `org`, and live/org/env.hcl validates that literal.
+	if got := agentPlatformDir(st, apComponent{name: "cost-pipeline", account: true}); strings.Contains(got, "development") {
+		t.Errorf("the account root path carries an environment token: %q", got)
 	}
 }
 
-// The teardown consequence must be disclosed at apply time, the same way druid's is. bedrock
-// and cost-pipeline own four S3 buckets with no force_destroy between them, all written to in
-// normal operation, so a destroy meets BucketNotEmpty after any traffic.
+// The teardown consequence must be disclosed at apply time, the same way druid's is. The
+// account-scoped buckets take writes from the first PUT, so a destroy meets BucketNotEmpty
+// unless force_destroy is landed in state first.
 func TestAgentPlatform_DisclosesTheTeardownBlocker(t *testing.T) {
 	st, out := apState(t)
 	noteAgentPlatformTeardown(st)
-	if !strings.Contains(out.String(), "cannot be destroyed cleanly") {
-		t.Fatalf("applying components that cannot be torn down must say so at apply time — that is "+
-			"the rule the druid disclosure established.\ngot:\n%s", out.String())
+	if !strings.Contains(out.String(), "BucketNotEmpty") || !strings.Contains(out.String(), "force_destroy") {
+		t.Fatalf("applying components that need a two-act teardown must say so at apply time — that "+
+			"is the rule the druid disclosure established.\ngot:\n%s", out.String())
+	}
+}
+
+// Applying an account-scoped root from ONE environment is a fact about the whole account, and it
+// has to be said where it is read rather than discovered from a bill or an outage.
+func TestAgentPlatform_DisclosesTheAccountScopedApply(t *testing.T) {
+	st, out := apState(t)
+	noteAccountScopedApply(st)
+	got := out.String()
+	if !strings.Contains(got, "live/org") || !strings.Contains(got, "ONCE") {
+		t.Errorf("the apply must say these roots are account-scoped and shared:\n%s", got)
+	}
+	// The CMK hazard specifically: landing-zone mints one secrets key per ENVIRONMENT, so
+	// whichever environment installs first hands the account its key and a later one repoints
+	// it. Nothing in rackctl can fix that from here, which is exactly why it must be stated.
+	if !strings.Contains(got, "CMK") || !strings.Contains(got, "per environment") {
+		t.Errorf("the apply must disclose that this environment's CMK becomes the ACCOUNT's:\n%s", got)
+	}
+}
+
+// A one-environment teardown must NOT remove the account-scoped roots, and must name what it is
+// leaving — target 5 verifies teardown as a set difference against a baseline, so an undeclared
+// survivor reads as an unexplained resource.
+func TestAgentPlatformTeardown_LeavesTheAccountRootsAndSaysSo(t *testing.T) {
+	st, out := apState(t)
+	noteAccountScopedTeardown(st, agentPlatformComponents(), AgentPlatformTeardown{})
+	got := out.String()
+	if !strings.Contains(got, "NOT destroying") {
+		t.Fatalf("the default teardown must state that it is leaving the account roots:\n%s", got)
+	}
+	for _, want := range []string{"bedrock-account", "cost-pipeline", "--account-scoped"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the note must name %q — what survives has to be listed, and the way to remove "+
+				"it has to be reachable from the message:\n%s", want, got)
+		}
+	}
+}
+
+// And opting in must say what it costs, because the operator is now doing the thing O14 exists
+// to prevent — deliberately, which is fine, and silently, which is not.
+func TestAgentPlatformTeardown_OptingInWarnsItIsAccountWide(t *testing.T) {
+	st, out := apState(t)
+	noteAccountScopedTeardown(st, agentPlatformComponents(), AgentPlatformTeardown{AccountScoped: true})
+	got := out.String()
+	if !strings.Contains(got, "DESTROYING") || !strings.Contains(got, "every environment") {
+		t.Fatalf("--account-scoped must say the blast radius is the account, not this environment:\n%s", got)
 	}
 }
 
@@ -374,9 +481,13 @@ exit 0
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	// The live roots the phase asserts before applying anything.
+	// The live roots the phase asserts before applying anything. Built through agentPlatformDir
+	// rather than by hand, so the fixture cannot quietly disagree with the path the phase uses —
+	// which is precisely how a per-cluster cost-pipeline stayed in the list after the tree moved
+	// it to live/org.
+	fixtureSt, _ := apState(t)
 	for _, c := range agentPlatformComponents() {
-		root := filepath.Join(dir, "terraform/live/development-platform", c)
+		root := filepath.Join(dir, agentPlatformDir(fixtureSt, c))
 		if err := os.MkdirAll(root, 0o755); err != nil {
 			t.Fatal(err)
 		}

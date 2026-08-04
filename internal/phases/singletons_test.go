@@ -17,6 +17,15 @@ import (
 // two environments would fight over one org-scoped resource, and a teardown of either would
 // destroy it for both. break-glass is the sharpest — a teardown that removes the account's
 // emergency access path removes the thing you would use to fix the teardown.
+//
+// eks-agent-platform's account-scoped roots (live/org/bedrock-account, live/org/cost-pipeline)
+// are NOT these, and the difference is ownership rather than scope. Both are account+region
+// singletons; the distinction is that nothing else in the world creates the Bedrock
+// invocation-logging configuration or this platform's cost pipeline, so a rackctl install that
+// skipped them would leave the platform without a substrate it needs and with no other way to
+// get one. Those two are applied deliberately, from live/org, and are excluded from a single
+// environment's teardown by default — see AgentPlatformTeardown. The landing-zone org-* roots
+// belong to an account this platform does not administer.
 var accountSingletons = []string{
 	"org-cost", "org-compliance", "org-scp", "org-networking", "org-identity",
 	"github-oidc", "service-quotas", "break-glass",
@@ -52,7 +61,8 @@ func TestComponents_NeverApplyAnAccountSingleton(t *testing.T) {
 							cfg.DNS = nil
 						}
 
-						got := append(CoreComponents(cfg), agentPlatformComponents()...)
+						got := append(CoreComponents(cfg),
+							agentPlatformComponentNames(agentPlatformComponents())...)
 						for _, c := range got {
 							for _, s := range accountSingletons {
 								if c == s || (strings.HasPrefix(s, "org-") && strings.HasPrefix(c, "org-")) {

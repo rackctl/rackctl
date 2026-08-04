@@ -941,11 +941,21 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 // this before the substrate and cluster phases, which is exactly the constraint the tree
 // needs: its components resolve landing-zone's SSM parameters through unguarded data blocks
 // that a destroy plan still evaluates.
+// The account-scoped roots are deliberately left standing, and a rollback is the strongest case
+// for that default rather than the weakest. This path is not an operator's decision — it is
+// automatic cleanup after a phase failed — and the two roots under live/org hold the account's
+// only Bedrock invocation-logging configuration and its only cost pipeline, shared by every
+// environment installed here. A failed development apply that swept them would take production's
+// invocation logging with it, unattended, with nothing red.
+//
+// They are named at apply time and again here, so what survives a rollback is stated rather than
+// discovered. Removing them is `rackctl destroy --account-scoped`, which is a sentence somebody
+// has to type.
 func (platform) Teardown(ctx context.Context, st *engine.State) error {
 	if !st.Config.AgentPlatform.Enabled() {
 		return nil
 	}
-	return DestroyAgentPlatform(ctx, st)
+	return DestroyAgentPlatform(ctx, st, AgentPlatformTeardown{})
 }
 
 // --- Phase 7 (optional): eks-fleet cluster control plane ---
