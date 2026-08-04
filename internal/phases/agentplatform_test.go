@@ -31,7 +31,13 @@ func apState(t *testing.T) (*engine.State, *strings.Builder) {
 		Config: cfg,
 		Runner: run,
 		Outputs: map[string]string{
-			"kms_key_arn":               "arn:aws:kms:us-west-2:111111111111:key/abc",
+			// The two CMK outputs are deliberately DIFFERENT here. They are equal in every
+			// default deployment — secrets publishes one key under both names unless an
+			// environment sets separate_logs_key — and a fixture that reproduced that equality
+			// would make the wiring untestable: crossing the two variables, or dropping back to
+			// one lookup, would still pass.
+			"kms_key_arn":               "arn:aws:kms:us-west-2:111111111111:key/data",
+			"logs_kms_key_arn":          "arn:aws:kms:us-west-2:111111111111:key/logs",
 			"vpc_id":                    "vpc-0abc",
 			"private_subnet_ids":        `["subnet-a","subnet-b","subnet-c"]`,
 			"private_route_table_ids":   `["rtb-p1","rtb-p2"]`,
@@ -77,21 +83,62 @@ func TestAgentPlatformEnv_SetsTheParseTimeAccountID(t *testing.T) {
 	}
 }
 
-// One landing-zone key serves both variables. There is no separate logs/data CMK: the secrets
-// component mints a single key whose policy is the only one in landing-zone granting both
-// logs.<region>.amazonaws.com and bedrock.amazonaws.com — exactly this pair of consumers.
-func TestAgentPlatformEnv_OneCMKServesBothKMSVariables(t *testing.T) {
+// Each KMS variable follows its own landing-zone output.
+//
+// This test previously asserted the opposite — that one output served both — and explained that
+// a second lookup "would be inventing a key that does not exist". That was correct until
+// landing-zone#205, which added `separate_logs_key` and a second output. The output exists now,
+// and reading it is what keeps the wiring correct once an environment separates: on separation
+// the log-path grants MOVE off the secrets key rather than being copied, so an installer still
+// passing the data key here fails at CreateLogGroup.
+func TestAgentPlatformEnv_EachKMSVariableFollowsItsOwnOutput(t *testing.T) {
 	st, _ := apState(t)
 	env, err := agentPlatformEnv(st)
 	if err != nil {
 		t.Fatalf("agentPlatformEnv: %v", err)
 	}
-	arn := "arn:aws:kms:us-west-2:111111111111:key/abc"
-	for _, want := range []string{"TF_VAR_logs_kms_key_arn=" + arn, "TF_VAR_data_kms_key_arn=" + arn} {
+	for _, want := range []string{
+		"TF_VAR_logs_kms_key_arn=arn:aws:kms:us-west-2:111111111111:key/logs",
+		"TF_VAR_data_kms_key_arn=arn:aws:kms:us-west-2:111111111111:key/data",
+	} {
 		if !slices.Contains(env, want) {
-			t.Errorf("missing %q — landing-zone's agent-iam wires its own data_kms_key_arn from the "+
-				"same secrets output, so a second lookup would be inventing a key that does not exist", want)
+			t.Errorf("missing %q — each variable reads the output published for it. "+
+				"logs_kms_key_arn is published in BOTH modes and equals kms_key_arn when sharing, "+
+				"so reading it is correct whether or not this environment separates.\ngot: %v", want, env)
 		}
+	}
+	// And specifically not crossed, which a Contains-only assertion would miss if both
+	// variables were somehow set twice.
+	if slices.Contains(env, "TF_VAR_logs_kms_key_arn=arn:aws:kms:us-west-2:111111111111:key/data") {
+		t.Error("the DATA key was sent as the log-path key. Once an environment separates, the " +
+			"secrets key no longer admits logs.<region>.amazonaws.com and every CreateLogGroup fails")
+	}
+}
+
+// A secrets state written before landing-zone#205 publishes no logs_kms_key_arn, and that must
+// not be a hard failure — most sharply on the teardown path, which reads these outputs back out
+// of a state nothing has re-applied.
+//
+// The fallback is sound rather than convenient: the output is published in BOTH modes, so a
+// state missing it came from a module that could not separate the keys, which means the one key
+// it did publish is the log key too.
+func TestAgentPlatformEnv_FallsBackWhenTheSecretsStatePredatesTheLogsOutput(t *testing.T) {
+	st, out := apState(t)
+	st.Runner.DryRun = false // the apply/destroy path; a dry-run substitutes placeholders
+	delete(st.Outputs, "logs_kms_key_arn")
+
+	env, err := agentPlatformEnv(st)
+	if err != nil {
+		t.Fatalf("an older secrets state must still resolve — hard-failing here would refuse to "+
+			"tear down every platform installed before landing-zone#205: %v", err)
+	}
+	want := "TF_VAR_logs_kms_key_arn=arn:aws:kms:us-west-2:111111111111:key/data"
+	if !slices.Contains(env, want) {
+		t.Fatalf("expected the secrets key to stand in for the log path; got %v", env)
+	}
+	if !strings.Contains(out.String(), "predates") {
+		t.Errorf("the fallback must say why it happened — a silent one is indistinguishable from "+
+			"reading the right output.\ngot:\n%s", out.String())
 	}
 }
 

@@ -81,18 +81,29 @@ func agentPlatformEnv(st *engine.State) ([]string, error) {
 	// sets TERRAGRUNT_ACCOUNT_ID for landing-zone, and this tree does not read that name.
 	env = append(env, "AWS_ACCOUNT_ID="+st.Config.Cloud.AccountID)
 
-	// One landing-zone key, two variables. There is no separate "logs" and "data" CMK: the
-	// secrets component mints a single key whose policy is the only one in landing-zone
-	// granting BOTH logs.<region>.amazonaws.com and bedrock.amazonaws.com — precisely this
-	// pair of consumers. landing-zone's own agent-iam wires its data_kms_key_arn from the same
-	// output.
-	kms, err := needOutput(st, "kms_key_arn", "secrets")
+	// Two variables, two outputs — one each. This used to read a single output and assign it
+	// twice, on the reasoning that there was no separate "logs" and "data" CMK to read. That was
+	// true when it was written and stopped being true with landing-zone#205.
+	//
+	// The secrets component now takes `separate_logs_key`. It defaults to false, which mints one
+	// key and publishes it as BOTH kms_key_arn and logs_kms_key_arn — so reading the log-path
+	// output changes nothing today. Set it true and the log-path grants (logs.<region>
+	// .amazonaws.com and bedrock.amazonaws.com) MOVE to a second key rather than being copied,
+	// deliberately: a separate logs key that the secrets key still admitted would let a log
+	// group encrypt under either and enforce nothing.
+	//
+	// Which is what makes this worth landing before anyone flips the flag. An installer still
+	// passing the data key as logs_kms_key_arn does not silently encrypt logs under the wrong
+	// key — it fails at CreateLogGroup with a KMS error. Fail-closed and loud, but still a
+	// failed install rather than a caught misconfiguration, and reading the right output avoids
+	// it entirely. Ledger O25.
+	dataKMS, err := needOutput(st, "kms_key_arn", "secrets")
 	if err != nil {
 		return nil, err
 	}
 	env = append(env,
-		"TF_VAR_logs_kms_key_arn="+kms,
-		"TF_VAR_data_kms_key_arn="+kms)
+		"TF_VAR_logs_kms_key_arn="+logsKMSKey(st, dataKMS),
+		"TF_VAR_data_kms_key_arn="+dataKMS)
 
 	vpc, err := needOutput(st, "vpc_id", "network")
 	if err != nil {
@@ -138,6 +149,35 @@ func agentPlatformEnv(st *engine.State) ([]string, error) {
 		"TF_VAR_node_role_name="+nodeRole)
 
 	return env, nil
+}
+
+// logsKMSKey resolves the log-path CMK, falling back to the data key when the secrets state on
+// disk predates the output that publishes it.
+//
+// The fallback is not a guess, and the argument for it is what makes it safe: logs_kms_key_arn
+// is published in BOTH modes, so a state that does not carry it was written by a module version
+// that could not separate the two keys — which means there is exactly one key, and the data key
+// IS the log key. A state old enough to be missing the output is old enough that the fallback
+// is the only value it could ever have had.
+//
+// It earns its place on the DESTROY path. `rackctl destroy` starts cold and reads these outputs
+// back out of a state nothing has re-applied, so a hard needOutput here would refuse to tear
+// down any platform installed before landing-zone#205 — and it would refuse at the point where
+// the operator has already decided to spend nothing more. A teardown that cannot run is the
+// exact failure this is meant to prevent, not an acceptable price for strictness.
+func logsKMSKey(st *engine.State, dataKMS string) string {
+	if v := st.Outputs["logs_kms_key_arn"]; v != "" {
+		return v
+	}
+	// A dry-run captures nothing, so name the output this WOULD read rather than echoing the
+	// data key's placeholder twice and hiding that there are two reads.
+	if st.Runner.DryRun {
+		return "<secrets.logs_kms_key_arn>"
+	}
+	note(st, "landing-zone's secrets state publishes no logs_kms_key_arn, so it predates the "+
+		"separate-logs-key change — using the secrets key for the log path, which is the value "+
+		"that state's own module would have published there")
+	return dataKMS
 }
 
 // needOutput reads a captured terragrunt output, failing with the component that produces it.
@@ -279,10 +319,10 @@ func applyAgentPlatform(ctx context.Context, st *engine.State) error {
 	defer func() { st.Runner.Dir, st.Runner.Env = prevDir, prevEnv }()
 
 	if st.Runner.DryRun {
-		note(st, "agent-platform substrate: (apply) reads kms_key_arn from landing-zone's secrets; "+
-			"vpc_id, private_subnet_ids and both route-table lists from network; "+
-			"cluster_security_group_id and karpenter_node_role_name from cluster — then hands them "+
-			"to this tree as TF_VAR_*. The <placeholders> below are those reads, not values")
+		note(st, "agent-platform substrate: (apply) reads kms_key_arn and logs_kms_key_arn from "+
+			"landing-zone's secrets; vpc_id, private_subnet_ids and both route-table lists from "+
+			"network; cluster_security_group_id and karpenter_node_role_name from cluster — then "+
+			"hands them to this tree as TF_VAR_*. The <placeholders> below are those reads, not values")
 	}
 	noteAgentPlatformTeardown(st)
 
