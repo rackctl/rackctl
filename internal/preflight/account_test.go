@@ -273,3 +273,57 @@ func TestSessionLifetime_NoExpiryIsNotAFailure(t *testing.T) {
 		t.Fatalf("no expiry means nothing to expire.\ngot %s: %s", r.Status, r.Detail)
 	}
 }
+
+// ─────────────────────────── cost allocation ───────────────────────────
+//
+// Two halves of one bill, attributed by different mechanisms, activated separately. The check
+// used to look only at the bare key — which reports healthy on an account whose model spend,
+// the dominant cost, is entirely unattributed.
+
+// Both keys active covers the tenant's DATASTORES and says nothing about model spend. A
+// Bedrock invocation is not a taggable resource, so no resourceTags/ key is ever populated on
+// one — this must not read as clear.
+func TestCostAllocation_ResourceTagsAloneDoNotCoverModelSpend(t *testing.T) {
+	fakeBin(t, "aws", `echo "PlatformId	Repository"`)
+	r := CheckCostAllocationTags(context.Background(), testEnv())
+	if r.Status == doctor.OK {
+		t.Fatalf("PlatformId and Repository being active covers datastores only. Model spend is "+
+			"attributed by calling identity, activated separately, and is the dominant cost — "+
+			"reporting OK here is the exact false clear this check exists to stop.\ngot: %s", r.Detail)
+	}
+	if !strings.Contains(r.Detail, "iamPrincipal/PlatformId") {
+		t.Errorf("the warning must name the key that is missing:\n%s", r.Detail)
+	}
+	// And it must not send the operator to activate it right now — for Bedrock the key does not
+	// appear for activation until a tagged principal has made at least one call.
+	if !strings.Contains(r.Detail, "at least one call") {
+		t.Errorf("the remedy must say this one comes AFTER traffic, or the operator goes looking "+
+			"for a key that cannot exist yet:\n%s", r.Detail)
+	}
+}
+
+// With the IAM-principal half active too, both halves are covered and the check is clear.
+func TestCostAllocation_BothHalvesActiveIsClear(t *testing.T) {
+	fakeBin(t, "aws", `echo "PlatformId	Repository	iamPrincipal/PlatformId"`)
+	if r := CheckCostAllocationTags(context.Background(), testEnv()); r.Status != doctor.OK {
+		t.Fatalf("both attribution mechanisms are active; nothing is missing.\ngot %s: %s", r.Status, r.Detail)
+	}
+}
+
+// Neither half active must report BOTH, not just the first one found. They are activated
+// through different console filters, so an operator who fixes only what they were told about
+// fixes half the bill.
+func TestCostAllocation_NothingActiveReportsBothHalves(t *testing.T) {
+	fakeBin(t, "aws", `echo ""`)
+	r := CheckCostAllocationTags(context.Background(), testEnv())
+	if r.Status != doctor.Warn {
+		t.Fatalf("missing cost allocation tags truncate a bill rather than blocking an install, "+
+			"so this warns.\ngot %s: %s", r.Status, r.Detail)
+	}
+	for _, want := range []string{"PlatformId", "Repository", "iamPrincipal/PlatformId", "SEPARATELY"} {
+		if !strings.Contains(r.Detail, want) {
+			t.Errorf("the warning must name %q — the two halves are activated separately, so "+
+				"reporting one leaves the other silently broken:\n%s", want, r.Detail)
+		}
+	}
+}
