@@ -26,6 +26,16 @@ type apComponent struct {
 	// per environment. It changes three things: the path, the variables it is handed, and
 	// whether a teardown of one environment is allowed to remove it at all.
 	account bool
+	// forceDestroyInput marks a component that DECLARES force_destroy_buckets, and so takes the
+	// two-act teardown: an apply that lands the flag in state, then the destroy.
+	//
+	// Only cost-pipeline does. bedrock-account derives its force_destroy from
+	// `object_lock_mode != "COMPLIANCE"` instead, and live/org pins GOVERNANCE precisely so the
+	// account tears down cleanly — so a permitting apply there would land nothing, while still
+	// being a real write to the account's invocation-logging configuration moments before
+	// destroying it. Applying to "every account root" is the kind of nearly-right that costs an
+	// extra mutation of an account-wide singleton for no effect.
+	forceDestroyInput bool
 }
 
 // agentPlatformComponents is the apply order. Destroy runs it in reverse, minus the account
@@ -61,7 +71,8 @@ type apComponent struct {
 func agentPlatformComponents() []apComponent {
 	return []apComponent{
 		{name: "bedrock-account", account: true},
-		{name: "cost-pipeline", account: true}, // reads bedrock-account's log group over SSM
+		// reads bedrock-account's log group over SSM; the one root here taking force_destroy_buckets
+		{name: "cost-pipeline", account: true, forceDestroyInput: true},
 		{name: "bedrock"},
 		{name: "agent-egress"},
 		{name: "accelerator-pools"},
@@ -575,20 +586,22 @@ func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatf
 		if c.account && !opts.AccountScoped {
 			continue
 		}
+		// The two-act bucket teardown applies to the one component that declares the input.
+		// force_destroy has no effect until an apply lands it in state, so a destroy that only
+		// passes the variable meets BucketNotEmpty exactly as if it had not.
+		twoAct := opts.ForceBuckets && c.forceDestroyInput
+
 		vars := clusterEnv
 		if c.account {
 			vars = accountEnv
-			// Act 1 of the two-act bucket teardown, for the account chain specifically.
-			// force_destroy has no effect until an apply lands it in state, so a destroy that
-			// only passes the variable meets BucketNotEmpty exactly as if it had not.
-			if opts.ForceBuckets {
-				vars = append(append([]string(nil), vars...), "TF_VAR_force_destroy_buckets=true")
-			}
+		}
+		if twoAct {
+			vars = append(append([]string(nil), vars...), "TF_VAR_force_destroy_buckets=true")
 		}
 		st.Runner.Env = append(append([]string(nil), prevEnv...), vars...)
 
 		dir := agentPlatformDir(st, c)
-		if c.account && opts.ForceBuckets {
+		if twoAct {
 			note(st, "agent-platform substrate: %s — landing force_destroy_buckets=true before destroying", c.name)
 			if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", "init"); err != nil {
 				return fmt.Errorf("agent-platform %s: init: %w", c.name, err)

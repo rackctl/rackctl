@@ -525,3 +525,149 @@ exit 0
 		t.Fatalf("Runner.Env must be restored after the republish, got %v", st.Runner.Env)
 	}
 }
+
+// apDestroyLog runs DestroyAgentPlatform against a fake terragrunt on $PATH and returns one
+// line per invocation: "<verb> <working-dir> force=<TF_VAR_force_destroy_buckets>".
+//
+// It execs rather than dry-runs deliberately. The two tests above this one assert on the NOTE a
+// teardown prints, and a note is not the behaviour — an adversarial review of this change found
+// that deleting the account-root guard entirely left the whole suite green, because the note is
+// emitted before the loop and does not change. exec.Runner echoes argv but never env, so the
+// force_destroy flag in particular cannot be observed any other way.
+func apDestroyLog(t *testing.T, opts AgentPlatformTeardown) []string {
+	t.Helper()
+	dir := t.TempDir()
+	logf := filepath.Join(dir, "invocations")
+	script := fmt.Sprintf(`#!/bin/sh
+for a in "$@"; do
+  case "$prev" in --working-dir) wd="$a";; esac
+  case "$a" in apply|destroy|init) verb="$a";; esac
+  prev="$a"
+done
+[ "$verb" != init ] && echo "$verb $wd force=${TF_VAR_force_destroy_buckets:-UNSET}" >> %q
+exit 0
+`, logf)
+	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	st, _ := apState(t)
+	st.Runner = exec.New(io.Discard) // NOT dry-run — the point is to exec
+	st.Repos = engine.Repos{AgentPlatform: dir}
+
+	if err := DestroyAgentPlatform(context.Background(), st, opts); err != nil {
+		t.Fatalf("DestroyAgentPlatform: %v", err)
+	}
+	b, err := os.ReadFile(logf)
+	if err != nil {
+		t.Fatalf("the teardown ran nothing at all: %v", err)
+	}
+	return strings.Split(strings.TrimSpace(string(b)), "\n")
+}
+
+// The default teardown must not TOUCH the account roots, and this asserts the loop rather than
+// the message.
+//
+// A rollback calls this path automatically with a zero-valued AgentPlatformTeardown, so a guard
+// that fails open here means a failed development apply deletes the account's only Bedrock
+// invocation-logging configuration and its only cost pipeline — production's included — with
+// nothing red.
+func TestDestroyAgentPlatform_DefaultNeverReachesTheAccountRoots(t *testing.T) {
+	got := apDestroyLog(t, AgentPlatformTeardown{})
+
+	for _, line := range got {
+		if strings.Contains(line, "live/org/") {
+			t.Fatalf("a single environment's teardown invoked terragrunt against an account root: %q\n"+
+				"Those roots hold the account's ONLY Bedrock invocation-logging configuration and its "+
+				"ONLY cost pipeline, shared by every environment installed here.\nall: %v", line, got)
+		}
+	}
+	// And it must still have destroyed this cluster's own six, or the guard is over-broad.
+	if len(got) != 6 {
+		t.Fatalf("expected the 6 cluster roots to be destroyed; got %d:\n%v", len(got), got)
+	}
+	// Reverse of the apply order: cost-access first, bedrock last.
+	if !strings.Contains(got[0], "cost-access") {
+		t.Errorf("teardown must run in reverse, so the join goes first; got %q", got[0])
+	}
+	if !strings.Contains(got[len(got)-1], "bedrock") {
+		t.Errorf("teardown must run in reverse, so bedrock goes last; got %q", got[len(got)-1])
+	}
+}
+
+// Opting in must actually reach them — a guard that never opens is a flag that lies.
+func TestDestroyAgentPlatform_AccountScopedReachesBothAccountRoots(t *testing.T) {
+	got := apDestroyLog(t, AgentPlatformTeardown{AccountScoped: true})
+
+	for _, want := range []string{"live/org/cost-pipeline", "live/org/bedrock-account"} {
+		found := false
+		for _, line := range got {
+			if strings.HasPrefix(line, "destroy ") && strings.Contains(line, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("--account-scoped did not destroy %s:\n%v", want, got)
+		}
+	}
+	// Still in reverse: bedrock-account was applied first, so it comes down last.
+	if last := got[len(got)-1]; !strings.Contains(last, "live/org/bedrock-account") {
+		t.Errorf("bedrock-account is the head of the account chain and must come down last; got %q", last)
+	}
+}
+
+// The two-act sequence must be TWO acts, in order, on the root that needs it.
+//
+// force_destroy has no effect until an apply lands it in state — upstream says so in
+// cost-pipeline/variables.tf — so a destroy that merely passes the variable meets BucketNotEmpty
+// exactly as if it had not been passed. Both halves are asserted because both survived mutation:
+// disabling the pre-apply, and dropping the TF_VAR, each left the suite green.
+func TestDestroyAgentPlatform_ForceBucketsIsTwoActsAndCarriesTheFlag(t *testing.T) {
+	got := apDestroyLog(t, AgentPlatformTeardown{AccountScoped: true, ForceBuckets: true})
+
+	applyAt, destroyAt := -1, -1
+	for i, line := range got {
+		if !strings.Contains(line, "live/org/cost-pipeline") {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "apply ") && applyAt < 0:
+			applyAt = i
+			if !strings.Contains(line, "force=true") {
+				t.Errorf("act 1 ran without TF_VAR_force_destroy_buckets=true, so it lands nothing in "+
+					"state and act 2 wedges on BucketNotEmpty anyway: %q", line)
+			}
+		case strings.HasPrefix(line, "destroy "):
+			destroyAt = i
+		}
+	}
+	if applyAt < 0 {
+		t.Fatalf("no permitting apply ran for the account cost-pipeline. force_destroy has no effect "+
+			"until an apply lands it in state, so --force-buckets would change nothing:\n%v", got)
+	}
+	if destroyAt < 0 {
+		t.Fatalf("the account cost-pipeline was never destroyed:\n%v", got)
+	}
+	if applyAt > destroyAt {
+		t.Fatalf("the permitting apply ran AFTER the destroy (%d > %d) — the two acts are in the "+
+			"wrong order and the flag accomplishes nothing:\n%v", applyAt, destroyAt, got)
+	}
+
+	// bedrock-account needs no permitting apply: its force_destroy derives from
+	// object_lock_mode != COMPLIANCE, and live/org pins GOVERNANCE. An apply there would be a
+	// second write to the account's invocation-logging configuration for no reason.
+	for _, line := range got {
+		if strings.HasPrefix(line, "apply ") && strings.Contains(line, "bedrock-account") {
+			t.Errorf("bedrock-account got a permitting apply it does not need: %q", line)
+		}
+	}
+
+	// And the cluster roots must not carry the flag — they are landing-zone's two-act sequence,
+	// run separately by PermitBucketTeardown, and this tree's components do not all declare it.
+	for _, line := range got {
+		if !strings.Contains(line, "live/org/") && strings.Contains(line, "force=true") {
+			t.Errorf("a cluster root carried TF_VAR_force_destroy_buckets: %q", line)
+		}
+	}
+}
