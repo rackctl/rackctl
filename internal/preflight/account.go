@@ -79,37 +79,69 @@ func CheckSessionLifetime(ctx context.Context, env *Env) doctor.Result {
 
 // ─────────────────────────── bucket names ───────────────────────────
 
+// bucketScope says how many of a bucket there is meant to be, which is what decides whether
+// finding one already there is wreckage or the steady state.
+//
+// Getting this wrong in either direction costs a run. Treating a shared bucket as cluster-scoped
+// made this check fail on the account it was written against, and would have failed on every
+// account that had ever run an install — a preflight that fires on the healthy steady state is
+// worse than no preflight, because it teaches the operator to skip it. Treating a cluster bucket
+// as shared loses the check that motivated this file.
+type bucketScope int
+
+const (
+	// scopeCluster: one per cluster. An existing one is this cluster's own wreckage — a previous
+	// run, or a teardown that could not empty it — and it blocks the install.
+	scopeCluster bucketScope = iota
+	// scopeAccount: one per account+region, shared by every environment. eks-agent-platform's
+	// live/org roots own these; their names carry no cluster and no environment token because
+	// there is exactly one of the thing they name. Whichever environment installs first creates
+	// them, so from the second environment onwards finding them is expected.
+	scopeAccount
+	// scopeBackend: Terraform state. Created idempotently behind a head-bucket guard
+	// (landing-zone scripts/init-backend-aws.sh:12, phases/agentplatform.go:224), never deleted
+	// by rackctl, and shared across every environment in the account, differing only by key.
+	scopeBackend
+)
+
 // plannedBucket is a bucket this config will try to create, and the component that owns it.
 //
-// persistent marks the two Terraform state backends. Their existence is not wreckage — it is
-// the normal steady state, and the expected one from the second install onwards. Both are
-// created idempotently behind a head-bucket guard (landing-zone scripts/init-backend-aws.sh:12,
-// phases/agentplatform.go:224), neither is ever deleted by rackctl, and both are deliberately
-// SHARED across every environment in the account, differing only by state key.
-//
-// The distinction is load-bearing rather than cosmetic: treating them like component buckets
-// made this check fail on the account it was written against, and it would have failed on every
-// account that had ever run an install. A preflight that fires on the healthy steady state is
-// worse than no preflight, because it teaches the operator to skip it.
-//
-// They still get the other two checks. A name over 63 characters is still fatal, and a 403 —
-// the name existing in somebody else's account — is MORE fatal here than anywhere else, because
-// without a backend nothing can be applied at all.
+// Every scope still gets the other two checks. A name over 63 characters is fatal regardless,
+// and a 403 — the name existing in somebody else's account — is MORE fatal on a backend than
+// anywhere else, because without one nothing can be applied at all.
 type plannedBucket struct {
 	name, owner string
-	persistent  bool
+	scope       bucketScope
 }
 
 // plannedBuckets returns every S3 bucket name this config would claim.
 //
 // Composed from the components' own expressions rather than guessed:
 //
-//	agent-iam       artifacts.tf:50-52   <cluster>-<account>-<region>-{model-artifacts,eval-reports,access-logs}
-//	cluster-addons  main.tf:37 + s3.tf   <cluster>-<account>-<region>-{velero,loki,tempo,argo-workflows}
-//	model-import    main.tf:65           <environment>-<account>-<region>-model-import
-//	bedrock         main.tf:4,17,72      <cluster>-bedrock-{access-logs,invocations}-<account>
-//	cost-pipeline   main.tf:16,29,94,227 <cluster>-cost-{access-logs,cur,athena}-<account>
-//	backends        init-backend-aws.sh:9 / agentplatform.go:214
+//	agent-iam        artifacts.tf:50-52  <cluster>-<account>-<region>-{model-artifacts,eval-reports,access-logs}
+//	cluster-addons   main.tf:37 + s3.tf  <cluster>-<account>-<region>-{velero,loki,tempo,argo-workflows}
+//	model-import     main.tf:65          <environment>-<account>-<region>-model-import
+//	bedrock-account  main.tf:11,92,152   org-<account>-<region>-bedrock-{access-logs,invocations}
+//	cost-pipeline    main.tf:67,169,237,335
+//	                                     org-<account>-<region>-cost-{access-logs,estimates,athena}-<account>
+//	backends         init-backend-aws.sh:9 / agentplatform.go:214
+//
+// The last two used to be composed as <cluster>-bedrock-* and <cluster>-cost-*, which is the
+// shape eks-agent-platform had before it account-scoped both components. Those names are not
+// stale in the harmless sense — nothing creates them now, so the check was looking for names
+// that cannot exist while missing the ones that do, which reads as a clean preflight over an
+// unchecked estate.
+//
+// The account id appears twice in the cost names and once in the bedrock ones. That asymmetry
+// is upstream's, not a typo here: cost-pipeline suffixes each bucket with the caller's account
+// on top of a prefix that already carries it (main.tf:169), and bedrock-account does not.
+//
+// Note what left with the rename: these five no longer contain cluster.name at all, so the
+// 63-character pressure that made cluster.name the fix for a too-long name is now confined to
+// the cluster-scoped set.
+//
+// Not listed: org-<account>-cur-export. It is landing-zone's, created by its org-cost root,
+// and rackctl does not apply that root — so it is not a name this config claims.
 //
 // cluster-addons' four are listed unconditionally even though a leaf can disable a consumer
 // (staging turns argo-workflows off, so that bucket is never created). Over-inclusion costs one
@@ -122,7 +154,7 @@ func plannedBuckets(cfg *config.Config) []plannedBucket {
 	envName := string(cfg.Environment)
 
 	bs := []plannedBucket{
-		{name: fmt.Sprintf("%s-%s-tfstate", acct, region), owner: "terraform backend", persistent: true},
+		{name: fmt.Sprintf("%s-%s-tfstate", acct, region), owner: "terraform backend", scope: scopeBackend},
 	}
 	for _, s := range []string{"velero", "loki", "tempo", "argo-workflows"} {
 		bs = append(bs, plannedBucket{name: fmt.Sprintf("%s-%s-%s-%s", cluster, acct, region, s), owner: "cluster-addons"})
@@ -131,14 +163,19 @@ func plannedBuckets(cfg *config.Config) []plannedBucket {
 		for _, s := range []string{"model-artifacts", "eval-reports", "access-logs"} {
 			bs = append(bs, plannedBucket{name: fmt.Sprintf("%s-%s-%s-%s", cluster, acct, region, s), owner: "agent-iam"})
 		}
-		bs = append(bs,
-			plannedBucket{name: fmt.Sprintf("eks-agent-platform-tfstate-%s-%s", acct, region), owner: "agent-platform backend", persistent: true},
-			plannedBucket{name: fmt.Sprintf("%s-bedrock-access-logs-%s", cluster, acct), owner: "bedrock"},
-			plannedBucket{name: fmt.Sprintf("%s-bedrock-invocations-%s", cluster, acct), owner: "bedrock"},
-			plannedBucket{name: fmt.Sprintf("%s-cost-access-logs-%s", cluster, acct), owner: "cost-pipeline"},
-			plannedBucket{name: fmt.Sprintf("%s-cost-cur-%s", cluster, acct), owner: "cost-pipeline"},
-			plannedBucket{name: fmt.Sprintf("%s-cost-athena-%s", cluster, acct), owner: "cost-pipeline"},
-		)
+		bs = append(bs, plannedBucket{
+			name:  fmt.Sprintf("eks-agent-platform-tfstate-%s-%s", acct, region),
+			owner: "agent-platform backend", scope: scopeBackend})
+		for _, s := range []string{"access-logs", "invocations"} {
+			bs = append(bs, plannedBucket{
+				name:  fmt.Sprintf("%s-%s-%s-bedrock-%s", accountScopeToken, acct, region, s),
+				owner: "bedrock-account", scope: scopeAccount})
+		}
+		for _, s := range []string{"access-logs", "estimates", "athena"} {
+			bs = append(bs, plannedBucket{
+				name:  fmt.Sprintf("%s-%s-%s-cost-%s-%s", accountScopeToken, acct, region, s, acct),
+				owner: "cost-pipeline", scope: scopeAccount})
+		}
 		if cfg.AgentPlatform.ModelImport {
 			bs = append(bs, plannedBucket{
 				name: fmt.Sprintf("%s-%s-%s-model-import", envName, acct, region), owner: "model-import"})
@@ -146,6 +183,17 @@ func plannedBuckets(cfg *config.Config) []plannedBucket {
 	}
 	return bs
 }
+
+// accountScopeToken is the environment token eks-agent-platform's account-scoped roots carry.
+//
+// It is a literal rather than anything derived from cfg.Environment, and that is the point:
+// terraform/live/org/env.hcl pins `environment = "org"` for every account-scoped root, so these
+// names are the same whichever environment rackctl is installing. Composing them from the
+// config would produce development-…-bedrock-invocations, which nothing creates.
+//
+// `org` is the reserved account-scope token from nanohype/standards/resource-naming.json, the
+// same one landing-zone uses for its management-account roots.
+const accountScopeToken = "org"
 
 // CheckBucketNames asserts every bucket this run would create can actually be created.
 //
@@ -190,15 +238,24 @@ func CheckBucketNames(ctx context.Context, env *Env) doctor.Result {
 		reapply = true
 	}
 
-	var tooLong, taken, ours []string
+	var tooLong, taken, ours, shared []string
 	for _, b := range planned {
 		if len(b.name) > 63 {
 			tooLong = append(tooLong, fmt.Sprintf("%s (%d chars, %s)", b.name, len(b.name), b.owner))
 			continue
 		}
 		if owned[b.name] {
-			// A state backend that already exists is the steady state, not a collision.
-			if !reapply && !b.persistent {
+			switch {
+			case reapply:
+				// A re-apply owns its own buckets.
+			case b.scope == scopeBackend:
+				// A state backend that already exists is the steady state, not a collision.
+			case b.scope == scopeAccount:
+				// One per account+region, shared by every environment. Another environment
+				// having created it is the ordinary case from the second install onwards, so
+				// this is reported and not refused — see the warn branch below.
+				shared = append(shared, fmt.Sprintf("%s (%s)", b.name, b.owner))
+			case b.scope == scopeCluster:
 				ours = append(ours, fmt.Sprintf("%s (%s)", b.name, b.owner))
 			}
 			continue
@@ -231,6 +288,22 @@ func CheckBucketNames(ctx context.Context, env *Env) doctor.Result {
 				"--apply` (add --force-buckets outside development), or empty and delete them by "+
 				"hand. Note that a bucket left behind means its component's terraform state and the "+
 				"account have diverged.", clusterName(cfg), strings.Join(ours, ", ")))
+	case len(shared) > 0:
+		// A warning rather than a failure, and the asymmetry is deliberate. These are
+		// account+region singletons owned by eks-agent-platform's live/org roots, so on the
+		// second and every later environment their existence is exactly what a healthy account
+		// looks like — refusing would make this check fire on the steady state, which is the
+		// failure mode the scope split exists to avoid.
+		//
+		// It is still worth saying, because on a FIRST install of a FIRST environment the same
+		// observation means wreckage, and rackctl cannot tell those two apart without knowing
+		// whether another environment exists. Naming them lets the operator make that call.
+		return warn(name, fmt.Sprintf(
+			"these account-scoped buckets already exist — %s. They are one per account and region, "+
+				"shared by every environment, so if another environment is already installed here "+
+				"this is the expected steady state and the apply will adopt them through their own "+
+				"state. If this is the first install in this account, they are wreckage from an "+
+				"earlier attempt and the org roots will fail at create.", strings.Join(shared, ", ")))
 	}
 	return ok(name, fmt.Sprintf("all %d bucket names are free", len(planned)))
 }
@@ -291,22 +364,31 @@ func CheckHostedZone(ctx context.Context, env *Env) doctor.Result {
 
 // ─────────────────────────── bedrock's account singleton ───────────────────────────
 
-// CheckBedrockLogging asserts this run will not silently take over another environment's Bedrock
+// CheckBedrockLogging asserts this run will not silently take over somebody else's Bedrock
 // invocation logging.
 //
 // aws_bedrock_model_invocation_logging_configuration (eks-agent-platform
-// components/bedrock/main.tf:238) has no name and no identifier: the Bedrock API holds EXACTLY
-// ONE configuration per account per region. The component's buckets are correctly cluster-scoped;
-// the configuration that points at them cannot be.
+// components/bedrock-account/main.tf) has no name and no identifier: the Bedrock API holds
+// EXACTLY ONE configuration per account per region.
 //
-// Under rackctl every environment shares one account, so applying development overwrites
-// production's logging destination and tearing development down deletes the singleton outright —
-// leaving production with no invocation logging at all. Both applies are green. Invocation
-// logging is the signal every budget decision reads, so this is the org's own recurring class
-// sitting on the flagship feature.
+// It used to be applied per environment, which made this check's warning the whole story —
+// applying development overwrote production's logging destination and tearing development down
+// deleted the singleton outright, both applies green, with invocation logging being the signal
+// every budget decision reads. That was ledger O14, and upstream fixed the shape rather than the
+// symptom: the configuration and the two buckets it points at moved to an account-scoped root,
+// terraform/live/org/bedrock-account, whose names carry no cluster and no environment token
+// because there is exactly one of the thing they name.
 //
-// Filed upstream as ledger O14. Until it lands, refusing is the only honest move rackctl has:
-// there is no TF_VAR that makes the resource per-environment, because the API has no such axis.
+// So what remains is narrower and still worth having. The singleton is genuinely account-global
+// in an account this platform SHARES with other estates, so a configuration pointing anywhere
+// other than the account root's own bucket belongs to something else — and this run would
+// repoint it without saying so.
+//
+// The name below is composed from cfg.Cloud.Region, while the org roots resolve theirs from
+// terraform/live/org/env.hcl, which pins us-west-2. The two agree today and would diverge for a
+// config in another region — but so would the deployment, since that root would apply its
+// logging to us-west-2 while the cluster ran elsewhere. Composing from the config is the shape
+// that stays right when the pin is lifted; the pin itself is upstream's to lift.
 func CheckBedrockLogging(ctx context.Context, env *Env) doctor.Result {
 	const name = "bedrock logging"
 
@@ -321,21 +403,25 @@ func CheckBedrockLogging(ctx context.Context, env *Env) doctor.Result {
 		return ok(name, "no invocation logging configured in "+cfg.Cloud.Region)
 	}
 
-	// The name this run's own bedrock component would set. If it matches, the singleton is
-	// already ours and re-applying is a no-op rather than a takeover.
-	mine := fmt.Sprintf("%s-bedrock-invocations-%s", clusterName(cfg), cfg.Cloud.AccountID)
+	// The bucket the account-scoped root delivers to. If it matches, the singleton is already
+	// this platform's and re-applying is a no-op rather than a takeover — including from an
+	// environment that did not create it, which is the ordinary case for every environment after
+	// the first.
+	mine := fmt.Sprintf("%s-%s-%s-bedrock-invocations", accountScopeToken, cfg.Cloud.AccountID, cfg.Cloud.Region)
 	if bucket == mine {
-		return ok(name, "the invocation logging singleton is already this cluster's")
+		return ok(name, "the invocation logging singleton is this platform's account-scoped one")
 	}
 	return fail(name, fmt.Sprintf(
 		"Bedrock invocation logging in %s is already configured, delivering to %q — and this run's "+
-			"bedrock component would repoint it at %q. There is exactly ONE such configuration per "+
+			"bedrock-account root would repoint it at %q. There is exactly ONE such configuration per "+
 			"account per region: it has no name and nothing to scope it by, so applying here takes it "+
 			"over silently and a later teardown DELETES it rather than restoring the previous owner. "+
-			"Invocation logging is what every budget decision reads, so the environment that loses it "+
-			"stops being able to bill or cap anything, with nothing going red. Set agentPlatform.enable: "+
-			"false, or use an account that does not already have this set. (Upstream fix: ledger O14.)",
-		cfg.Cloud.Region, bucket, mine))
+			"Invocation logging is what every budget decision reads, so whatever loses it stops being "+
+			"able to bill or cap anything, with nothing going red. This account is shared with other "+
+			"estates, so the likeliest owner of %q is one of them rather than a previous run of this "+
+			"platform. Set agentPlatform.enable: false, or use an account that does not already have "+
+			"this set.",
+		cfg.Cloud.Region, bucket, mine, bucket))
 }
 
 // ─────────────────────────── cost allocation tags ───────────────────────────

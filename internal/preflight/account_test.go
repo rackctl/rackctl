@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -67,6 +68,70 @@ esac`)
 	}
 }
 
+// An ACCOUNT-SCOPED bucket that already exists must not fail the install.
+//
+// eks-agent-platform's live/org roots own one set of these per account and region, shared by
+// every environment. Whichever environment installs first creates them, so from the second
+// environment onwards finding them is the healthy steady state — and failing here would refuse
+// every install after the first, which is the same shape as the state-backend false positive
+// this scope split generalises.
+//
+// It is still reported, because on a first install in a fresh account the identical observation
+// means wreckage and rackctl cannot tell the two apart.
+func TestBucketNames_AccountScopedBucketIsReportedNotRefused(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "s3api list-buckets") echo "org-111122223333-us-west-2-bedrock-invocations" ;;
+  "eks describe-cluster") exit 1 ;;      # this environment's cluster does not exist yet
+  "s3api head-bucket")    exit 1 ;;
+  *) exit 1 ;;
+esac`)
+	r := CheckBucketNames(context.Background(), testEnv())
+	if r.Status != doctor.Warn {
+		t.Fatalf("an account+region singleton another environment already created is not this "+
+			"install's collision — failing here refuses every install after the first.\n"+
+			"got %s: %s", r.Status, r.Detail)
+	}
+	if !strings.Contains(r.Detail, "org-111122223333-us-west-2-bedrock-invocations") {
+		t.Errorf("the warning must name what it found, so a first-install operator can tell "+
+			"wreckage from the steady state:\n%s", r.Detail)
+	}
+}
+
+// And the account-scoped names must be the ones upstream actually creates. Composing them from
+// cfg.Environment would produce development-…-bedrock-invocations, which nothing creates: the
+// check would look for names that cannot exist while missing the ones that do, and report a
+// clean preflight over an unchecked estate.
+func TestPlannedBuckets_AccountScopedNamesCarryTheOrgToken(t *testing.T) {
+	cfg := testEnv().Cfg
+	var got []string
+	for _, b := range plannedBuckets(cfg) {
+		got = append(got, b.name)
+	}
+	for _, want := range []string{
+		"org-111122223333-us-west-2-bedrock-invocations",
+		"org-111122223333-us-west-2-bedrock-access-logs",
+		"org-111122223333-us-west-2-cost-athena-111122223333",
+		"org-111122223333-us-west-2-cost-estimates-111122223333",
+		"org-111122223333-us-west-2-cost-access-logs-111122223333",
+	} {
+		if !slices.Contains(got, want) {
+			t.Errorf("missing %q — this is the name terraform/live/org creates, with `org` pinned "+
+				"by that tree's env.hcl rather than derived from the config.\ngot: %v", want, got)
+		}
+	}
+	// The pre-move names are gone, not merely joined by the new ones. Keeping both would make
+	// every install report a phantom collision the moment one of the old orphans is present.
+	for _, gone := range []string{
+		"development-platform-bedrock-invocations-111122223333",
+		"development-platform-cost-cur-111122223333",
+	} {
+		if slices.Contains(got, gone) {
+			t.Errorf("%q is the pre-account-scoping shape and nothing creates it now", gone)
+		}
+	}
+}
+
 // The unrecoverable one, and it must not read like the other two. S3's namespace is global: a
 // name owned by another account is gone, and no cleanup here frees it.
 func TestBucketNames_OwnedByAnotherAccountIsUnrecoverable(t *testing.T) {
@@ -106,33 +171,61 @@ func TestBucketNames_LengthIsRegionDependent(t *testing.T) {
 
 // ─────────────────────────── bedrock singleton ───────────────────────────
 
-// The Bedrock API holds exactly one invocation-logging configuration per account per region.
-// Under rackctl every environment shares one account, so applying here silently takes over
-// whichever environment configured it last — and a teardown deletes it outright.
-func TestBedrockLogging_AnotherClustersSingletonRefuses(t *testing.T) {
+// The Bedrock API holds exactly one invocation-logging configuration per account per region, and
+// this account is shared with other estates — so a configuration pointing anywhere other than
+// the account root's own bucket belongs to something else, and applying here takes it over.
+func TestBedrockLogging_SomebodyElsesSingletonRefuses(t *testing.T) {
 	fakeBin(t, "aws", `
 case "$2" in
-  get-model-invocation-logging-configuration) echo "production-platform-bedrock-invocations-111122223333" ;;
+  get-model-invocation-logging-configuration) echo "some-other-estate-bedrock-logs" ;;
   *) exit 1 ;;
 esac`)
 	r := CheckBedrockLogging(context.Background(), testEnv())
 	mustFail(t, r, "ONE such configuration per")
-	if !strings.Contains(r.Detail, "production-platform-bedrock-invocations") {
+	if !strings.Contains(r.Detail, "some-other-estate-bedrock-logs") {
 		t.Errorf("the failure must name the CURRENT owner, or the operator cannot tell whose "+
 			"logging they are about to take:\n%s", r.Detail)
 	}
 }
 
-// Already ours is a no-op, not a takeover. Without this the check would refuse every re-apply.
-func TestBedrockLogging_OwnSingletonIsFine(t *testing.T) {
+// The account-scoped singleton is a no-op for EVERY environment, not just the one that created
+// it — which is the whole point of the upstream move to live/org/bedrock-account.
+//
+// This test previously fed it "development-platform-bedrock-invocations-<acct>", the pre-move
+// cluster-scoped shape. That name matched what the check composed, so it passed — while the
+// name nothing produces drifted out from under it. The comment said "without this the check
+// would refuse every re-apply", and that is precisely what the check had started doing against
+// a correctly built account; the test could not see it because both sides were stale together.
+//
+// It is now fed the name bedrock-account actually creates
+// (components/bedrock-account/main.tf:11,152 — prefix "${var.environment}-${account}-${region}
+// -bedrock" with var.environment pinned to "org" by live/org/env.hcl), so the constant and the
+// fixture can no longer drift as a pair.
+func TestBedrockLogging_TheAccountScopedSingletonIsFineFromAnyEnvironment(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$2" in
+  get-model-invocation-logging-configuration) echo "org-111122223333-us-west-2-bedrock-invocations" ;;
+  *) exit 1 ;;
+esac`)
+	// testEnv() is the development environment; the singleton carries no environment token, and
+	// that is what makes this pass rather than being a takeover.
+	if r := CheckBedrockLogging(context.Background(), testEnv()); r.Status != doctor.OK {
+		t.Fatalf("the account-scoped singleton belongs to every environment in the account, so "+
+			"re-applying against it must pass.\ngot %s: %s", r.Status, r.Detail)
+	}
+}
+
+// The pre-move name must NOT be treated as ours. It is the shape a 2026-05 run left behind in
+// this very account, and adopting it would mean pointing the account's invocation logging at an
+// orphan bucket that nothing owns and no state describes.
+func TestBedrockLogging_ThePreMoveClusterScopedNameIsNotOurs(t *testing.T) {
 	fakeBin(t, "aws", `
 case "$2" in
   get-model-invocation-logging-configuration) echo "development-platform-bedrock-invocations-111122223333" ;;
   *) exit 1 ;;
 esac`)
-	if r := CheckBedrockLogging(context.Background(), testEnv()); r.Status != doctor.OK {
-		t.Fatalf("re-applying against our own singleton must pass.\ngot %s: %s", r.Status, r.Detail)
-	}
+	r := CheckBedrockLogging(context.Background(), testEnv())
+	mustFail(t, r, "ONE such configuration per")
 }
 
 // ─────────────────────────── hosted zone ───────────────────────────
