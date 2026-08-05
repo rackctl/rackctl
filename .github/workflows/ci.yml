@@ -17,6 +17,20 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...
+      # A step of `build` rather than a job of its own, deliberately: protect-main requires the
+      # `build` context, so putting lint here makes it enforced immediately. A separate job would
+      # be advisory until somebody remembered to add it to the ruleset, and an advisory gate on a
+      # repo with a no-bypass ruleset is just a slower way of not having one.
+      #
+      # It runs before build and test because its most valuable linter is `unused`, and dead code
+      # compiles and passes tests by definition — this repo shipped two such symbols.
+      #
+      # Pinned to the same version developers get from Homebrew, so a clean local run means a
+      # clean CI run. Config in .golangci.yml.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
       - run: go build ./...
       - run: go test -race ./...
       # Two-layer supply-chain gate. govulncheck is Go-native and

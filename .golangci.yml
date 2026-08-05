@@ -1,0 +1,39 @@
+version: "2"
+
+# Lint runs in CI as a step of the `build` job — the one context protect-main requires — so it
+# gates merges rather than being a thing somebody remembers to run. That is deliberate: this
+# session alone turned up two symbols that compiled, passed every test, and did nothing, and a
+# check nobody runs would not have found either.
+
+linters:
+  # The default set (errcheck, govet, ineffassign, staticcheck, unused) is the whole point here.
+  # `unused` in particular is the one that earns its place: dead code in an installer is not
+  # untidiness, it is a claim that something is handled when nothing is.
+  default: standard
+
+  exclusions:
+    rules:
+      # Unchecked writes to a terminal or an in-memory buffer.
+      #
+      # errcheck is right in general and wrong for these specific calls. Every one is
+      # fmt.Fprint* to os.Stdout or a strings.Builder: the error can only be a closed stdout or
+      # an OOM, neither of which this program can do anything about, and neither of which is
+      # made better by a `_ =`. Writing the error to the same broken writer is not a plan.
+      #
+      # Scoped to fmt.Fprint* by name rather than disabling errcheck, because the errors that
+      # DO matter here — an AWS call, a terragrunt exec, a file write — are exactly what this
+      # linter is for, and a blanket exclusion would take those with it.
+      - linters: [errcheck]
+        source: '^\s*fmt\.Fprint(f|ln)?\('
+
+    # Generated files and vendored trees only; test files are NOT excluded. A test that ignores
+    # an error is how a test passes while the thing it names is broken, which is a defect class
+    # this repo has met more than once.
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  enable:
+    - gofmt

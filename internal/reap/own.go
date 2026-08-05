@@ -109,24 +109,11 @@ func roleTags(ctx context.Context, run execer, name string) (map[string]string, 
 	return tags, nil
 }
 
-// tagsFromDescribeJSON pulls the Tags array out of an ec2 describe-* element. EC2 spells the
-// key "Tags" on most shapes and "TagSet" on network interfaces; both are handled so callers
-// do not have to care which describe they used.
-func tagsFromDescribeJSON(raw json.RawMessage) map[string]string {
-	var shape struct {
-		Tags   []struct{ Key, Value string } `json:"Tags"`
-		TagSet []struct{ Key, Value string } `json:"TagSet"`
-	}
-	if err := json.Unmarshal(raw, &shape); err != nil {
-		return nil
-	}
-	src := shape.Tags
-	if len(src) == 0 {
-		src = shape.TagSet
-	}
-	tags := make(map[string]string, len(src))
-	for _, t := range src {
-		tags[t.Key] = t.Value
-	}
-	return tags
-}
+// A tagsFromDescribeJSON helper lived here — it pulled Tags/TagSet out of an `ec2 describe-*`
+// element so callers would not have to care which spelling their describe used. Nothing ever
+// called it: the sweeps that were going to need it (OrphanedNodes, OrphanedVolumes) filter with
+// `--filters` server-side and never parse tags out of a describe response themselves.
+//
+// Recorded rather than silently dropped, because the shape difference it papered over is real —
+// EC2 spells the key "Tags" on most resources and "TagSet" on network interfaces — and the next
+// person to parse tags out of a describe will meet it.

@@ -562,9 +562,6 @@ func (cluster) Teardown(ctx context.Context, st *engine.State) error {
 	return nil
 }
 
-// --- Phase 4: secrets & ArgoCD bootstrap ---
-type bootstrap struct{ base }
-
 // substrateComponents is the AWS substrate the GitOps layer consumes: every landing-zone
 // component ArgoCD depends on but that does not itself need ArgoCD. Derived from
 // CoreComponents (never restated) so the conditional components (agent-iam,
