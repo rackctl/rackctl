@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/rackctl/rackctl/internal/config"
@@ -112,17 +113,23 @@ func TestTGEnv_PassesTheOrgsForkNotUpstream(t *testing.T) {
 	}
 }
 
-// addons.accelerators must reach the label that makes it mean something. It was documented
-// in the shipped example config and read by nothing, so setting it produced a cluster with
-// no accelerator label and no GPU addons — the config said yes and the platform said nothing.
-func TestTGEnv_PassesTheAcceleratorLabel(t *testing.T) {
-	for _, on := range []bool{true, false} {
-		cfg := &config.Config{}
-		cfg.Addons.Accelerators = on
-		want := "TF_VAR_enable_accelerators=" + map[bool]string{true: "true", false: "false"}[on]
-		if !slices.Contains(tgEnv(cfg), want) {
-			t.Errorf("accelerators=%v: %q not injected — without it the accelerators ApplicationSet "+
-				"never targets the cluster and the config knob is inert", on, want)
+// enable_accelerators must NOT be injected, and the assertion is inverted rather than deleted.
+//
+// This test used to require the opposite, for a reason that was true when written: setting
+// addons.accelerators produced a cluster with no accelerator label and no GPU addons, so the
+// injection was what made the knob mean anything. The whole GPU path is deleted now (ledger
+// O27) — the ApplicationSet, the accelerator-pools component, and landing-zone's variable and
+// label — so the variable is undeclared and the injection would be inert.
+//
+// Keeping a test here at all is the point. tofu ignores a TF_VAR_ for a variable no root
+// declares, so re-adding this injection would break nothing and pass everything; the only thing
+// that would notice is an assertion that says it must not come back.
+func TestTGEnv_DoesNotInjectTheRetiredAcceleratorFlag(t *testing.T) {
+	for _, e := range tgEnv(&config.Config{}) {
+		if strings.HasPrefix(e, "TF_VAR_enable_accelerators=") {
+			t.Errorf("rackctl injected %q. No root declares that variable since the GPU path was "+
+				"deleted upstream, so this is inert — and an inert injection is how a knob keeps "+
+				"looking supported long after it stopped being", e)
 		}
 	}
 }
