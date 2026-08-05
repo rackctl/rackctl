@@ -583,9 +583,18 @@ func TestDestroyAgentPlatform_DefaultNeverReachesTheAccountRoots(t *testing.T) {
 				"ONLY cost pipeline, shared by every environment installed here.\nall: %v", line, got)
 		}
 	}
-	// And it must still have destroyed this cluster's own six, or the guard is over-broad.
-	if len(got) != 6 {
-		t.Fatalf("expected the 6 cluster roots to be destroyed; got %d:\n%v", len(got), got)
+	// And it must still have destroyed every cluster root, or the guard is over-broad. The
+	// expected count is derived rather than written down: this assertion is about the GUARD, and
+	// pinning a literal here would make it fail every time upstream adds or removes a component
+	// — which is a different fact, owned by TestAgentPlatformComponents_MatchesTheTreeOnDisk.
+	wantCluster := 0
+	for _, c := range agentPlatformComponents() {
+		if !c.account {
+			wantCluster++
+		}
+	}
+	if len(got) != wantCluster {
+		t.Fatalf("expected the %d cluster roots to be destroyed; got %d:\n%v", wantCluster, len(got), got)
 	}
 	// Reverse of the apply order: cost-access first, bedrock last.
 	if !strings.Contains(got[0], "cost-access") {
@@ -668,6 +677,90 @@ func TestDestroyAgentPlatform_ForceBucketsIsTwoActsAndCarriesTheFlag(t *testing.
 	for _, line := range got {
 		if !strings.Contains(line, "live/org/") && strings.Contains(line, "force=true") {
 			t.Errorf("a cluster root carried TF_VAR_force_destroy_buckets: %q", line)
+		}
+	}
+}
+
+// The component list must be the EXACT set, asserted as a literal.
+//
+// TestAgentPlatformComponents_MatchesTheTreeOnDisk checks that certain names are present and
+// certain others absent, which lets a name nobody intended slip in between the two lists —
+// verified: adding accelerator-pools back passed the entire suite. It could not do otherwise,
+// because every fixture in this file builds its roots by walking agentPlatformComponents()
+// through agentPlatformDir(), so the fixture and the list can never disagree.
+//
+// A literal set does not prove the tree has these roots. What it does is make adding or removing
+// one require editing a second place, which is the prompt to go and look — and upstream has
+// deleted a root out from under this list twice in two days.
+func TestAgentPlatformComponents_IsTheExactSet(t *testing.T) {
+	want := []string{
+		"bedrock-account", "cost-pipeline", // account, live/org
+		"bedrock", "agent-egress", "eval-runtime", "kill-switch", "cost-access", // per cluster
+	}
+	got := agentPlatformComponentNames(agentPlatformComponents())
+	if !slices.Equal(got, want) {
+		t.Fatalf("the apply order changed.\n got: %v\nwant: %v\n\n"+
+			"If upstream moved, added or deleted a component, update BOTH this literal and the "+
+			"slice — and check terraform/live in the eks-agent-platform checkout while you are "+
+			"there, because a name here with no root there aborts the phase before it applies "+
+			"anything, and a dry run still looks fine.", got, want)
+	}
+}
+
+// And where a real checkout is available, every root must actually resolve.
+//
+// This is the only assertion in the file that can catch upstream DELETING a root, which is a
+// change to somebody else's repo that no rackctl commit accompanies. It has happened twice:
+// cost-pipeline moving to live/org (ledger O21), and accelerator-pools being deleted outright
+// (O27). Both times the first symptom was the phase aborting before applying anything, and both
+// times `rackctl plan` still looked fine, because a dry run only prints a note.
+//
+// Skips when no checkout is present rather than failing, since most machines running these tests
+// have never run an install. RACKCTL_AGENT_PLATFORM_CHECKOUT points it at a working clone.
+func TestAgentPlatformComponents_EveryRootResolvesInARealCheckout(t *testing.T) {
+	root := os.Getenv("RACKCTL_AGENT_PLATFORM_CHECKOUT")
+	if root == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Skip("no home directory to look for a checkout in")
+		}
+		// rackctl clones to ~/.rackctl/<org>/eks-agent-platform; the org is not knowable here.
+		matches, _ := filepath.Glob(filepath.Join(home, ".rackctl", "*", "eks-agent-platform"))
+		for _, m := range matches {
+			if _, err := os.Stat(filepath.Join(m, "terraform", "live")); err == nil {
+				root = m
+				break
+			}
+		}
+	}
+	if root == "" {
+		t.Skip("no eks-agent-platform checkout found — set RACKCTL_AGENT_PLATFORM_CHECKOUT to run this")
+	}
+
+	st, _ := apState(t)
+	// Check against the environments the checkout actually authors, so this does not fail on a
+	// tree that simply has not grown a staging leaf yet.
+	var envs []config.Environment
+	for _, e := range []config.Environment{config.EnvDev, config.EnvStaging, config.EnvProduction} {
+		if _, err := os.Stat(filepath.Join(root, "terraform", "live", string(e)+"-platform")); err == nil {
+			envs = append(envs, e)
+		}
+	}
+	if len(envs) == 0 {
+		t.Skipf("%s has no <environment>-platform roots; not a tree this test can check", root)
+	}
+
+	for _, env := range envs {
+		st.Config.Environment = env
+		for _, c := range agentPlatformComponents() {
+			dir := agentPlatformDir(st, c)
+			if _, err := os.Stat(filepath.Join(root, dir, "terragrunt.hcl")); err != nil {
+				t.Errorf("%s/terragrunt.hcl does not exist in %s.\n\n"+
+					"rackctl lists %q, so assertAgentPlatformRoots collects it as missing and a "+
+					"non-dry run returns NoRollbackError — the phase aborts before applying "+
+					"ANYTHING. A dry run only prints a note, so `rackctl plan` would still look fine.",
+					dir, root, c.name)
+			}
 		}
 	}
 }

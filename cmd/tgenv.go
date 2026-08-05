@@ -74,10 +74,14 @@ func tgEnv(cfg *config.Config) []string {
 		// leaves express as an explicit dependency. That phase boundary is the precondition; the
 		// tier is only what decides whether it is wanted.
 		//
-		// enable_accelerators labels this cluster eks-agent-platform/accelerators=true so the
-		// accelerators ApplicationSet (gpu-operator, nvidia-dra-driver) targets it. Opt-in and
-		// unset in every committed leaf, because a GPU driver on a cluster with no GPU nodes
-		// cannot even pull its image (nvcr.io wants an NGC key) and has nothing to schedule on.
+		// enable_accelerators is deliberately absent. It labelled the cluster
+		// eks-agent-platform/accelerators=true so the accelerators ApplicationSet targeted it,
+		// and the whole GPU path — that ApplicationSet, the accelerator-pools component, and
+		// landing-zone's variable and label — was deleted upstream (ledger O27). The variable is
+		// now undeclared, so injecting it would be inert rather than wrong; it is gone anyway,
+		// because a knob whose documentation promises an effect it no longer has is worse than
+		// no knob. addons.accelerators is refused at config load, not ignored — see
+		// internal/config/retired.go.
 		//
 		// enable_agent_platform labels the cluster into the operator ApplicationSet. Default
 		// true upstream, which is the right day-0 answer — but when the operator opts out
@@ -102,7 +106,6 @@ func tgEnv(cfg *config.Config) []string {
 		// This is the one place rackctl injects a value that is not "different from the
 		// leaf's" — there is no leaf pin to respect here, only a component default, and
 		// leaving a credential lying around is not a default worth inheriting.
-		"TF_VAR_enable_accelerators=" + strconv.FormatBool(cfg.Addons.Accelerators),
 		"TF_VAR_observability_tier=" + string(cfg.Observability.Tier),
 		"TF_VAR_enable_managed_monitoring=" + strconv.FormatBool(cfg.FullObservability()),
 		"TF_VAR_enable_agent_platform=" + strconv.FormatBool(cfg.AgentPlatform.Enabled()),

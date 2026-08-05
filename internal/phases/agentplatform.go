@@ -68,6 +68,12 @@ type apComponent struct {
 // batch-runtime is deliberately absent. It is a component with no live root in any environment,
 // so there is nothing here to apply — see assertAgentPlatformRoots, which says so rather than
 // letting terragrunt discover it.
+//
+// accelerator-pools is absent because it no longer exists. The whole GPU path was deleted
+// upstream — the component and its three live leaves with it — after three layers of it turned
+// out to be inert: a DRA chart pinned to a name published by no registry, values describing an
+// AcceleratorPool CRD that exists nowhere, and a driver mutually exclusive with the gpu-operator
+// sitting beside it at an adjacent sync wave. The model path is Bedrock. Ledger O27.
 func agentPlatformComponents() []apComponent {
 	return []apComponent{
 		{name: "bedrock-account", account: true},
@@ -75,7 +81,6 @@ func agentPlatformComponents() []apComponent {
 		{name: "cost-pipeline", account: true, forceDestroyInput: true},
 		{name: "bedrock"},
 		{name: "agent-egress"},
-		{name: "accelerator-pools"},
 		{name: "eval-runtime"},
 		{name: "kill-switch"},
 		{name: "cost-access"}, // last: joins the account contract to this cluster's operator
@@ -200,16 +205,16 @@ func agentPlatformEnv(st *engine.State) ([]string, error) {
 
 	// node_role_name is deliberately NOT sent, and this is a deletion rather than an omission.
 	//
-	// accelerator-pools used to attach an inline ec2:Describe* policy to the Karpenter node role
-	// for the AWS Neuron device plugin's topology discovery. There is no Neuron device plugin —
-	// eks-gitops installs the GPU Operator and the NVIDIA DRA driver and nothing else — so the
-	// whole Neuron half went upstream, and `var.node_role_name` and the data source resolving it
-	// went with it (accelerator-pools/variables.tf:11 records the absence deliberately).
+	// The only component that ever took it was accelerator-pools, which attached an inline
+	// ec2:Describe* policy to the Karpenter node role for the AWS Neuron device plugin's topology
+	// discovery. The Neuron half went first (O24), taking `var.node_role_name` with it; the whole
+	// component went shortly after, when the GPU path was deleted (O27). So there is now no root
+	// in this tree that declares the variable at all.
 	//
-	// tofu ignores a TF_VAR_ naming a variable no root declares, so this was inert rather than
-	// broken. What was not inert was the `needOutput(st, "karpenter_node_role_name", "cluster")`
-	// behind it: a hard requirement that failed the whole phase before applying anything, to
-	// produce a value nothing reads. Ledger O24.
+	// tofu ignores a TF_VAR_ naming a variable no root declares, so the export was inert rather
+	// than broken. What was not inert was the `needOutput(st, "karpenter_node_role_name",
+	// "cluster")` behind it: a hard requirement that failed the whole phase before applying
+	// anything, to produce a value nothing reads.
 
 	return env, nil
 }
@@ -554,10 +559,10 @@ func assertAgentPlatformRoots(st *engine.State) error {
 // these components resolve landing-zone values — agent-iam's operator role and tenant paths,
 // observability's alert topic ARNs — and Terraform evaluates data sources during a DESTROY
 // plan as well as an apply. So destroying landing-zone's agent-iam or observability first
-// leaves five of these six leaves unable to plan their own destroy at all: they fail at
-// parameter resolution, before deleting anything. accelerator-pools and eval-runtime add a
-// second constraint — they own EKS Pod Identity associations, so they must go before the
-// cluster.
+// leaves most of these leaves unable to plan their own destroy at all: they fail at parameter
+// resolution, before deleting anything. eval-runtime adds a second constraint — it owns EKS Pod
+// Identity associations, so it must go before the cluster. accelerator-pools was the other half
+// of that constraint until the GPU path was deleted upstream (ledger O27).
 //
 // Exported for `rackctl destroy`, which walks the teardown outside the phase engine.
 func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatformTeardown) error {

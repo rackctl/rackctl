@@ -335,8 +335,7 @@ type Quotas struct {
 }
 
 type Addons struct {
-	Druid        bool `json:"druid"`
-	Accelerators bool `json:"accelerators"` // gpu-operator / neuron
+	Druid bool `json:"druid"`
 }
 
 // ObservabilityTier selects which observability substrate a cluster runs. It mirrors

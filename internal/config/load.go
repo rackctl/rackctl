@@ -19,6 +19,13 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	// Before defaults and before validation: a retired key is a statement about what this file
+	// asks for, and the answer must not depend on anything rackctl computes afterwards. See
+	// retired.go — the decoder ignores unknown keys, so removing a field without this turns a
+	// deleted feature into a silently ignored request.
+	if err := checkRetired(b); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
 	c.ApplyDefaults()
 	if err := c.Validate(); err != nil {
 		return &c, err
