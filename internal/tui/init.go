@@ -137,7 +137,7 @@ func (m model) View() string {
 		if !r.seen && !r.active {
 			title = ui.Gray.Render(title)
 		}
-		b.WriteString(fmt.Sprintf(" %s %s\n", icon, title))
+		fmt.Fprintf(&b, " %s %s\n", icon, title)
 	}
 	b.WriteString("\n")
 	switch {

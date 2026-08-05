@@ -34,7 +34,10 @@ func fetchEgressIP(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	// Discarded explicitly. Closing a response body this function has finished reading can only
+	// fail on an already-broken connection, and there is nothing to do about it and nothing to
+	// report it to — the caller wants an IP or an error about getting one.
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("%s returned %s", ipEchoEndpoint, resp.Status)
 	}
