@@ -358,6 +358,78 @@ func TestCheckCatalogFork_OrgThatPublishesTheCatalogHasNoFork(t *testing.T) {
 	}
 }
 
+// ─────────────────────────── cost pipeline prerequisite ───────────────────────────
+
+// The CUR contract missing must FAIL, and the message must name both remedies.
+//
+// cost-pipeline resolves /platform/org/cost/cur-export-{bucket,prefix,name} through
+// unguarded data blocks, so absent parameters fail its PLAN — as root two of the seven the
+// agent-platform substrate applies, i.e. after the VPC, the EKS control plane and ArgoCD
+// convergence. Discovering it there costs a cluster and a NAT gateway; discovering it here
+// costs one API call.
+func TestCheckCostPipelinePrerequisite_FailsWhenTheCURContractIsAbsent(t *testing.T) {
+	// `aws ssm get-parameters --query InvalidParameters --output text` prints the names it
+	// could not resolve, tab-separated.
+	fakeBin(t, "aws", `
+if [ "$1" = "ssm" ]; then printf '%s\t%s\t%s\n' \
+  /platform/org/cost/cur-export-bucket \
+  /platform/org/cost/cur-export-prefix \
+  /platform/org/cost/cur-export-name; fi
+exit 0`)
+
+	r := CheckCostPipelinePrerequisite(context.Background(), testEnv())
+	mustFail(t, r, "org-cost")
+	if !strings.Contains(r.Detail, "costPipeline: false") {
+		t.Errorf("the message must offer the other remedy — installing without the cost tier:\n%s", r.Detail)
+	}
+	if !strings.Contains(r.Detail, "cur-export-bucket") {
+		t.Errorf("the message must name WHICH parameters are missing:\n%s", r.Detail)
+	}
+}
+
+// A published contract passes.
+func TestCheckCostPipelinePrerequisite_OKWhenPublished(t *testing.T) {
+	// An empty InvalidParameters list renders as AWS's literal "None" under --output text,
+	// which is the case a naive non-empty check reads as three missing parameters.
+	fakeBin(t, "aws", `
+if [ "$1" = "ssm" ]; then echo None; fi
+exit 0`)
+
+	if r := CheckCostPipelinePrerequisite(context.Background(), testEnv()); r.Status != doctor.OK {
+		t.Fatalf("all three parameters resolved is the healthy case: %s — %s", r.Status, r.Detail)
+	}
+}
+
+// Turning the tier off is a legitimate install, and the check must say what was given up
+// rather than reporting a bare green tick.
+func TestCheckCostPipelinePrerequisite_OKWhenTheTierIsOff(t *testing.T) {
+	// aws exits non-zero for everything: if the short-circuit were removed this would warn,
+	// so the assertion below distinguishes "skipped deliberately" from "happened to pass".
+	fakeBin(t, "aws", `exit 1`)
+
+	env := testEnv()
+	off := false
+	env.Cfg.AgentPlatform.CostPipeline = &off
+
+	r := CheckCostPipelinePrerequisite(context.Background(), env)
+	if r.Status != doctor.OK {
+		t.Fatalf("costPipeline: false is a supported install: %s — %s", r.Status, r.Detail)
+	}
+	if !strings.Contains(r.Detail, "BudgetPolicy") {
+		t.Errorf("the detail must name what turning the tier off costs:\n%s", r.Detail)
+	}
+}
+
+// A query that fails must never read as healthy — the same rule the catalog-fork check
+// learned. "Cannot tell" and "fine" are different answers.
+func TestCheckCostPipelinePrerequisite_UnreadableIsNotHealthy(t *testing.T) {
+	fakeBin(t, "aws", `exit 1`)
+
+	if r := CheckCostPipelinePrerequisite(context.Background(), testEnv()); r.Status == doctor.OK {
+		t.Fatalf("a failed query must not report OK — that is a green light that means nothing.\ndetail: %s", r.Detail)
+	}
+}
+
 // ─────────────────────────── identity ───────────────────────────
 
 // The profile is ambient; the account id is declared. Nothing compared them, so a

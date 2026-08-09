@@ -428,12 +428,43 @@ type AgentPlatform struct {
 	// and gives them a teardown posture, so nothing here has to outlive its cluster.
 	ModelImport bool `json:"modelImport"`
 
+	// CostPipeline applies the two cost roots of the agent-platform tree: cost-pipeline
+	// (account-scoped) and cost-access (per cluster). Together they turn a Cost and Usage
+	// Report plus Bedrock invocation logs into per-tenant spend, which is the attribution
+	// every BudgetPolicy the operator enforces is measured on.
+	//
+	// It has a prerequisite rackctl cannot satisfy, and that is why this is a field rather
+	// than always-on. cost-pipeline resolves the report's location from three SSM
+	// parameters — /platform/org/cost/cur-export-{bucket,prefix,name} — through unguarded
+	// `data` blocks, and the only thing in the org that writes them is landing-zone's
+	// org-cost root at live/aws/management/<region>/org/org-cost. A CUR has no filter: it
+	// always covers the whole account, so exactly one exists, and defining it is an
+	// org-level act in the management account rather than something a platform install
+	// should do on the way past.
+	//
+	// Without those parameters the apply dies at root two of seven — after the VPC, the
+	// EKS control plane, the whole AWS substrate and ArgoCD convergence have been built and
+	// paid for. So preflight asserts them instead, before a dollar is spent, and names the
+	// root to apply.
+	//
+	// Omitted (nil) defaults to TRUE. Cost attribution is what the platform's budget
+	// controls are built on, and defaulting it off would ship a BudgetPolicy measuring
+	// nothing. Set it false to install without the cost tier.
+	CostPipeline *bool `json:"costPipeline,omitempty"`
+
 	Compliance Compliance `json:"compliance"`
 }
 
 // Enabled reports whether the agent platform should be installed. An omitted
 // agentPlatform block (nil) defaults to enabled.
 func (a AgentPlatform) Enabled() bool { return a.Enable == nil || *a.Enable }
+
+// CostPipelineEnabled reports whether the two cost roots should be applied. An omitted
+// field defaults to enabled. Callers gate on Enabled() first — there is no cost tier
+// without an agent platform to attribute spend for.
+func (a AgentPlatform) CostPipelineEnabled() bool {
+	return a.CostPipeline == nil || *a.CostPipeline
+}
 
 type Compliance struct {
 	SOC2  bool `json:"soc2"`

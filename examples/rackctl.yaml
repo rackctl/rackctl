@@ -154,6 +154,25 @@ agentPlatform:
                                 # because the component applies cleanly elsewhere and is silently unusable.
                                 # Destroyed with everything else — landing-zone scopes it by environment and gives
                                 # it a teardown posture, so nothing here outlives its cluster.
+  costPipeline: true            # default. Applies the two cost roots of the agent-platform tree —
+                                # cost-pipeline (account-scoped) and cost-access (per cluster) — which
+                                # turn a Cost and Usage Report plus Bedrock invocation logs into the
+                                # per-tenant spend every BudgetPolicy is measured against. They are gated
+                                # together: cost-access only republishes what cost-pipeline produces, so
+                                # half the pair is worse than neither.
+                                #
+                                # PREREQUISITE rackctl cannot satisfy. cost-pipeline resolves the report's
+                                # location from /platform/org/cost/cur-export-{bucket,prefix,name} through
+                                # unguarded data blocks, and the only thing that writes them is
+                                # landing-zone's org-cost root at live/aws/management/<region>/org/org-cost.
+                                # A CUR has no filter — it always covers the whole account — so there is
+                                # exactly one, and defining it is a management-account act, not something a
+                                # platform install should do on the way past (org-cost also enrolls the
+                                # account in Compute Optimizer and stands up budgets and anomaly monitors).
+                                #
+                                # `rackctl check` asserts those three parameters before anything is spent.
+                                # Without the check the apply dies at root two of seven — after the VPC, the
+                                # EKS control plane and ArgoCD convergence are built and billing.
   compliance:
     soc2: true
     hipaa: false

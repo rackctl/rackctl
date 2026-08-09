@@ -73,6 +73,7 @@ func Run(ctx context.Context, env *Env) []doctor.Result {
 		CheckSoftDeletedSecrets(ctx, env),
 		CheckCostAllocationTags(ctx, env),
 		CheckCatalogFork(ctx, env),
+		CheckCostPipelinePrerequisite(ctx, env),
 		CheckGitHubToken(ctx, env),
 		CheckVendFreshness(ctx, env),
 	}
@@ -510,4 +511,81 @@ func CheckVendFreshness(ctx context.Context, env *Env) doctor.Result {
 	return warn(name, fmt.Sprintf(
 		"%s behind their remote — init fast-forwards them, but a divergence would be used as-is",
 		strings.Join(behind, ", ")))
+}
+
+// ─────────────────────────── cost pipeline prerequisite ───────────────────────────
+
+// curExportParams is the contract cost-pipeline resolves the Cost and Usage Report from.
+//
+// Read through unguarded `data "aws_ssm_parameter"` blocks
+// (eks-agent-platform/terraform/components/cost-pipeline/main.tf:53-63), so a missing
+// parameter is not a degraded feature — it is a plan-time failure of the whole root.
+var curExportParams = []string{
+	"/platform/org/cost/cur-export-bucket",
+	"/platform/org/cost/cur-export-prefix",
+	"/platform/org/cost/cur-export-name",
+}
+
+// costOrgRoot is the only thing in the org that writes them: landing-zone's org-cost.
+const costOrgRoot = "live/aws/management/<region>/org/org-cost"
+
+// CheckCostPipelinePrerequisite asserts the CUR contract exists before the install starts.
+//
+// A Cost and Usage Report has no filter — it always covers the whole account — so exactly
+// one exists per account, and defining it is an org-level act in the management account.
+// rackctl deliberately does not perform it: applying landing-zone's org-cost would also
+// enroll the account in Compute Optimizer, create org budgets and stand up anomaly
+// monitors, none of which a platform install should do on the way past.
+//
+// So the prerequisite is real and rackctl's job is to say so early. Without it the apply
+// dies at cost-pipeline, which is root TWO of the seven the agent-platform substrate
+// applies — and that phase runs after the VPC, the EKS control plane, the whole AWS
+// substrate and ArgoCD convergence. The operator pays for a cluster and a NAT gateway to
+// discover a missing SSM parameter.
+//
+// The two failure modes this must distinguish, because they want opposite remedies:
+// parameters absent (apply org-cost, or turn the tier off) versus the query itself failing
+// (unknown — warn, never a green tick).
+func CheckCostPipelinePrerequisite(ctx context.Context, env *Env) doctor.Result {
+	const name = "cost pipeline"
+
+	if !env.Cfg.AgentPlatform.Enabled() {
+		return ok(name, "agent platform is off — no cost roots to apply")
+	}
+	if !env.Cfg.AgentPlatform.CostPipelineEnabled() {
+		return ok(name, "agentPlatform.costPipeline is false — cost-pipeline and cost-access are "+
+			"not applied, so BudgetPolicy has no per-tenant spend to measure")
+	}
+
+	// get-parameters returns the names it could NOT resolve in InvalidParameters, so one call
+	// answers for all three and names exactly which are missing. Querying that field rather
+	// than counting Parameters keeps the failure message specific: "which one" is the first
+	// thing the operator asks.
+	args := append([]string{"ssm", "get-parameters", "--names"}, curExportParams...)
+	out, err := env.aws(ctx, append(args, "--query", "InvalidParameters")...)
+	if err != nil {
+		return warn(name, fmt.Sprintf(
+			"could not read the CUR export parameters (%s) — verify by hand before relying on "+
+				"this run; cost-pipeline resolves them through unguarded data blocks and fails "+
+				"the plan if they are absent", strings.Join(curExportParams, ", ")))
+	}
+
+	// `--output text` renders an empty list as an empty string and a populated one as
+	// tab-separated names. Fields() handles both, and the "None" AWS prints for a null.
+	missing := strings.Fields(out)
+	if len(missing) == 1 && missing[0] == "None" {
+		missing = nil
+	}
+	if len(missing) == 0 {
+		return ok(name, "the CUR export contract is published — cost-pipeline and cost-access can resolve it")
+	}
+
+	return fail(name, fmt.Sprintf(
+		"%s missing in this account. cost-pipeline reads them through unguarded data blocks, so it "+
+			"fails at PLAN — as root two of the seven the agent-platform substrate applies, i.e. "+
+			"after the VPC, the cluster and ArgoCD are built and billing. Only landing-zone's "+
+			"org-cost root publishes them, and it belongs to the management account because a CUR "+
+			"is an account singleton. Fix: apply %s, or set agentPlatform.costPipeline: false to "+
+			"install without the cost tier",
+		strings.Join(missing, ", "), costOrgRoot))
 }

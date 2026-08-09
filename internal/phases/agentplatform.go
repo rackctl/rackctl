@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/engine"
 )
 
@@ -74,17 +75,33 @@ type apComponent struct {
 // out to be inert: a DRA chart pinned to a name published by no registry, values describing an
 // AcceleratorPool CRD that exists nowhere, and a driver mutually exclusive with the gpu-operator
 // sitting beside it at an adjacent sync wave. The model path is Bedrock. Ledger O27.
-func agentPlatformComponents() []apComponent {
-	return []apComponent{
+//
+// The two cost roots are gated by agentPlatform.costPipeline, and gated TOGETHER, because
+// half of the pair is worse than neither. cost-access exists only to read what cost-pipeline
+// publishes under /eks-agent-platform/org/cost-pipeline/* and republish it per cluster;
+// applied alone it resolves a contract with no producer and fails on eight unguarded reads.
+// cost-pipeline alone is the mirror image — the account pipeline runs and no cluster can
+// reach what it produces.
+func agentPlatformComponents(cfg *config.Config) []apComponent {
+	cost := cfg.AgentPlatform.CostPipelineEnabled()
+	comps := []apComponent{
 		{name: "bedrock-account", account: true},
-		// reads bedrock-account's log group over SSM; the one root here taking force_destroy_buckets
-		{name: "cost-pipeline", account: true, forceDestroyInput: true},
-		{name: "bedrock"},
-		{name: "agent-egress"},
-		{name: "eval-runtime"},
-		{name: "kill-switch"},
-		{name: "cost-access"}, // last: joins the account contract to this cluster's operator
 	}
+	if cost {
+		// reads bedrock-account's log group over SSM; the one root here taking force_destroy_buckets
+		comps = append(comps, apComponent{name: "cost-pipeline", account: true, forceDestroyInput: true})
+	}
+	comps = append(comps,
+		apComponent{name: "bedrock"},
+		apComponent{name: "agent-egress"},
+		apComponent{name: "eval-runtime"},
+		apComponent{name: "kill-switch"},
+	)
+	if cost {
+		// last: joins the account contract to this cluster's operator
+		comps = append(comps, apComponent{name: "cost-access"})
+	}
+	return comps
 }
 
 // agentPlatformComponentNames is the display list, for notes that name what is being applied.
@@ -444,7 +461,7 @@ func applyAgentPlatform(ctx context.Context, st *engine.State) error {
 	noteAgentPlatformTeardown(st)
 	noteAccountScopedApply(st)
 
-	for _, c := range agentPlatformComponents() {
+	for _, c := range agentPlatformComponents(st.Config) {
 		// The environment is rebuilt per component rather than once for the loop, because the
 		// account roots must not receive the cluster set. Assigning a fresh slice each time
 		// also keeps one component's variables from accumulating onto the next.
@@ -500,7 +517,7 @@ func noteAccountScopedApply(st *engine.State) {
 // s3:BypassGovernanceRetention on the caller, which rackctl neither declares nor checks.
 func noteAgentPlatformTeardown(st *engine.State) {
 	note(st, "agent-platform substrate: applying %s",
-		strings.Join(agentPlatformComponentNames(agentPlatformComponents()), ", "))
+		strings.Join(agentPlatformComponentNames(agentPlatformComponents(st.Config)), ", "))
 	note(st, "agent-platform substrate: NOTE — the account-scoped buckets take writes from the first "+
 		"PUT (S3 server-access logs land immediately), so a teardown meets BucketNotEmpty unless "+
 		"force_destroy is landed in state first. cost-pipeline now accepts force_destroy_buckets and "+
@@ -527,7 +544,7 @@ func noteAgentPlatformTeardown(st *engine.State) {
 // knows it is there.
 func assertAgentPlatformRoots(st *engine.State) error {
 	var missing []apComponent
-	for _, c := range agentPlatformComponents() {
+	for _, c := range agentPlatformComponents(st.Config) {
 		if _, err := os.Stat(filepath.Join(st.Repos.AgentPlatform, agentPlatformDir(st, c), "terragrunt.hcl")); err != nil {
 			missing = append(missing, c)
 		}
@@ -579,7 +596,7 @@ func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatf
 	st.Runner.Dir = st.Repos.AgentPlatform
 	defer func() { st.Runner.Dir, st.Runner.Env = prevDir, prevEnv }()
 
-	comps := agentPlatformComponents()
+	comps := agentPlatformComponents(st.Config)
 	note(st, "agent-platform substrate: destroying in reverse, BEFORE landing-zone — these components "+
 		"read agent-iam's and observability's SSM parameters through unguarded data blocks, and a "+
 		"destroy PLAN resolves data sources too, so tearing landing-zone down first leaves them "+
