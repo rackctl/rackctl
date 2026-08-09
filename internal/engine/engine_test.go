@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -412,5 +413,42 @@ func TestEngineStillRollsBackWhenARequiredPhaseFails(t *testing.T) {
 	want := []string{"run:cluster", "run:substrate", "teardown:substrate", "teardown:cluster"}
 	if !equal(log, want) {
 		t.Fatalf("log = %v, want %v — a required phase's failure must still roll back", log, want)
+	}
+}
+
+// One optional phase failing must not cancel the optional phases after it.
+//
+// The engine already declined to roll back when an optional phase failed, on the stated
+// reasoning that nothing an optional phase installs is a prerequisite for anything else.
+// It then returned, honouring only half of that: portal is ordered ahead of smoke, they
+// share nothing, and a portal that could not install meant the first-tenant vend — the one
+// phase whose entire purpose is to prove the platform works — never ran at all.
+func TestRun_AFailedOptionalPhaseDoesNotCancelTheNextOne(t *testing.T) {
+	var log []string
+	e := &Engine{
+		Out: io.Discard,
+		Phases: []Phase{
+			recPhase{id: "core", enabled: true, log: &log},
+			recPhase{id: "portal", enabled: true, optional: true, fail: true, log: &log},
+			recPhase{id: "smoke", enabled: true, optional: true, log: &log},
+		},
+	}
+
+	err := e.Run(context.Background(), &State{})
+	if err == nil {
+		t.Fatal("continuing past an optional failure is not forgiving it — the run must still fail")
+	}
+	if !strings.Contains(err.Error(), "portal") {
+		t.Errorf("the error must name which optional phase failed:\n%v", err)
+	}
+
+	if !slices.Contains(log, "run:smoke") {
+		t.Fatalf("smoke must still run after portal failed — they share nothing.\nlog = %v", log)
+	}
+	// And still no rollback: the platform underneath is provisioned.
+	for _, entry := range log {
+		if strings.HasPrefix(entry, "teardown:core") {
+			t.Errorf("an optional failure must never tear down a core phase.\nlog = %v", log)
+		}
 	}
 }

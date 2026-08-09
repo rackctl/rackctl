@@ -90,6 +90,9 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 
 	total := len(e.Phases)
 	var completed []Phase
+	// Optional phases that failed. Collected rather than returned, so one of them
+	// failing does not cancel the others — see the Optional() case below.
+	var optionalFailed []error
 	for i, p := range e.Phases {
 		ev := Event{Index: i + 1, Total: total, ID: p.ID(), Title: p.Title()}
 		label := fmt.Sprintf("[%d/%d] %s", ev.Index, ev.Total, ev.Title)
@@ -136,12 +139,32 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				// first tenant reaching Ready. That is the same reasoning NoRollbackError
 				// encodes for the ArgoCD convergence wait, made structural here so the next
 				// optional phase inherits it instead of having to remember.
+				//
+				// And the run CONTINUES. The reasoning above — that nothing an optional
+				// phase installs is a prerequisite for anything else — cuts both ways, and
+				// the loop used to honour only half of it: it declined to roll back, then
+				// returned, so a failure in one optional phase cancelled every optional
+				// phase after it.
+				//
+				// What that cost is specific. portal is the day-2 UI and smoke is the
+				// first-tenant vend, they share nothing, and portal is ordered first — so
+				// a portal that could not install meant the tenant-vending path, the one
+				// thing whose entire purpose is to prove the platform works, was never
+				// exercised. The operator lost the evidence to a failure in the console.
+				//
+				// Each optional phase reads only what the CORE phases built, so skipping a
+				// failed one leaves the next with everything it needs. The failures are
+				// collected and reported together at the end, and the run still exits
+				// non-zero: continuing is not forgiving them.
+				optionalFailed = append(optionalFailed, fmt.Errorf("%s: %w", p.ID(), err))
 				if e.Hook == nil {
 					fmt.Fprintln(e.Out, ui.Warn(
 						"this is an optional phase and the platform underneath it is provisioned — "+
-							"leaving it standing. Nothing was rolled back. Run `rackctl check` to see "+
-							"what is wrong, or `rackctl destroy` to tear it down deliberately."))
+							"leaving it standing. Nothing was rolled back, and the remaining phases "+
+							"still run. Run `rackctl check` to see what is wrong, or `rackctl destroy` "+
+							"to tear it down deliberately."))
 				}
+				continue
 			case e.CleanOnFail && !errors.As(err, &noRollback):
 				// The phase that FAILED is torn down too. It failed partway, which
 				// means it may have created resources before it died — a terragrunt
@@ -157,6 +180,16 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 		ev.Status = StatusOK
 		e.report(ev, ui.OK(label))
 		completed = append(completed, p)
+	}
+	// A platform whose optional layers failed is still a platform, and saying so is not
+	// the same as calling the run a success. Both, in that order.
+	if len(optionalFailed) > 0 {
+		if e.Hook == nil {
+			fmt.Fprintln(e.Out, ui.Warn(
+				"the core platform is up; optional phases failed and are listed below. Nothing "+
+					"was rolled back."))
+		}
+		return fmt.Errorf("optional phase(s) failed: %w", errors.Join(optionalFailed...))
 	}
 	if e.Hook == nil {
 		fmt.Fprintln(e.Out, ui.OK("platform is up — hand off to the portal for day-2 operations"))
