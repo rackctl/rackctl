@@ -194,20 +194,20 @@ func boolPtr(b bool) *bool { return &b }
 // sets app-of-apps' targetRevision from it and stamps gitops/repo-branch on the cluster
 // Secret, which every ApplicationSet templates its own targetRevision from. Without it a
 // pinned install builds from a tag and then syncs a fleet from main.
-func TestGlobalTGEnv_CatalogPinReachesClusterBootstrap(t *testing.T) {
+func TestTGEnv_CatalogPinReachesClusterBootstrap(t *testing.T) {
 	cfg := config.Default()
 	cfg.Org.Name = "acme"
 	cfg.Org.GitOps.EKSGitopsRepo = "github.com/acme/eks-gitops"
 	cfg.Cloud.AccountID = "111111111111"
 
-	if got := globalTGEnv(cfg); slices.ContainsFunc(got, func(e string) bool {
+	if got := tgEnv(cfg); slices.ContainsFunc(got, func(e string) bool {
 		return strings.HasPrefix(e, "TF_VAR_gitops_repo_branch=")
 	}) {
 		t.Fatalf("unpinned must send no revision — the leaf's own default stands.\nenv: %v", got)
 	}
 
 	cfg.Versions.EKSGitops = "v1.0.0"
-	got := globalTGEnv(cfg)
+	got := tgEnv(cfg)
 	if !slices.Contains(got, "TF_VAR_gitops_repo_branch=v1.0.0") {
 		t.Fatalf("a pinned catalog must reach cluster-bootstrap as gitops_repo_branch.\nenv: %v", got)
 	}
