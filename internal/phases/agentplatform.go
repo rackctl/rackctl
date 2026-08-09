@@ -613,13 +613,28 @@ func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatf
 		}
 	}
 
+	// A missing landing-zone output on the DESTROY path is not an error, and the message it
+	// used to produce said so itself: "Nothing in eks-agent-platform/terraform has been
+	// applied yet, so nothing needs unwinding" — and then returned that as a failure, which
+	// the destroy counted and exited non-zero on.
+	//
+	// The state bucket check above is necessary and not sufficient: rackctl creates that
+	// bucket outside terraform, so it outlives the tree it holds state for. A second
+	// teardown finds the bucket present, the tree already destroyed, and landing-zone's
+	// secrets component gone — so the output cannot be read and there is nothing that needs
+	// it.
+	//
+	// On the APPLY path the same missing output stays fatal, because there it means the
+	// substrate is about to be built against a key that does not exist.
 	clusterEnv, err := agentPlatformEnv(st)
 	if err != nil {
-		return err
+		note(st, "agent-platform substrate: %v — treating as nothing to unwind", err)
+		return nil
 	}
 	accountEnv, err := agentPlatformAccountEnv(st)
 	if err != nil {
-		return err
+		note(st, "agent-platform substrate: %v — treating as nothing to unwind", err)
+		return nil
 	}
 
 	prevDir, prevEnv := st.Runner.Dir, st.Runner.Env
