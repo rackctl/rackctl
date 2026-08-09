@@ -392,20 +392,56 @@ type acquire struct{ base }
 // touched it, and a divergence must be reported rather than merged over. It is not
 // fatal — a dirty working copy is the operator's business, and the note says which
 // checkout it is — but they are told.
-func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir string) error {
+func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir, ref string) error {
+	name := filepath.Base(dir)
+	fresh := false
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
-		return st.Runner.Run(ctx, "git", "clone", url, dir)
+		if err := st.Runner.Run(ctx, "git", "clone", url, dir); err != nil {
+			return err
+		}
+		fresh = true
 	}
 	prev := st.Runner.Dir
 	st.Runner.Dir = dir
 	defer func() { st.Runner.Dir = prev }()
 
-	if err := st.Runner.Run(ctx, "git", "pull", "--ff-only"); err != nil {
-		note(st, "%s: could not fast-forward — it has diverged from upstream, and this run "+
-			"will use the code as it stands on disk", filepath.Base(dir))
+	if ref == "" {
+		if fresh {
+			return nil
+		}
+		if err := st.Runner.Run(ctx, "git", "pull", "--ff-only"); err != nil {
+			note(st, "%s: could not fast-forward — it has diverged from upstream, and this run "+
+				"will use the code as it stands on disk", name)
+			return nil
+		}
+		note(st, "%s updated to latest", name)
 		return nil
 	}
-	note(st, "%s updated to latest", filepath.Base(dir))
+
+	// Pinned. Fetch tags explicitly — a plain fetch does not bring tags that are not
+	// on a fetched branch, and a release tag frequently is not.
+	if !fresh {
+		if err := st.Runner.Run(ctx, "git", "fetch", "--tags", "--prune", "origin"); err != nil {
+			return fmt.Errorf("fetching %s to resolve the pin %q: %w", name, ref, err)
+		}
+	}
+
+	// Resolve BEFORE checking out, so an unknown ref is reported as an unknown ref
+	// rather than as whatever git does next. This is the whole reason pinning is worth
+	// having: a typo that silently left the checkout on the default branch would build
+	// a platform from HEAD while the config, the logs and the operator all said
+	// otherwise — the exact failure a pin exists to remove.
+	if _, err := st.Runner.Capture(ctx, "git", "rev-parse", "--verify", ref+"^{commit}"); err != nil {
+		return &engine.NoRollbackError{Err: fmt.Errorf(
+			"%s has no ref %q. versions pins this repo to that ref, and rackctl will not fall "+
+				"back to the default branch — a pin that silently tracks HEAD is worse than no "+
+				"pin. Check the tag exists on the remote, or remove the entry from versions", name, ref)}
+	}
+	if err := st.Runner.Run(ctx, "git", "-c", "advice.detachedHead=false", "checkout", "--force", ref); err != nil {
+		return err
+	}
+	sha, _ := st.Runner.Capture(ctx, "git", "rev-parse", "--short", "HEAD")
+	note(st, "%s pinned to %s (%s)", name, ref, strings.TrimSpace(sha))
 	return nil
 }
 
@@ -448,6 +484,16 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir string) error
 // says something alarming that turns out to mean nothing" is how a real divergence
 // warning stops being read.
 func forkOrSync(ctx context.Context, st *engine.State, org string) error {
+	// A pinned catalog must not be fast-forwarded. `gh repo sync` moves the fork's main
+	// to upstream's, and the local checkout is then rewound to the pin — so the fork
+	// ArgoCD reads and the tree rackctl reads would be different code, which is exactly
+	// the split the pin exists to prevent.
+	if st.Config.Versions.EKSGitops != "" {
+		note(st, "versions.eksGitops pins the catalog to %s — not syncing the fork, because "+
+			"fast-forwarding it would move what ArgoCD reads off the pin",
+			st.Config.Versions.EKSGitops)
+		return nil
+	}
 	if engine.OwnsUpstreamCatalog(org) {
 		note(st, "%s publishes %s — there is no fork: the org's catalog IS upstream, and ArgoCD "+
 			"syncs it directly", org, engine.UpstreamCatalog)
@@ -475,12 +521,17 @@ func forkOrSync(ctx context.Context, st *engine.State, org string) error {
 
 func (acquire) Run(ctx context.Context, st *engine.State) error {
 	org := st.Config.Org.Name
+	v := st.Config.Versions
 	st.Repos = engine.RepoPaths(org)
 	note(st, "cloning platform repos into %s", st.Repos.Workdir)
-	if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/landing-zone.git", st.Repos.LandingZone); err != nil {
+	if v.Any() {
+		note(st, "versions: pinned refs are checked out and NEVER fast-forwarded; an unknown ref "+
+			"stops the run rather than falling back to the default branch")
+	}
+	if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/landing-zone.git", st.Repos.LandingZone, v.LandingZone); err != nil {
 		return err
 	}
-	if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/eks-agent-platform.git", st.Repos.AgentPlatform); err != nil {
+	if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/eks-agent-platform.git", st.Repos.AgentPlatform, v.EKSAgentPlatform); err != nil {
 		return err
 	}
 	if err := forkOrSync(ctx, st, org); err != nil {
@@ -488,14 +539,14 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 	}
 	// Clone the fork to the exact path (gh's --clone ignores the target dir).
 	if err := cloneOrUpdate(ctx, st,
-		fmt.Sprintf("https://github.com/%s/eks-gitops.git", org), st.Repos.EKSGitops); err != nil {
+		fmt.Sprintf("https://github.com/%s/eks-gitops.git", org), st.Repos.EKSGitops, v.EKSGitops); err != nil {
 		return err
 	}
 	// The portal chart is not published to ghcr; clone its repo so the portal
 	// phase can install from the local chart (mirrors the operator fallback).
 	if st.Config.ControlPlane.Portal {
 		note(st, "cloning nanohype/portal (day-2 UI) for its local chart")
-		if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/portal.git", st.Repos.Portal); err != nil {
+		if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/portal.git", st.Repos.Portal, v.Portal); err != nil {
 			return err
 		}
 	}
@@ -505,7 +556,7 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 	// landing-zone Dir. Clone only when gated on, mirroring the portal.
 	if st.Config.ControlPlane.EKSFleet {
 		note(st, "controlPlane.eksFleet is on — cloning nanohype/eks-fleet for the hub control-plane install")
-		if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/eks-fleet.git", st.Repos.EKSFleet); err != nil {
+		if err := cloneOrUpdate(ctx, st, "https://github.com/nanohype/eks-fleet.git", st.Repos.EKSFleet, v.EKSFleet); err != nil {
 			return err
 		}
 	}
