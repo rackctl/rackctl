@@ -381,8 +381,15 @@ func routeTableIDs(st *engine.State) (string, error) {
 //
 // Versioned and encrypted, matching what the README documents and what landing-zone's own
 // script does for its bucket. Idempotent via head-bucket, so a re-run costs one API call.
+// agentPlatformStateBucket is this tree's own backend. One definition, because two
+// callers must agree exactly: the apply that creates it, and the destroy that reads its
+// absence as "this tree was never applied".
+func agentPlatformStateBucket(st *engine.State) string {
+	return fmt.Sprintf("eks-agent-platform-tfstate-%s-%s", st.Config.Cloud.AccountID, st.Config.Cloud.Region)
+}
+
 func ensureAgentPlatformBackend(ctx context.Context, st *engine.State) error {
-	bucket := fmt.Sprintf("eks-agent-platform-tfstate-%s-%s", st.Config.Cloud.AccountID, st.Config.Cloud.Region)
+	bucket := agentPlatformStateBucket(st)
 	region := st.Config.Cloud.Region
 
 	if st.Runner.DryRun {
@@ -583,6 +590,29 @@ func assertAgentPlatformRoots(st *engine.State) error {
 //
 // Exported for `rackctl destroy`, which walks the teardown outside the phase engine.
 func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatformTeardown) error {
+	// Nothing to destroy if nothing was ever applied, and establishing that FIRST is what
+	// keeps this from wedging a teardown.
+	//
+	// This tree writes to its own state bucket, created by the platform phase and by
+	// nothing else — not by rackctl's identity phase, which runs landing-zone's script for
+	// landing-zone's bucket, and not by terragrunt, whose backend bootstrap is opt-in. So
+	// the bucket's absence is a precise, cheap proof that the platform phase never ran.
+	//
+	// Without this the destroy did the opposite of its job. `terragrunt init` against a
+	// missing bucket errors, the error propagates, and `rackctl destroy` returns before it
+	// reaches the landing-zone components — so a run that failed in the cluster or gitops
+	// phase left the EKS control plane, the VPC and the NAT gateway billing, and said so in
+	// a message about a component tree that had never been applied. rackctl itself points
+	// operators at `rackctl destroy` from three separate pre-platform failure branches.
+	if !st.Runner.DryRun {
+		bucket := agentPlatformStateBucket(st)
+		if _, err := st.Runner.Capture(ctx, "aws", "s3api", "head-bucket", "--bucket", bucket); err != nil {
+			note(st, "agent-platform substrate: s3://%s does not exist, so nothing in this tree was "+
+				"ever applied — skipping it and going straight to the landing-zone components", bucket)
+			return nil
+		}
+	}
+
 	clusterEnv, err := agentPlatformEnv(st)
 	if err != nil {
 		return err
