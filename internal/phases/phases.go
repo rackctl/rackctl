@@ -103,6 +103,19 @@ func CoreComponents(cfg *config.Config) []string {
 	// boundary — not this slice — that actually enforces "the AWS substrate exists before
 	// ArgoCD consumes it". See the substrate phase for why that ordering is load-bearing
 	// (Pod Identity is injected at pod admission) and why it must be structural.
+	// fleet-hub is the eks-fleet control plane's AWS half: the eks-fleet-crossplane
+	// role provider-opentofu assumes, its permissions boundary, and the state bucket
+	// every vended cluster's tofu state lands in. It belongs in this list rather than
+	// inside the fleet phase because being here buys three things the fleet phase
+	// cannot: acquire asserts its live root exists before a dollar is spent, the
+	// substrate teardown destroys it in reverse with everything else, and it is applied
+	// once, early, rather than at the point Crossplane is already installing.
+	//
+	// It depends only on the cluster component, which the cluster phase applied before
+	// this one, so its position here is free.
+	if cfg.ControlPlane.EKSFleet {
+		comps = append(comps, "fleet-hub")
+	}
 	return append(comps, "cluster-addons", "cluster-bootstrap")
 }
 
@@ -1057,10 +1070,15 @@ func (fleet) Run(ctx context.Context, st *engine.State) error {
 		"provider-opentofu, the Cluster XRD and composition. Future clusters become namespaced "+
 		"Cluster CRs (org.gitops.clustersRepo=%s is where day-2 vends land, not this phase)",
 		st.Config.Org.GitOps.ClustersRepo)
-	note(st, "prerequisite: the hub IRSA role (eks-fleet-crossplane) and nanohype-eks-fleet-tfstate "+
-		"bucket from landing-zone's fleet-hub component. fleet-hub lives under live/aws/fleet/…, "+
-		"which rackctl does not apply — supply that substrate out of band, or the provider pod "+
-		"has no ambient AWS credentials. See eks-fleet/docs/stand-up-the-hub.md")
+	if st.Config.ControlPlane.FleetHubRoleARN == "" {
+		note(st, "hub identity: %s, from the fleet-hub component the substrate phase applied into "+
+			"this account. Its state bucket (nanohype-eks-fleet-tfstate) and its CMK carry "+
+			"prevent_destroy — they hold every vended cluster's tofu state, so a destroy of this "+
+			"platform leaves them standing on purpose", st.Config.FleetHubRoleARN())
+	} else {
+		note(st, "hub identity: %s, configured — this platform vends through a hub it does not own, "+
+			"so nothing here creates or destroys that role", st.Config.FleetHubRoleARN())
+	}
 
 	// Everything below is relative to the eks-fleet checkout. acquire cloned it when
 	// the gate was on; a missing Dir is a programming error, not an operator one.

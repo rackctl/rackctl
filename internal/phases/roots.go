@@ -17,6 +17,7 @@ var componentGateRemedy = map[string]string{
 	"dns":                "remove the dns block",
 	"druid":              "set addons.druid: false",
 	"model-import":       "set agentPlatform.modelImport: false",
+	"fleet-hub":          "set controlPlane.eksFleet: false",
 }
 
 // assertComponentRoots verifies that every landing-zone component this config will apply

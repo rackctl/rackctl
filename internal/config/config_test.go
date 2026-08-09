@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func valid() *Config {
 	c := Default()
@@ -377,5 +380,70 @@ func TestValidate_RejectsImpossibleSystemNodeSizing(t *testing.T) {
 					"the VPC is built and the cluster apply is minutes in")
 			}
 		})
+	}
+}
+
+// The hub role ARN is computed, not pasted.
+//
+// landing-zone's fleet-hub component pins `role_name = "eks-fleet-crossplane"` at the root
+// IAM path, and it pins it precisely so eks-fleet's committed bootstrap annotation can name
+// it. That makes the ARN a function of the account and nothing else — so requiring an
+// operator to supply it has exactly two possible outcomes, "correct" and "a typo that
+// installs a provider with no credentials while reporting Healthy".
+func TestFleetHubRoleARN_DerivedFromTheAccount(t *testing.T) {
+	c := &Config{Cloud: Cloud{AccountID: "111111111111"}}
+	if got, want := c.FleetHubRoleARN(), "arn:aws:iam::111111111111:role/eks-fleet-crossplane"; got != want {
+		t.Fatalf("derived hub role ARN = %q, want %q", got, want)
+	}
+}
+
+// An explicit value still wins — that is the multi-account shape, where this platform vends
+// through a hub another account owns and nothing here creates the role.
+func TestFleetHubRoleARN_ExplicitOverridesTheDerivedOne(t *testing.T) {
+	c := &Config{Cloud: Cloud{AccountID: "111111111111"}}
+	c.ControlPlane.FleetHubRoleARN = "arn:aws:iam::222222222222:role/eks-fleet-crossplane"
+	if got := c.FleetHubRoleARN(); got != "arn:aws:iam::222222222222:role/eks-fleet-crossplane" {
+		t.Fatalf("an explicit hub role must win, got %q", got)
+	}
+}
+
+// eksFleet with no fleetHubRoleArn is now the NORMAL configuration, and must validate.
+//
+// It used to be an error whose remedy was `terragrunt output -raw hub_role_arn` against a
+// root rackctl does not apply — against a tree whose cluster dependency has no state, so
+// the command could not run either.
+func TestValidate_EKSFleetDoesNotRequireAPastedHubRole(t *testing.T) {
+	c := Default()
+	c.Org.Name = "acme"
+	c.Org.GitOps.EKSGitopsRepo = "github.com/acme/eks-gitops"
+	c.Org.GitOps.ClustersRepo = "github.com/acme/clusters"
+	c.Cloud.AccountID = "111111111111"
+	c.Cloud.Profile = "acme"
+	c.Cluster.Name = "platform"
+	c.ControlPlane.EKSFleet = true
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("eksFleet with a derived hub role must validate: %v", err)
+	}
+}
+
+// A malformed one is still rejected: the shape is the half rackctl cannot compute away.
+func TestValidate_MalformedHubRoleIsStillRejected(t *testing.T) {
+	c := Default()
+	c.Org.Name = "acme"
+	c.Org.GitOps.EKSGitopsRepo = "github.com/acme/eks-gitops"
+	c.Org.GitOps.ClustersRepo = "github.com/acme/clusters"
+	c.Cloud.AccountID = "111111111111"
+	c.Cloud.Profile = "acme"
+	c.Cluster.Name = "platform"
+	c.ControlPlane.EKSFleet = true
+	c.ControlPlane.FleetHubRoleARN = "eks-fleet-crossplane"
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("a bare role name is not an ARN — the provider's ServiceAccount annotation must resolve")
+	}
+	if !strings.Contains(err.Error(), "Leave it unset") {
+		t.Errorf("the message must offer the derived value as the remedy:\n%v", err)
 	}
 }

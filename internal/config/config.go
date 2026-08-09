@@ -505,21 +505,45 @@ type Compliance struct {
 type ControlPlane struct {
 	EKSFleet bool `json:"eksFleet"` // Crossplane cluster control plane (multi-cluster)
 	Portal   bool `json:"portal"`   // day-2 operator UI
-	// FleetHubRoleARN is the IAM role provider-opentofu assumes to vend spoke clusters —
-	// landing-zone's fleet-hub component publishes it as `hub_role_arn`.
+	// FleetHubRoleARN is the IAM role provider-opentofu assumes to vend spoke clusters.
 	//
-	// It is required with EKSFleet because eks-fleet's config/bootstrap/providers.yaml
-	// ships a LITERAL placeholder (`arn:aws:iam::<FLEET_ACCOUNT_ID>:role/eks-fleet-crossplane`)
-	// and its own stand-up doc says "the file stays a placeholder", substituting the real
-	// ARN at apply time. Applying the file as-is installs a provider whose ServiceAccount
-	// annotation is not an ARN at all, so it never receives credentials — and since
-	// `kubectl apply` is declarative, it also reverts a real ARN an operator had put there.
+	// It matters because eks-fleet's config/bootstrap/providers.yaml ships a LITERAL
+	// placeholder (`arn:aws:iam::<FLEET_ACCOUNT_ID>:role/eks-fleet-crossplane`) and its
+	// own stand-up doc says "the file stays a placeholder", substituting the real ARN at
+	// apply time. Applying it unrendered installs a provider whose ServiceAccount
+	// annotation is not an ARN at all, so it never receives credentials — while still
+	// reporting Healthy. And since `kubectl apply` is declarative, it also reverts a real
+	// ARN an operator had put there by hand.
 	//
-	// fleet-hub lives under live/aws/fleet/…, a tree rackctl does not apply, so this cannot
-	// be captured from an output the way the landing-zone values are. Get it with:
+	// OPTIONAL, because rackctl now applies fleet-hub itself and the role's name is not a
+	// free choice. The component pins it — `role_name = "eks-fleet-crossplane"`, at the
+	// root IAM path — precisely so eks-fleet's bootstrap annotation can match, so the ARN
+	// is a function of the account and nothing else. Requiring an operator to paste a value
+	// rackctl can compute is a step whose only possible outcomes are "correct" and
+	// "a typo that installs a credential-less provider".
 	//
-	//	terragrunt output -raw hub_role_arn   # from live/aws/fleet/<region>/hub/fleet-hub
+	// Set it only to point at a hub in a DIFFERENT account from the one being installed
+	// into — the multi-account shape, where the workload account's platform vends through
+	// a hub the fleet account owns.
 	FleetHubRoleARN string `json:"fleetHubRoleArn,omitempty"`
+}
+
+// fleetHubRoleName is the role landing-zone's fleet-hub component creates. Pinned there
+// (components/aws/fleet-hub/main.tf, `role_name`) rather than derived from anything, so
+// that eks-fleet's committed bootstrap annotation can name it — which makes it a contract
+// across three repos, and the reason the ARN is computable here at all.
+const fleetHubRoleName = "eks-fleet-crossplane"
+
+// FleetHubRoleARN returns the configured hub role, or the one this account's fleet-hub
+// apply creates.
+//
+// The partition is aws — the same assumption Cloud.Provider already encodes, and the same
+// one every ARN this repo builds makes.
+func (c *Config) FleetHubRoleARN() string {
+	if c.ControlPlane.FleetHubRoleARN != "" {
+		return c.ControlPlane.FleetHubRoleARN
+	}
+	return fmt.Sprintf("arn:aws:iam::%s:role/%s", c.Cloud.AccountID, fleetHubRoleName)
 }
 
 type FirstTenant struct {
@@ -781,18 +805,14 @@ func (c *Config) Validate() error {
 	if c.ControlPlane.EKSFleet && c.Org.GitOps.ClustersRepo == "" {
 		errs = append(errs, "org.gitops.clustersRepo is required when controlPlane.eksFleet is true")
 	}
-	if c.ControlPlane.EKSFleet {
-		switch arn := c.ControlPlane.FleetHubRoleARN; {
-		case arn == "":
-			errs = append(errs, "controlPlane.fleetHubRoleArn is required when controlPlane.eksFleet is true — "+
-				"eks-fleet's config/bootstrap/providers.yaml ships a literal <FLEET_ACCOUNT_ID> placeholder and "+
-				"expects the real hub role ARN substituted at apply time. Get it from landing-zone's fleet-hub "+
-				"component: terragrunt output -raw hub_role_arn")
-		case !iamRoleARN.MatchString(arn):
-			errs = append(errs, fmt.Sprintf("controlPlane.fleetHubRoleArn %q is not an IAM role ARN — expected "+
-				"arn:<partition>:iam::<account>:role/<name>. A malformed value annotates the provider's "+
-				"ServiceAccount with something EKS cannot resolve, and the provider comes up with no credentials", arn))
-		}
+	// Only the SHAPE is validated. An empty value is the normal case now: rackctl applies
+	// fleet-hub into this account and the role name is pinned by that component, so the ARN
+	// is computed rather than pasted.
+	if arn := c.ControlPlane.FleetHubRoleARN; arn != "" && !iamRoleARN.MatchString(arn) {
+		errs = append(errs, fmt.Sprintf("controlPlane.fleetHubRoleArn %q is not an IAM role ARN — expected "+
+			"arn:<partition>:iam::<account>:role/<name>. A malformed value annotates the provider's "+
+			"ServiceAccount with something EKS cannot resolve, and the provider comes up with no credentials. "+
+			"Leave it unset to use the role this account's fleet-hub apply creates", arn))
 	}
 	if c.ControlPlane.Portal && c.Org.GitOps.TenantsRepo == "" {
 		errs = append(errs, "org.gitops.tenantsRepo is required when controlPlane.portal is true")

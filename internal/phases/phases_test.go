@@ -750,3 +750,26 @@ func TestSubstrate_SaysNothingAboutDruidWhenItIsOff(t *testing.T) {
 		t.Fatalf("druid is off; nothing should mention it.\ngot:\n%s", out.String())
 	}
 }
+
+// fleet-hub is in the component list exactly when the fleet phase will run.
+//
+// Being in this list rather than inside the fleet phase is what buys the three things the
+// fleet phase cannot: acquire asserts the live root exists before a dollar is spent, the
+// substrate teardown destroys it in reverse with everything else, and it is applied once,
+// early, rather than while Crossplane is already installing.
+func TestCoreComponents_FleetHubTracksTheEKSFleetGate(t *testing.T) {
+	cfg := config.Default()
+	if slices.Contains(CoreComponents(cfg), "fleet-hub") {
+		t.Fatalf("fleet-hub must not be applied when controlPlane.eksFleet is false:\n%v", CoreComponents(cfg))
+	}
+
+	cfg.ControlPlane.EKSFleet = true
+	got := CoreComponents(cfg)
+	if !slices.Contains(got, "fleet-hub") {
+		t.Fatalf("controlPlane.eksFleet must bring fleet-hub with it:\n%v", got)
+	}
+	// It reads the cluster component's OIDC outputs, so it cannot precede it.
+	if slices.Index(got, "fleet-hub") < slices.Index(got, "cluster") {
+		t.Errorf("fleet-hub depends on the cluster component's OIDC outputs and must follow it:\n%v", got)
+	}
+}
