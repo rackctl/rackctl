@@ -2,7 +2,6 @@ package phases
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/engine"
@@ -76,11 +75,38 @@ func PermitBucketTeardown(ctx context.Context, st *engine.State) error {
 	}
 
 	st.Runner.Dir = st.Repos.LandingZone
+	// Best-effort, per component, and that is a correction to the premise in the comment
+	// above: "every dependency each leaf declares is still live" holds on a FIRST destroy
+	// and not on a re-run — which is the recovery rackctl itself prescribes ("re-run
+	// `rackctl destroy`; it is idempotent").
+	//
+	// After a partial teardown the cluster is gone, so agent-iam's `dependency "cluster"`
+	// resolves against state that no longer exists and terragrunt fails at parse:
+	//
+	//	live/aws/../_envcommon/aws/agent-iam.hcl:28: Unknown variable; There is no
+	//	variable named "dependency".
+	//
+	// That used to abort the whole destroy BEFORE the component loop — the third place a
+	// pre-loop step could strand everything behind it. It is also moot in exactly that
+	// case: the bucket-owning components have usually already been destroyed, so there is
+	// nothing left to permit.
+	//
+	// So a permit that fails is a warning, not a verdict. The DESTROY is what has to be
+	// honest, and it is: a bucket that really cannot be emptied fails its own component
+	// with BucketNotEmpty, which is reported and counted there.
+	var refused []string
 	for _, c := range comps {
 		note(st, "force-buckets: apply %s with TF_VAR_force_destroy_buckets=true", c)
 		if err := applyWith(ctx, st, c, "TF_VAR_force_destroy_buckets=true"); err != nil {
-			return fmt.Errorf("force-buckets permitting apply of %s: %w", c, err)
+			refused = append(refused, c)
+			note(st, "force-buckets: could not permit %s (%v) — continuing. If that component "+
+				"still owns a non-empty bucket, its destroy will say so", c, err)
 		}
+	}
+	if len(refused) > 0 {
+		note(st, "force-buckets: %d component(s) could not be permitted: %v. Common and harmless "+
+			"on a re-run after a partial teardown — the leaves declare dependencies on a cluster "+
+			"that is already gone, and their buckets usually went with it", len(refused), refused)
 	}
 	return nil
 }

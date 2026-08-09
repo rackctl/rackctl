@@ -317,6 +317,13 @@ wedge there until that lands upstream.`,
 		// non-zero naming all of them. Ordering is still dependency-correct — it is the
 		// order most likely to succeed — it just is not permitted to be a stopping
 		// condition. A destroy's job is to remove as much as it can.
+		// Take back the subdomain delegation before the dns component deletes the zone it
+		// points at. A delegation that outlives its zone is a lame delegation in a zone
+		// that serves something else — the parent keeps answering NS, resolvers follow it
+		// to name servers with nothing behind them, and lookups fail slowly instead of
+		// returning NXDOMAIN. Idempotent: no record, nothing to do.
+		phases.WithdrawSubdomainDelegation(ctx, st)
+
 		comps := phases.CoreComponents(cfg)
 		for i := len(comps) - 1; i >= 0; i-- {
 			c := comps[i]

@@ -821,6 +821,10 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 
 func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
+	// Before the zone goes, take back the delegation pointing at it. Afterwards the child
+	// zone is unreadable and the record cannot be matched for deletion.
+	WithdrawSubdomainDelegation(ctx, st)
+
 	comps := substrateComponents(st.Config)
 	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply, no exceptions
 		if err := destroy(ctx, st, comps[i]); err != nil {

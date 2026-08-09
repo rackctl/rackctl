@@ -243,6 +243,71 @@ func delegateSubdomain(ctx context.Context, st *engine.State) {
 		"the wildcard certificate issues on its own from here", zone, parent, strings.Join(servers, ", "))
 }
 
+// WithdrawSubdomainDelegation removes the NS record delegateSubdomain wrote, before the
+// dns component deletes the zone it points at.
+//
+// A delegation that outlives its zone is not inert. The parent keeps answering NS for the
+// subdomain, resolvers follow it to name servers that no longer host it, and the lookup
+// fails slowly instead of returning NXDOMAIN — a lame delegation, in the zone that serves
+// the org's actual site. Observed after the first live teardown: the dns component
+// destroyed hub.nanohype.dev and its NS record sat in nanohype.dev pointing at four name
+// servers with nothing behind them.
+//
+// So the two are symmetric. Anything rackctl writes into somebody else's zone, rackctl
+// takes back out — and it runs BEFORE the component destroy, because afterwards the child
+// zone is gone and its name servers are unreadable, which is exactly the state that makes
+// the record impossible to match on.
+func WithdrawSubdomainDelegation(ctx context.Context, st *engine.State) {
+	if st.Config.DNS == nil || st.Config.DNS.HostedZone == "" {
+		return
+	}
+	zone := strings.TrimSuffix(st.Config.DNS.HostedZone, ".")
+	_, parent, found := strings.Cut(zone, ".")
+	if !found || strings.Count(parent, ".") == 0 {
+		return
+	}
+	if st.Runner.DryRun {
+		note(st, "dns: (destroy) if %s holds an NS record for %s, rackctl removes it — a "+
+			"delegation pointing at a zone this destroy is about to delete is a lame delegation "+
+			"in a zone that serves something else", parent, zone)
+		return
+	}
+
+	parentID := publicZoneID(ctx, st, parent)
+	if parentID == "" {
+		return // never delegated from here, or somebody else's zone
+	}
+
+	// Read the record back rather than recomposing it from the child zone. DELETE must
+	// match the existing RRSet exactly, and by now the child may already be gone — in
+	// which case its name servers are unreadable and a recomposed batch would not match.
+	out, err := st.Runner.Capture(ctx, "aws", "route53", "list-resource-record-sets",
+		"--hosted-zone-id", parentID,
+		"--query", fmt.Sprintf("ResourceRecordSets[?Name=='%s.' && Type=='NS'] | [0]", zone),
+		"--output", "json")
+	if err != nil || strings.TrimSpace(out) == "" || strings.TrimSpace(out) == "null" {
+		return // nothing delegated
+	}
+	var rrset map[string]any
+	if err := json.Unmarshal([]byte(out), &rrset); err != nil || rrset == nil {
+		return
+	}
+	batch, err := json.Marshal(map[string]any{
+		"Comment": "rackctl: withdraw delegation for " + zone,
+		"Changes": []any{map[string]any{"Action": "DELETE", "ResourceRecordSet": rrset}},
+	})
+	if err != nil {
+		return
+	}
+	if err := st.Runner.Run(ctx, "aws", "route53", "change-resource-record-sets",
+		"--hosted-zone-id", parentID, "--change-batch", string(batch)); err != nil {
+		note(st, "dns: could not withdraw %s's delegation from %s (%v) — remove the NS record by "+
+			"hand, or the parent keeps pointing at name servers with nothing behind them", zone, parent, err)
+		return
+	}
+	note(st, "dns: withdrew %s's delegation from %s", zone, parent)
+}
+
 // publicZoneID resolves a zone name to its id, or "" when this account has no PUBLIC
 // hosted zone by that exact name.
 //
