@@ -24,8 +24,9 @@ rackctl plan     -c rackctl.yaml          # what a provision would do (read-only
 rackctl apply    -c rackctl.yaml          # provision for real
 rackctl apply    -c rackctl.yaml --tui    # interactive progress view
 rackctl check    -c rackctl.yaml          # can this install succeed, and is a running one healthy
-rackctl destroy  -c rackctl.yaml --apply  # reverse-order teardown
-rackctl destroy  -c rackctl.yaml --apply --force-buckets  # ...also emptying non-emptyable buckets
+rackctl destroy  -c rackctl.yaml --yes    # reverse-order teardown
+rackctl destroy  -c rackctl.yaml --yes --force-buckets     # ...also emptying non-emptyable buckets
+rackctl destroy  -c rackctl.yaml --yes --force-buckets --account-scoped  # ...and the account-scoped roots
 ```
 
 See [`examples/rackctl.yaml`](examples/rackctl.yaml) for the full config surface.
