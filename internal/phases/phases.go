@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/engine"
@@ -757,6 +758,11 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 		if comp == "secrets" {
 			captureOutputs(ctx, st, "secrets")
 		}
+		// The zone exists now, so its name servers are readable — and the certificate this
+		// component just requested cannot validate until something points at them.
+		if comp == "dns" {
+			delegateSubdomain(ctx, st)
+		}
 	}
 	captureOutputs(ctx, st, "cluster-addons")
 
@@ -871,9 +877,7 @@ func (gitopsPhase) Run(ctx context.Context, st *engine.State) error {
 	// fine because they name real built-in conditions — `Established` on a CRD and
 	// `Available` on a Deployment are both written by Kubernetes itself.
 	note(st, "waiting for ArgoCD applications to converge (sync-waves 0→52)")
-	if err := st.Runner.Run(ctx, "kubectl", "-n", "argocd", "wait",
-		"--for=jsonpath={.status.health.status}=Healthy",
-		"applications", "--all", "--timeout=30m"); err != nil {
+	if err := waitCatalogConverged(ctx, st, 30*time.Minute); err != nil {
 		// The cloud is provisioned. ArgoCD is running and has generated the catalog.
 		// Something on the cluster has not settled — which is NOT a reason to destroy
 		// the cluster.

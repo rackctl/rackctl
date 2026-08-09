@@ -1,8 +1,10 @@
 package phases
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/rackctl/rackctl/internal/engine"
 )
@@ -139,4 +141,127 @@ func dnsEnv(st *engine.State, verb string) ([]string, error) {
 	}
 
 	return env, nil
+}
+
+// delegateSubdomain writes the child zone's NS records into its parent, when the parent is
+// a public hosted zone in this same account.
+//
+// The dns component mints a zone and requests a wildcard certificate for it, and ACM
+// validates by resolving a record over PUBLIC DNS. Until the parent delegates, that
+// resolution fails — the zone exists but nothing on the internet is pointed at it — and
+// the request sits in PENDING_VALIDATION until it hard-expires at 72 hours.
+//
+// rackctl used to print "NEXT, and rackctl cannot do it" and leave the operator with a
+// 72-hour clock. That is true for a zone whose parent is a registrar, and false for the
+// common case this exists for: a platform installed on a subdomain of a domain the org
+// already hosts in Route53. There the parent zone is one API call away, the delegation is
+// a single additive RRSet, and the certificate issues within minutes instead of whenever
+// somebody remembers.
+//
+// It is deliberately narrow. It writes exactly one NS RRSet for exactly the child zone,
+// into a zone that must already exist in this account; it never creates the parent, never
+// touches another record, and never runs when the parent is absent. A delegation is the
+// one edit that is safe to make on someone's behalf, because it is inert until the child
+// zone answers and the child zone is the thing this run just created.
+func delegateSubdomain(ctx context.Context, st *engine.State) {
+	if st.Config.DNS == nil || st.Config.DNS.HostedZone == "" {
+		return
+	}
+	zone := strings.TrimSuffix(st.Config.DNS.HostedZone, ".")
+
+	// The parent is the zone minus its first label. A two-label name (example.com) has no
+	// parent zone anyone can hold — its delegation lives at the registrar — so there is
+	// nothing to try.
+	_, parent, found := strings.Cut(zone, ".")
+	if !found || strings.Count(parent, ".") == 0 {
+		note(st, "dns: %s is an apex domain, so its delegation is a registrar change. Point its NS "+
+			"records at this zone's name servers; ACM cannot validate the certificate until you do, "+
+			"and the request expires after 72 hours", zone)
+		return
+	}
+
+	if st.Runner.DryRun {
+		note(st, "dns: (apply) if %s is a public hosted zone in this account, rackctl writes %s's NS "+
+			"records into it — the delegation ACM needs to validate the certificate. If it is not, "+
+			"rackctl says so and the delegation stays a registrar change", parent, zone)
+		return
+	}
+
+	childID := publicZoneID(ctx, st, zone)
+	parentID := publicZoneID(ctx, st, parent)
+	if childID == "" {
+		note(st, "dns: could not find the hosted zone for %s to read its name servers — do the "+
+			"delegation by hand", zone)
+		return
+	}
+	if parentID == "" {
+		note(st, "dns: %s is not a public hosted zone in this account, so the delegation is somebody "+
+			"else's change. Point %s's NS records at this zone's name servers; ACM cannot validate "+
+			"the certificate until that resolves publicly, and the request expires after 72 hours",
+			parent, zone)
+		return
+	}
+
+	out, err := st.Runner.Capture(ctx, "aws", "route53", "get-hosted-zone", "--id", childID,
+		"--query", "DelegationSet.NameServers", "--output", "json")
+	if err != nil {
+		note(st, "dns: could not read %s's name servers (%v) — do the delegation by hand", zone, err)
+		return
+	}
+	var servers []string
+	if err := json.Unmarshal([]byte(out), &servers); err != nil || len(servers) == 0 {
+		note(st, "dns: %s reported no name servers — do the delegation by hand", zone)
+		return
+	}
+
+	records := make([]map[string]string, 0, len(servers))
+	for _, s := range servers {
+		records = append(records, map[string]string{"Value": s})
+	}
+	batch, err := json.Marshal(map[string]any{
+		"Comment": "rackctl: delegate " + zone,
+		"Changes": []any{map[string]any{
+			// UPSERT, not CREATE: a re-run must be a no-op rather than a collision, and an
+			// existing delegation pointing at a zone this run replaced must be corrected
+			// rather than left stale.
+			"Action": "UPSERT",
+			"ResourceRecordSet": map[string]any{
+				"Name": zone + ".", "Type": "NS", "TTL": 300, "ResourceRecords": records,
+			},
+		}},
+	})
+	if err != nil {
+		note(st, "dns: could not build the delegation change for %s (%v) — do it by hand", zone, err)
+		return
+	}
+	if err := st.Runner.Run(ctx, "aws", "route53", "change-resource-record-sets",
+		"--hosted-zone-id", parentID, "--change-batch", string(batch)); err != nil {
+		note(st, "dns: writing %s's delegation into %s failed (%v) — do it by hand", zone, parent, err)
+		return
+	}
+	note(st, "dns: delegated %s from %s (%s). ACM resolves the validation record over public DNS, so "+
+		"the wildcard certificate issues on its own from here", zone, parent, strings.Join(servers, ", "))
+}
+
+// publicZoneID resolves a zone name to its id, or "" when this account has no PUBLIC
+// hosted zone by that exact name.
+//
+// The exact-name match and the private-zone exclusion are both load-bearing.
+// list-hosted-zones-by-name is a PREFIX walk, so asking for nanohype.dev also returns
+// dev.nanohype.dev and anything else sorting after it; and a private zone by the same name
+// is a split-horizon view that resolves for the VPC and for nobody on the internet, which
+// is precisely the audience ACM validates from.
+func publicZoneID(ctx context.Context, st *engine.State, name string) string {
+	out, err := st.Runner.Capture(ctx, "aws", "route53", "list-hosted-zones-by-name",
+		"--dns-name", name+".",
+		"--query", fmt.Sprintf("HostedZones[?Name=='%s.' && Config.PrivateZone==`false`].Id | [0]", name),
+		"--output", "text")
+	if err != nil {
+		return ""
+	}
+	id := strings.TrimSpace(out)
+	if id == "" || id == "None" {
+		return ""
+	}
+	return id
 }
