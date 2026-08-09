@@ -229,7 +229,7 @@ func apIndex(comps []apComponent, name string) int {
 // cost-access last: it joins the account contract (/eks-agent-platform/org/cost-pipeline/*) to
 // this cluster's operator, and republishes the account values under the cluster key.
 func TestAgentPlatformComponents_OrderingHoldsBothChains(t *testing.T) {
-	comps := agentPlatformComponents()
+	comps := allAPComponents()
 	for _, edge := range []struct{ first, then, why string }{
 		{"bedrock-account", "cost-pipeline",
 			"the account cost pipeline reads bedrock-account's invocation log group from SSM and " +
@@ -261,7 +261,7 @@ func TestAgentPlatformComponents_OrderingHoldsBothChains(t *testing.T) {
 // non-dry run then returns NoRollbackError — the phase aborts before applying anything, which is
 // exactly what shipped.
 func TestAgentPlatformComponents_MatchesTheTreeOnDisk(t *testing.T) {
-	comps := agentPlatformComponents()
+	comps := allAPComponents()
 	names := agentPlatformComponentNames(comps)
 
 	for _, want := range []string{"bedrock-account", "cost-pipeline", "cost-access"} {
@@ -350,7 +350,7 @@ func TestAgentPlatform_DisclosesTheAccountScopedApply(t *testing.T) {
 // survivor reads as an unexplained resource.
 func TestAgentPlatformTeardown_LeavesTheAccountRootsAndSaysSo(t *testing.T) {
 	st, out := apState(t)
-	noteAccountScopedTeardown(st, agentPlatformComponents(), AgentPlatformTeardown{})
+	noteAccountScopedTeardown(st, allAPComponents(), AgentPlatformTeardown{})
 	got := out.String()
 	if !strings.Contains(got, "NOT destroying") {
 		t.Fatalf("the default teardown must state that it is leaving the account roots:\n%s", got)
@@ -367,7 +367,7 @@ func TestAgentPlatformTeardown_LeavesTheAccountRootsAndSaysSo(t *testing.T) {
 // to prevent — deliberately, which is fine, and silently, which is not.
 func TestAgentPlatformTeardown_OptingInWarnsItIsAccountWide(t *testing.T) {
 	st, out := apState(t)
-	noteAccountScopedTeardown(st, agentPlatformComponents(), AgentPlatformTeardown{AccountScoped: true})
+	noteAccountScopedTeardown(st, allAPComponents(), AgentPlatformTeardown{AccountScoped: true})
 	got := out.String()
 	if !strings.Contains(got, "DESTROYING") || !strings.Contains(got, "every environment") {
 		t.Fatalf("--account-scoped must say the blast radius is the account, not this environment:\n%s", got)
@@ -486,7 +486,7 @@ exit 0
 	// which is precisely how a per-cluster cost-pipeline stayed in the list after the tree moved
 	// it to live/org.
 	fixtureSt, _ := apState(t)
-	for _, c := range agentPlatformComponents() {
+	for _, c := range allAPComponents() {
 		root := filepath.Join(dir, agentPlatformDir(fixtureSt, c))
 		if err := os.MkdirAll(root, 0o755); err != nil {
 			t.Fatal(err)
@@ -588,7 +588,7 @@ func TestDestroyAgentPlatform_DefaultNeverReachesTheAccountRoots(t *testing.T) {
 	// pinning a literal here would make it fail every time upstream adds or removes a component
 	// — which is a different fact, owned by TestAgentPlatformComponents_MatchesTheTreeOnDisk.
 	wantCluster := 0
-	for _, c := range agentPlatformComponents() {
+	for _, c := range allAPComponents() {
 		if !c.account {
 			wantCluster++
 		}
@@ -686,7 +686,7 @@ func TestDestroyAgentPlatform_ForceBucketsIsTwoActsAndCarriesTheFlag(t *testing.
 // TestAgentPlatformComponents_MatchesTheTreeOnDisk checks that certain names are present and
 // certain others absent, which lets a name nobody intended slip in between the two lists —
 // verified: adding accelerator-pools back passed the entire suite. It could not do otherwise,
-// because every fixture in this file builds its roots by walking agentPlatformComponents()
+// because every fixture in this file builds its roots by walking allAPComponents()
 // through agentPlatformDir(), so the fixture and the list can never disagree.
 //
 // A literal set does not prove the tree has these roots. What it does is make adding or removing
@@ -697,7 +697,7 @@ func TestAgentPlatformComponents_IsTheExactSet(t *testing.T) {
 		"bedrock-account", "cost-pipeline", // account, live/org
 		"bedrock", "agent-egress", "eval-runtime", "kill-switch", "cost-access", // per cluster
 	}
-	got := agentPlatformComponentNames(agentPlatformComponents())
+	got := agentPlatformComponentNames(allAPComponents())
 	if !slices.Equal(got, want) {
 		t.Fatalf("the apply order changed.\n got: %v\nwant: %v\n\n"+
 			"If upstream moved, added or deleted a component, update BOTH this literal and the "+
@@ -752,7 +752,7 @@ func TestAgentPlatformComponents_EveryRootResolvesInARealCheckout(t *testing.T) 
 
 	for _, env := range envs {
 		st.Config.Environment = env
-		for _, c := range agentPlatformComponents() {
+		for _, c := range allAPComponents() {
 			dir := agentPlatformDir(st, c)
 			if _, err := os.Stat(filepath.Join(root, dir, "terragrunt.hcl")); err != nil {
 				t.Errorf("%s/terragrunt.hcl does not exist in %s.\n\n"+
@@ -762,5 +762,50 @@ func TestAgentPlatformComponents_EveryRootResolvesInARealCheckout(t *testing.T) 
 					dir, root, c.name)
 			}
 		}
+	}
+}
+
+// allAPComponents is the full seven — every fixture in these files predates the
+// agentPlatform.costPipeline gate and asserts against the complete list, which is what an
+// omitted field still produces.
+//
+// A helper rather than a literal on purpose: a fixture carrying its own copy of the slice
+// would keep passing after a component was added to the real one, and "the tests pass
+// because they stopped looking at the thing under test" is the failure this repo's gates
+// exist to avoid.
+func allAPComponents() []apComponent { return agentPlatformComponents(&config.Config{}) }
+
+// The gate removes BOTH cost roots or neither.
+//
+// Half the pair is worse than either whole answer. cost-access exists only to read what
+// cost-pipeline publishes under /eks-agent-platform/org/cost-pipeline/* and republish it
+// per cluster, so applied alone it resolves a contract with no producer and fails on eight
+// unguarded reads; cost-pipeline alone is the mirror image, an account pipeline no cluster
+// can reach. So this asserts the pairing, not just the count.
+func TestAgentPlatformComponents_CostRootsAreGatedAsAPair(t *testing.T) {
+	off := false
+	cfg := &config.Config{}
+	cfg.AgentPlatform.CostPipeline = &off
+
+	got := agentPlatformComponentNames(agentPlatformComponents(cfg))
+	for _, banned := range []string{"cost-pipeline", "cost-access"} {
+		if slicesContainsFunc(got, func(c string) bool { return c == banned }) {
+			t.Errorf("costPipeline: false must drop %s.\ngot: %v", banned, got)
+		}
+	}
+	// The rest of the tree is untouched — turning the cost tier off is not turning the
+	// agent platform off.
+	for _, want := range []string{"bedrock-account", "bedrock", "agent-egress", "eval-runtime", "kill-switch"} {
+		if !slicesContainsFunc(got, func(c string) bool { return c == want }) {
+			t.Errorf("costPipeline: false must not drop %s.\ngot: %v", want, got)
+		}
+	}
+
+	// Default (field omitted) keeps both, in their load-bearing positions: cost-pipeline
+	// straight after bedrock-account whose log group it subscribes to, cost-access last
+	// because it is the join.
+	all := agentPlatformComponentNames(allAPComponents())
+	if len(all) != 7 || all[1] != "cost-pipeline" || all[len(all)-1] != "cost-access" {
+		t.Fatalf("an omitted costPipeline must keep the full ordered seven.\ngot: %v", all)
 	}
 }

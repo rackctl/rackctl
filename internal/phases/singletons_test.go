@@ -62,7 +62,7 @@ func TestComponents_NeverApplyAnAccountSingleton(t *testing.T) {
 						}
 
 						got := append(CoreComponents(cfg),
-							agentPlatformComponentNames(agentPlatformComponents())...)
+							agentPlatformComponentNames(allAPComponents())...)
 						for _, c := range got {
 							for _, s := range accountSingletons {
 								if c == s || (strings.HasPrefix(s, "org-") && strings.HasPrefix(c, "org-")) {
