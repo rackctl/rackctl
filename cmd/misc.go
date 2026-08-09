@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -278,6 +279,10 @@ wedge there until that lands upstream.`,
 		// O5 has landed upstream, so --force-buckets now reaches that tree too: cost-pipeline
 		// accepts force_destroy_buckets and bedrock-account derives force_destroy from its
 		// object-lock mode, which live/org pins to GOVERNANCE for this reason.
+		// Every failure this teardown hits, so the command can attempt everything and
+		// still exit non-zero naming all of them.
+		var failed []error
+
 		if cfg.AgentPlatform.Enabled() {
 			if destroyAccountScoped && !destroyForceBuckets {
 				fmt.Println(ui.Warn("--account-scoped without --force-buckets: the account buckets take " +
@@ -289,20 +294,48 @@ wedge there until that lands upstream.`,
 				AccountScoped: destroyAccountScoped,
 				ForceBuckets:  destroyForceBuckets,
 			}); err != nil {
-				return err
+				// NOT a return. See the note above the loop below — this tree holds IAM,
+				// SSM and buckets, and the components after it hold the EKS control plane,
+				// the VPC and the NAT gateway.
+				failed = append(failed, fmt.Errorf("agent-platform substrate: %w", err))
+				fmt.Println(ui.Warn("agent-platform teardown failed — continuing to the " +
+					"landing-zone components, which is where the billable resources are"))
 			}
 		}
 
+		// A destroy that stops at its first failure leaves the most expensive things
+		// standing, because the expensive things are LAST.
+		//
+		// The reverse order is cluster-bootstrap, cluster-addons, …, agent-iam, secrets,
+		// cluster, network — so anything that errors in the middle strands the EKS control
+		// plane, the VPC and the NAT gateway, and the run reports the error that caused it
+		// rather than the bill it left. That is not hypothetical: a live teardown failed on
+		// agent-iam because a managed policy still had two operator-minted roles attached,
+		// and everything behind it went untouched.
+		//
+		// So every component is attempted, failures are collected, and the command exits
+		// non-zero naming all of them. Ordering is still dependency-correct — it is the
+		// order most likely to succeed — it just is not permitted to be a stopping
+		// condition. A destroy's job is to remove as much as it can.
 		comps := phases.CoreComponents(cfg)
 		for i := len(comps) - 1; i >= 0; i-- {
 			c := comps[i]
 			fmt.Println(ui.Step("destroy " + c))
 			if err := phases.Destroy(ctx, st, c); err != nil {
-				return err
+				failed = append(failed, fmt.Errorf("%s: %w", c, err))
+				fmt.Println(ui.Warn("destroy " + c + " failed — continuing with the rest"))
 			}
 		}
 		// The cluster is gone; anything still tagged for it is an orphan by definition.
+		// Run it even after failures: an aborted destroy is exactly when orphans exist.
 		reap.OrphanedVolumes(ctx, run, os.Stdout, cfg.ClusterName(), cfg.Cloud.Region)
+
+		if len(failed) > 0 {
+			fmt.Println(ui.Fail(fmt.Sprintf("%d component(s) failed to destroy — resources may "+
+				"still be billing. Fix the cause and re-run `rackctl destroy`; it is idempotent.",
+				len(failed))))
+			return errors.Join(failed...)
+		}
 		fmt.Println(ui.OK("platform destroyed"))
 		return nil
 	},

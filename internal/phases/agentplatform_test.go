@@ -550,6 +550,12 @@ exit 0
 	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The teardown head-buckets this tree's state bucket first and skips everything when
+	// it is absent, because absent means the tree was never applied. These fixtures are
+	// all "it WAS applied", so the fake aws answers yes.
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	st, _ := apState(t)
@@ -807,5 +813,40 @@ func TestAgentPlatformComponents_CostRootsAreGatedAsAPair(t *testing.T) {
 	all := agentPlatformComponentNames(allAPComponents())
 	if len(all) != 7 || all[1] != "cost-pipeline" || all[len(all)-1] != "cost-access" {
 		t.Fatalf("an omitted costPipeline must keep the full ordered seven.\ngot: %v", all)
+	}
+}
+
+// A tree that was never applied must not wedge the teardown.
+//
+// This tree writes to its own state bucket, created by the platform phase and by nothing
+// else. `terragrunt init` against a missing bucket errors, and `rackctl destroy` used to
+// return that error before it reached the landing-zone components — so a run that failed
+// in the cluster or gitops phase left the EKS control plane, the VPC and the NAT gateway
+// billing, and reported a component tree that had never been applied. rackctl points
+// operators at `rackctl destroy` from three separate pre-platform failure branches, so
+// this is a designed outcome rather than an edge case.
+func TestDestroyAgentPlatform_SkipsWhenTheTreeWasNeverApplied(t *testing.T) {
+	dir := t.TempDir()
+	logf := filepath.Join(dir, "invocations")
+	// terragrunt records any invocation; aws fails head-bucket, i.e. no state bucket.
+	if err := os.WriteFile(filepath.Join(dir, "terragrunt"),
+		[]byte(fmt.Sprintf("#!/bin/sh\necho called >> %q\nexit 0\n", logf)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	st, _ := apState(t)
+	st.Runner = exec.New(io.Discard)
+	st.Repos = engine.Repos{AgentPlatform: dir}
+
+	if err := DestroyAgentPlatform(context.Background(), st, AgentPlatformTeardown{}); err != nil {
+		t.Fatalf("a tree that was never applied is nothing to destroy, not an error: %v", err)
+	}
+	if _, err := os.Stat(logf); err == nil {
+		t.Fatal("terragrunt was invoked against a tree with no state bucket — that init fails, " +
+			"and its error is what used to abort the whole teardown before the EKS cluster")
 	}
 }
