@@ -436,21 +436,39 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir string) error
 // is the entire point of forking the catalog rather than consuming it. A divergence is
 // therefore legitimate and must never be overwritten. It is reported, and the run
 // continues against the fork as it stands.
+// An org that PUBLISHES the upstream catalog has no fork, and both branches below are
+// wrong for it. `gh repo view nanohype/eks-gitops` succeeds — it is upstream — so the
+// sync branch is taken and asks GitHub to fast-forward main onto itself. That fails, and
+// the failure is reported as "it has diverged from nanohype/eks-gitops", which is a
+// frightening and completely false statement about the canonical catalog. The fork branch
+// is no better: GitHub refuses to fork a repo into the account that owns it.
+//
+// Neither is fatal, which is exactly why it is worth naming. The run continues against a
+// catalog that is correct, having just told the operator it is diverged — and "the tool
+// says something alarming that turns out to mean nothing" is how a real divergence
+// warning stops being read.
 func forkOrSync(ctx context.Context, st *engine.State, org string) error {
+	if engine.OwnsUpstreamCatalog(org) {
+		note(st, "%s publishes %s — there is no fork: the org's catalog IS upstream, and ArgoCD "+
+			"syncs it directly", org, engine.UpstreamCatalog)
+		return nil
+	}
+
 	fork := org + "/eks-gitops"
 
 	if _, err := st.Runner.Capture(ctx, "gh", "repo", "view", fork, "--json", "name"); err != nil || st.Runner.DryRun {
-		note(st, "forking nanohype/eks-gitops → %s (ArgoCD syncs the catalog from the org's fork, never upstream)", fork)
-		return st.Runner.Run(ctx, "gh", "repo", "fork", "nanohype/eks-gitops",
+		note(st, "forking %s → %s (ArgoCD syncs the catalog from the org's fork, never upstream)",
+			engine.UpstreamCatalog, fork)
+		return st.Runner.Run(ctx, "gh", "repo", "fork", engine.UpstreamCatalog,
 			"--org", org, "--fork-name", "eks-gitops", "--clone=false")
 	}
 
 	note(st, "%s already exists — syncing it with upstream", fork)
 	if err := st.Runner.Run(ctx, "gh", "repo", "sync", fork,
-		"--source", "nanohype/eks-gitops", "--branch", "main"); err != nil {
-		note(st, "%s: could not fast-forward — it has diverged from nanohype/eks-gitops, and this "+
+		"--source", engine.UpstreamCatalog, "--branch", "main"); err != nil {
+		note(st, "%s: could not fast-forward — it has diverged from %s, and this "+
 			"run will use the catalog as it stands on the fork. If that is not intended, reconcile "+
-			"the fork before re-running.", fork)
+			"the fork before re-running.", fork, engine.UpstreamCatalog)
 	}
 	return nil
 }

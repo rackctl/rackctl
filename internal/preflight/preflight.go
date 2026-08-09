@@ -383,15 +383,24 @@ func CheckSoftDeletedSecrets(ctx context.Context, env *Env) doctor.Result {
 func CheckCatalogFork(ctx context.Context, env *Env) doctor.Result {
 	const name = "catalog fork"
 
+	// An org that publishes the catalog has nothing to fall behind. Without this the check
+	// compares main against itself, always reads zero, and reports "nanohype/eks-gitops is
+	// current with nanohype/eks-gitops" — a green tick for a comparison that cannot fail,
+	// which is indistinguishable from a check that is working.
+	if engine.OwnsUpstreamCatalog(env.Cfg.Org.Name) {
+		return ok(name, env.Cfg.Org.Name+" publishes "+engine.UpstreamCatalog+
+			" — no fork exists to fall behind it")
+	}
+
 	fork := env.Cfg.Org.Name + "/eks-gitops"
-	const upstream = "nanohype/eks-gitops"
+	upstream := engine.UpstreamCatalog
 
 	if _, err := env.Run.Capture(ctx, "gh", "repo", "view", fork, "--json", "name"); err != nil {
 		return ok(name, fork+" does not exist yet — init will fork it")
 	}
 
 	out, err := env.Run.Capture(ctx, "gh", "api",
-		fmt.Sprintf("repos/%s/compare/%s:main...%s:main", fork, env.Cfg.Org.Name, "nanohype"),
+		fmt.Sprintf("repos/%s/compare/%s:main...%s:main", fork, env.Cfg.Org.Name, engine.UpstreamCatalogOwner()),
 		"--jq", ".ahead_by")
 	if err != nil {
 		return warn(name, "could not compare "+fork+" with "+upstream)

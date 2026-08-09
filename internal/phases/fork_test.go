@@ -144,6 +144,31 @@ exit 0
 	}
 }
 
+// An org that PUBLISHES the catalog has no fork, and must not be handed either branch.
+//
+// nanohype installs its own platform from its own catalog. `gh repo view
+// nanohype/eks-gitops` succeeds — that is upstream — so the sync branch was taken and ran
+// `gh repo sync nanohype/eks-gitops --source nanohype/eks-gitops`, asking GitHub to
+// fast-forward main onto itself. The failure was then reported as "it has diverged from
+// nanohype/eks-gitops": a false and alarming claim about the canonical catalog, printed
+// on every run, on the way to continuing correctly. A warning that is always wrong is a
+// warning nobody reads when it is finally right.
+//
+// The assertion is that gh is not invoked AT ALL, rather than that the calls succeed.
+// Reaching GitHub to establish something knowable from the config is the defect.
+func TestForkOrSync_OrgThatPublishesTheCatalogIsNeverForkedOrSynced(t *testing.T) {
+	calls := fakeGH(t, true)
+
+	if err := forkOrSync(context.Background(), newState(), "nanohype"); err != nil {
+		t.Fatalf("forkOrSync: %v", err)
+	}
+
+	if got := calls(); len(got) != 0 {
+		t.Fatalf("the org owns the upstream catalog, so there is no fork to create or sync — "+
+			"gh must not be called at all.\ncalls: %#v", got)
+	}
+}
+
 func slicesContainsFunc(s []string, f func(string) bool) bool {
 	for _, v := range s {
 		if f(v) {
