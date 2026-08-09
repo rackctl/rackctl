@@ -117,6 +117,19 @@ func CoreComponents(cfg *config.Config) []string {
 	if cfg.ControlPlane.EKSFleet {
 		comps = append(comps, "fleet-hub")
 	}
+	// portal is a Platform tenant of the platform it operates, so its Postgres, Redis and
+	// object store come from tenant-substrate like any other tenant's. Same three reasons
+	// fleet-hub is here rather than inside its phase: acquire asserts the live root before
+	// a dollar is spent, the substrate teardown destroys it in reverse, and it is applied
+	// once, early, rather than while helm is already installing.
+	//
+	// It is handed a tenants map containing portal ALONE — see portalTenantsVar. The
+	// environment's committed map is every tenant APP it carries, and provisioning four
+	// unrelated Aurora clusters on the way to standing up a console is not this command's
+	// job.
+	if cfg.ControlPlane.Portal {
+		comps = append(comps, "tenant-substrate")
+	}
 	return append(comps, "cluster-addons", "cluster-bootstrap")
 }
 
@@ -232,6 +245,16 @@ func Destroy(ctx context.Context, st *engine.State, component string) error {
 // both.
 func componentEnv(ctx context.Context, st *engine.State, component, verb string) ([]string, error) {
 	switch component {
+	case "tenant-substrate":
+		// portal only — the committed map is the GitOps concern.
+		blob, err := portalTenantsVar(st)
+		if err != nil {
+			return nil, err
+		}
+		note(st, "tenant-substrate: TF_VAR_tenants carries portal and nothing else. The leaf reads "+
+			"tenants.generated.json, which is every tenant APP this environment carries — an "+
+			"installer applying that would provision their databases too")
+		return []string{"TF_VAR_tenants=" + blob}, nil
 	case "network":
 		// Mode, create-mode levers (IPAM/TGW/egress), adopt inputs, and the sizing knobs
 		// (vpc_cidr, nat_gateways) when they differ from Default().
@@ -763,6 +786,11 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 		if comp == "dns" {
 			delegateSubdomain(ctx, st)
 		}
+		// The endpoints and the RDS master-secret ARN portal's chart needs. There is no
+		// other channel: RDS names that secret itself, so it cannot be composed.
+		if comp == "tenant-substrate" {
+			captureOutputs(ctx, st, "tenant-substrate")
+		}
 	}
 	captureOutputs(ctx, st, "cluster-addons")
 
@@ -1198,17 +1226,90 @@ func (fleet) Teardown(ctx context.Context, st *engine.State) error {
 type portal struct{ base }
 
 func (portal) Run(ctx context.Context, st *engine.State) error {
-	note(st, "deploying portal (Go API + River worker + React); needs Postgres/Redis/S3")
-	note(st, "wiring GitOps deploy keys for %s and %s", st.Config.Org.GitOps.ClustersRepo, st.Config.Org.GitOps.TenantsRepo)
-	// The portal OCI chart is not published yet; fall back to the local chart in
-	// the cloned repo when the pull fails (mirrors the operator).
-	if err := st.Runner.Run(ctx, "helm", "upgrade", "--install", "portal",
-		"oci://ghcr.io/nanohype/charts/portal"); err != nil {
-		note(st, "portal OCI chart unavailable — falling back to local ./deploy/helm/portal")
-		st.Runner.Dir = st.Repos.Portal
-		return st.Runner.Run(ctx, "helm", "upgrade", "--install", "portal", "deploy/helm/portal")
+	// The tenant namespace the operator derives from the Platform's name. portal's pods run
+	// there so its Pod Identity association binds, and so the AppProject and default-deny
+	// NetworkPolicy the operator reconciles actually cover them. Installing into `default`
+	// — which is what a helm command with no --namespace does — put the release outside
+	// every boundary its own Platform CR declares.
+	const ns = "tenants-portal"
+
+	sub, err := readPortalSubstrate(st)
+	if err != nil {
+		return &engine.NoRollbackError{Err: fmt.Errorf("portal substrate: %w", err)}
 	}
+
+	note(st, "deploying portal (Go API + River worker + React) as a Platform tenant in %s", ns)
+	note(st, "portal: database %s, credential from %s — external-secrets composes DATABASE_URL at "+
+		"refresh, so the password never lands in a values file or the helm release",
+		sub.DBHost, sub.DBSecretARN)
+
+	args := []string{
+		"upgrade", "--install", "portal", portalChartRef(st),
+		"--namespace", ns, "--create-namespace",
+		"--set", "externalSecret.enabled=true",
+		"--set", "externalSecret.relationalSecretArn=" + sub.DBSecretARN,
+		"--set", "tenantInfra.relational.host=" + sub.DBHost,
+		"--set", "config.environment=" + portalEnvironment(st),
+		"--set", "serviceAccount.name=tenant-runtime",
+	}
+	if sub.CacheHost != "" {
+		args = append(args, "--set", "tenantInfra.cache.host="+sub.CacheHost)
+		if sub.CacheSecret != "" {
+			args = append(args, "--set", "externalSecret.cacheSecretArn="+sub.CacheSecret)
+		}
+	}
+	if sub.Bucket != "" {
+		args = append(args,
+			"--set", "objectStore.bucket="+sub.Bucket,
+			"--set", "objectStore.region="+st.Config.Cloud.Region,
+			"--set", "objectStore.endpoint=s3."+st.Config.Cloud.Region+".amazonaws.com",
+			"--set", "objectStore.useSSL=true",
+		)
+	}
+	if org := st.Config.Org.Name; org != "" {
+		args = append(args, "--set", "config.allowedGitHubOrg="+org)
+	}
+	if err := st.Runner.Run(ctx, "helm", args...); err != nil {
+		return err
+	}
+	note(st, "portal: no ingress. The chart defaults to ClusterIP, and an ingress before a GitHub "+
+		"OAuth app exists would publish a console whose only login is the development one. Reach it "+
+		"with: kubectl -n %s port-forward svc/portal-web 8080:80", ns)
 	return nil
+}
+
+// portalChartRef prefers the published chart and falls back to the checkout.
+//
+// Both are real paths now: v0.1.0 is in GHCR. The fallback stays because a fork that has
+// not published its own chart still has the source, and because an unreachable registry
+// should not be the thing that stops an install.
+func portalChartRef(st *engine.State) string {
+	const published = "oci://ghcr.io/nanohype/portal/charts/portal"
+	if st.Runner.DryRun {
+		return published
+	}
+	if _, err := st.Runner.Capture(context.Background(), "helm", "show", "chart", published); err == nil {
+		return published
+	}
+	note(st, "portal: %s is unreachable — installing from the checkout at %s",
+		published, st.Repos.Portal)
+	st.Runner.Dir = st.Repos.Portal
+	return "deploy/helm/portal"
+}
+
+// portalEnvironment maps this install's environment onto the one portal validates against.
+//
+// portal refuses to start outside `development` without a GitHub OAuth app, an allowed
+// org and a webhook secret — deliberately, because a GitHub OAuth App admits every GitHub
+// account and the org check is the only boundary. rackctl has none of those to give, so a
+// development install runs development. Anything else keeps its own name and fails loudly
+// at startup until an operator supplies them, which is the correct outcome: a console
+// admitting the internet is worse than one that will not boot.
+func portalEnvironment(st *engine.State) string {
+	if st.Config.Environment == config.EnvDev {
+		return "development"
+	}
+	return string(st.Config.Environment)
 }
 
 func (portal) Teardown(ctx context.Context, st *engine.State) error {
