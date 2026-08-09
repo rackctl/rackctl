@@ -75,6 +75,8 @@ var operatorOwnedKinds = []string{
 func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 	if run.DryRun {
 		fmt.Fprintln(out, ui.Step("reap controller-owned resources (finalizers)"))
+		fmt.Fprintf(out, "    → (dry-run) kubectl patch applications --all -n argocd "+
+			"--type merge -p '{\"spec\":{\"syncPolicy\":null}}'  (stop selfHeal recreating what is reaped)\n")
 		for _, k := range operatorOwnedKinds {
 			fmt.Fprintf(out, "    → (dry-run) kubectl delete %s --all -A --wait --timeout=5m\n", k)
 		}
@@ -88,6 +90,8 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 		fmt.Fprintln(out, ui.Step("no reachable cluster — nothing to reap"))
 		return
 	}
+
+	disarmArgoCD(ctx, run, out)
 
 	for _, kind := range operatorOwnedKinds {
 		// An uninstalled CRD is not a failure: the platform may never have been
@@ -729,4 +733,43 @@ func fleetSpokes(ctx context.Context, run execer) []string {
 		return nil // no CRD installed, or no reachable cluster — either way, no spokes to strand
 	}
 	return strings.Fields(out)
+}
+
+// disarmArgoCD clears syncPolicy on every Application, so ArgoCD stops re-applying what
+// the reap is deleting.
+//
+// Every Application in the catalog carries automated.selfHeal. A Platform CR is
+// catalog-managed, so deleting it is drift — and ArgoCD corrects drift. Observed on a live
+// teardown: the reap deleted Platform/ops, its finalizer ran and removed the tenant's IAM
+// roles, and ArgoCD recreated the Platform seconds later. The operator then minted the
+// roles again, against a cluster on its way out.
+//
+// What that costs is not the CR. It is that `agent-iam` owns a managed policy those roles
+// attach to, and a managed policy cannot be deleted while any role holds it — so the
+// component fails on DeleteConflict, several minutes and several components later, naming
+// a policy rather than the race that repopulated it. The roles then outlive the cluster
+// entirely, because the only thing that removes them is a finalizer on a CR that no longer
+// has an operator to reconcile it.
+//
+// Clearing syncPolicy rather than deleting the Applications is deliberate: deleting an
+// Application with prune enabled deletes everything it manages, which on the argocd
+// Application itself means removing ArgoCD in the middle of a teardown that still needs it
+// to not fight back. This makes ArgoCD passive; the destroy removes the cluster
+// afterwards.
+//
+// Best-effort, like everything else here. No ArgoCD, or no Applications, is not an error —
+// it is a platform that never got that far.
+func disarmArgoCD(ctx context.Context, run *exec.Runner, out io.Writer) {
+	if _, err := run.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications",
+		"-o", "name", "--request-timeout=30s"); err != nil {
+		return // no ArgoCD, or no Applications — nothing to disarm
+	}
+	fmt.Fprintln(out, ui.Step("disarm ArgoCD selfHeal (it recreates what the reap deletes)"))
+	if _, err := run.Capture(ctx, "kubectl", "-n", "argocd", "patch", "applications", "--all",
+		"--type", "merge", "-p", `{"spec":{"syncPolicy":null}}`, "--request-timeout=60s"); err != nil {
+		fmt.Fprintln(out, ui.Fail(
+			"could not clear syncPolicy on the ArgoCD applications — selfHeal may recreate the "+
+				"Platform CRs this reap is about to delete, which leaves their IAM roles behind and "+
+				"fails agent-iam later on DeleteConflict"))
+	}
 }

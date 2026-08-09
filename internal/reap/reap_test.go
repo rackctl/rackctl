@@ -5,8 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/rackctl/rackctl/internal/exec"
 )
 
 // fakeIAM models the IAM API's actual constraints so a test fails against a naive
@@ -630,5 +635,75 @@ func TestOperatorRoles_DryRunEnumeratesSoItCanBeNegativeTested(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "dev-ops-tenant") {
 		t.Fatalf("the dry-run must name what it would delete.\n%s", buf.String())
+	}
+}
+
+// The reap must disarm ArgoCD before deleting anything a controller owns.
+//
+// Every catalog Application carries automated.selfHeal, and a Platform CR is
+// catalog-managed — so deleting one is drift, and ArgoCD corrects drift. Observed on a
+// live teardown: the reap deleted Platform/ops, its finalizer removed the tenant's IAM
+// roles, and ArgoCD recreated the Platform seconds later, which made the operator mint
+// the roles again. agent-iam then fails on DeleteConflict several components later,
+// naming a managed policy rather than the race that repopulated it.
+//
+// The assertion is on ORDER, not merely on presence: patching after the deletes would be
+// a no-op with a reassuring log line.
+
+// fakeKubectl puts a kubectl on PATH that records every invocation and answers the two
+// probes All() gates on: /readyz (is there a cluster) and `get crd` (is the CRD
+// installed). Everything else succeeds, because this asserts WHICH commands run and in
+// what order, not what they return.
+func fakeKubectl(t *testing.T) func() []string {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+exit 0
+`, logPath)
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake kubectl: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return func() []string {
+		b, err := os.ReadFile(logPath)
+		if err != nil {
+			return nil
+		}
+		var out []string
+		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			if l != "" {
+				out = append(out, l)
+			}
+		}
+		return out
+	}
+}
+
+func TestAll_DisarmsArgoCDBeforeReapingAnything(t *testing.T) {
+	calls := fakeKubectl(t)
+
+	All(context.Background(), exec.New(io.Discard), io.Discard)
+
+	got := calls()
+	patchAt, deleteAt := -1, -1
+	for i, c := range got {
+		if patchAt < 0 && strings.Contains(c, "patch applications") && strings.Contains(c, "syncPolicy") {
+			patchAt = i
+		}
+		if deleteAt < 0 && strings.Contains(c, "delete platforms.platform.nanohype.dev") {
+			deleteAt = i
+		}
+	}
+	if patchAt < 0 {
+		t.Fatalf("syncPolicy was never cleared — selfHeal recreates every CR this reap deletes.\ncalls: %#v", got)
+	}
+	if deleteAt < 0 {
+		t.Fatalf("the Platform reap did not run at all.\ncalls: %#v", got)
+	}
+	if patchAt > deleteAt {
+		t.Fatalf("ArgoCD was disarmed AFTER the delete (%d > %d) — by then it has already put the "+
+			"Platform back.\ncalls: %#v", patchAt, deleteAt, got)
 	}
 }
