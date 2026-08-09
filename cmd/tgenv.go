@@ -115,5 +115,17 @@ func tgEnv(cfg *config.Config) []string {
 	if u := cfg.Org.GitOps.GitURL(); u != "" {
 		env = append(env, "TF_VAR_gitops_repo_url="+u)
 	}
+	// The catalog pin's second half, and the half that makes it real.
+	//
+	// versions.eksGitops decides which commit rackctl reads LOCALLY. On its own that
+	// changes nothing about the cluster: ArgoCD clones the catalog itself. This is what
+	// carries the pin across — cluster-bootstrap takes gitops_repo_branch, sets
+	// app-of-apps' targetRevision from it, and stamps it on the ArgoCD cluster Secret as
+	// gitops/repo-branch, which every ApplicationSet now templates its own targetRevision
+	// from. Without this line a pinned install builds from a tag and then syncs a fleet
+	// from main.
+	if rev := cfg.Versions.EKSGitops; rev != "" {
+		env = append(env, "TF_VAR_gitops_repo_branch="+rev)
+	}
 	return env
 }

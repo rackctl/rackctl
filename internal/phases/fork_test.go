@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
 )
@@ -58,7 +59,10 @@ exit 0
 
 func newState() *engine.State {
 	r := exec.New(io.Discard)
-	return &engine.State{Runner: r}
+	// A real State always carries a Config — forkOrSync reads versions.eksGitops to
+	// decide whether the catalog is pinned, and a nil Config here would only ever
+	// mean the fixture is less than the thing it stands in for.
+	return &engine.State{Runner: r, Config: &config.Config{}}
 }
 
 // An existing fork must be SYNCED, not merely reused.
@@ -176,4 +180,23 @@ func slicesContainsFunc(s []string, f func(string) bool) bool {
 		}
 	}
 	return false
+}
+
+// A pinned catalog must not be fast-forwarded.
+//
+// `gh repo sync` moves the fork's main to upstream's. The local checkout is then rewound
+// to the pin, so the fork ArgoCD reads and the tree rackctl reads would be different code
+// — exactly the split the pin exists to prevent.
+func TestForkOrSync_APinnedCatalogIsNotSynced(t *testing.T) {
+	calls := fakeGH(t, true)
+
+	st := newState()
+	st.Config.Versions.EKSGitops = "v1.0.0"
+
+	if err := forkOrSync(context.Background(), st, "acme"); err != nil {
+		t.Fatalf("forkOrSync: %v", err)
+	}
+	if got := calls(); len(got) != 0 {
+		t.Fatalf("a pinned catalog must not be forked or synced — gh must not be called.\ncalls: %#v", got)
+	}
 }

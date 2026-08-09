@@ -75,6 +75,37 @@ type Config struct {
 	AgentPlatform AgentPlatform `json:"agentPlatform"`
 	ControlPlane  ControlPlane  `json:"controlPlane"`
 	FirstTenant   *FirstTenant  `json:"firstTenant,omitempty"`
+	Versions      Versions      `json:"versions,omitempty"`
+}
+
+// Versions pins the platform repos this install is built from.
+//
+// Every field is a git ref — a tag, a branch, or a commit — and an EMPTY field means
+// the repo's default branch, which is what rackctl has always done. So an existing
+// config keeps working and pinning is opt-in per repo.
+//
+// WHY THIS EXISTS. rackctl cloned each repo and `git pull --ff-only`'d it, so every run
+// built from whatever was on main at the moment it ran. Two installs a week apart were
+// two different platforms, and there was no way to say "build the one that worked" —
+// tagging the repos would have produced tags nothing could consume.
+//
+// The catalog pin is the one with a second half. eksGitops does not only decide which
+// commit rackctl reads locally; it rides TF_VAR_gitops_repo_branch into cluster-bootstrap,
+// which stamps gitops/repo-branch on the ArgoCD cluster Secret, which every
+// ApplicationSet now templates its targetRevision from. Without that the cluster would
+// sync main no matter what the local checkout said, and the pin would be a comment.
+type Versions struct {
+	LandingZone      string `json:"landingZone,omitempty"`
+	EKSGitops        string `json:"eksGitops,omitempty"`
+	EKSAgentPlatform string `json:"eksAgentPlatform,omitempty"`
+	Portal           string `json:"portal,omitempty"`
+	EKSFleet         string `json:"eksFleet,omitempty"`
+}
+
+// Any reports whether anything is pinned at all.
+func (v Versions) Any() bool {
+	return v.LandingZone != "" || v.EKSGitops != "" || v.EKSAgentPlatform != "" ||
+		v.Portal != "" || v.EKSFleet != ""
 }
 
 type Org struct {

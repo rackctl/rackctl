@@ -201,3 +201,25 @@ firstTenant:                      # optional smoke test (phase 9). Vends this te
   persona: generic
   tenant: example
   monthlyBudgetUsd: 100
+
+# versions pins the platform repos this install is built from. Omit the block, or any
+# field in it, to track that repo's default branch — which is what rackctl does without
+# it, so an existing config keeps working and pinning is opt-in per repo.
+#
+# A pinned ref is CHECKED OUT and never fast-forwarded, and an unknown ref STOPS the run
+# rather than falling back to the default branch: a pin that silently tracks HEAD builds
+# a platform from HEAD while the config, the logs and the operator all say otherwise.
+#
+# eksGitops is the one with a second half. It does not only decide which commit rackctl
+# reads locally — ArgoCD clones the catalog itself — so it also rides
+# TF_VAR_gitops_repo_branch into cluster-bootstrap, which stamps gitops/repo-branch on the
+# ArgoCD cluster Secret, which every ApplicationSet templates its targetRevision from.
+# Without that a pinned install builds from a tag and then syncs a fleet from main. The
+# fork is deliberately NOT synced while pinned, for the same reason.
+#
+# versions:
+#   landingZone: v1.0.0
+#   eksGitops: v1.0.0
+#   eksAgentPlatform: v1.0.0
+#   portal: v0.1.0
+#   eksFleet: v1.0.0
