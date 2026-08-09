@@ -332,6 +332,32 @@ func TestCheckCatalogFork_OKWhenForkDoesNotExistYet(t *testing.T) {
 	}
 }
 
+// An org that publishes the catalog has nothing to fall behind, and the check must say
+// so rather than compare main against itself.
+//
+// The self-comparison always returns ahead_by 0, so the check reported OK — but as
+// "nanohype/eks-gitops is current with nanohype/eks-gitops", a green tick for a
+// comparison whose answer is fixed. On the terminal that is indistinguishable from the
+// check actually working, which is the failure mode this file exists to stamp out.
+//
+// The fake `gh` exits non-zero for everything: without the short-circuit the `repo view`
+// fails and the check takes the "does not exist yet — init will fork it" branch, which is
+// also OK. So the assertion is on the DETAIL, not merely on the status.
+func TestCheckCatalogFork_OrgThatPublishesTheCatalogHasNoFork(t *testing.T) {
+	fakeBin(t, "gh", `exit 1`)
+
+	env := testEnv()
+	env.Cfg.Org.Name = "nanohype"
+
+	r := CheckCatalogFork(context.Background(), env)
+	if r.Status != doctor.OK {
+		t.Fatalf("the org's catalog IS upstream; there is nothing to be behind: %s — %s", r.Status, r.Detail)
+	}
+	if !strings.Contains(r.Detail, "no fork exists to fall behind") {
+		t.Errorf("the detail must say why the comparison is skipped, not imply one happened:\n%s", r.Detail)
+	}
+}
+
 // ─────────────────────────── identity ───────────────────────────
 
 // The profile is ambient; the account id is declared. Nothing compared them, so a
