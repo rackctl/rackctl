@@ -180,15 +180,25 @@ agentPlatform:
 controlPlane:
   eksFleet: false                 # opt-in: Crossplane cluster control plane. Requires org.gitops.clustersRepo
                                   # and fleetHubRoleArn below.
-  # fleetHubRoleArn: arn:aws:iam::111111111111:role/eks-fleet-crossplane
-                                  # the IAM role provider-opentofu assumes to vend spokes. REQUIRED with
-                                  # eksFleet: eks-fleet ships config/bootstrap/providers.yaml with a literal
-                                  # <FLEET_ACCOUNT_ID> placeholder and its stand-up doc substitutes the real
-                                  # ARN at apply time, so applying it unrendered installs a provider that
-                                  # never receives credentials — while still reporting Healthy.
-                                  # Get it from landing-zone's fleet-hub component, which rackctl does NOT
-                                  # apply (it lives under live/aws/fleet/…, a different account):
-                                  #   terragrunt output -raw hub_role_arn
+  # fleetHubRoleArn: arn:aws:iam::222222222222:role/eks-fleet-crossplane
+                                  # the IAM role provider-opentofu assumes to vend spokes. OPTIONAL, and
+                                  # normally left unset: with eksFleet on, rackctl applies landing-zone's
+                                  # fleet-hub component into THIS account, and that component pins the role
+                                  # name (eks-fleet-crossplane, root IAM path) so eks-fleet's committed
+                                  # bootstrap annotation can match it. The ARN is therefore a function of
+                                  # cloud.accountId, and pasting it can only be correct or a typo.
+                                  #
+                                  # Set it to vend through a hub in a DIFFERENT account — the multi-account
+                                  # shape. Nothing then creates or destroys that role on this side.
+                                  #
+                                  # It matters either way because eks-fleet ships
+                                  # config/bootstrap/providers.yaml with a literal <FLEET_ACCOUNT_ID>
+                                  # placeholder; applied unrendered it installs a provider that never
+                                  # receives credentials, while still reporting Healthy.
+                                  #
+                                  # TEARDOWN: fleet-hub's state bucket and CMK carry prevent_destroy — they
+                                  # hold every vended cluster's tofu state. `rackctl destroy` leaves them
+                                  # standing on purpose; emptying the account is a deliberate later act.
   portal: false                   # opt-in: day-2 operator UI
 
 firstTenant:                      # optional smoke test (phase 9). Vends this tenant from

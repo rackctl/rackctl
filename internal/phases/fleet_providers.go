@@ -31,12 +31,13 @@ var fleetRoleARNLine = regexp.MustCompile(`(?m)^(\s*)eks\.amazonaws\.com/role-ar
 // placeholder — which is what rackctl used to do immediately after printing a note telling
 // them to make sure that annotation was right.
 //
-// rackctl supplies fragile per-run inputs; this is one. The ARN comes from config because
-// fleet-hub lives under live/aws/fleet/…, which rackctl does not apply and cannot capture
-// an output from.
+// rackctl supplies fragile per-run inputs; this is one. The ARN is normally COMPUTED
+// rather than configured: the substrate phase applies landing-zone's fleet-hub into this
+// account, and that component pins the role name so eks-fleet's committed annotation can
+// match it. controlPlane.fleetHubRoleArn overrides, for a hub in another account.
 func renderFleetProviders(st *engine.State) (string, error) {
 	const src = "config/bootstrap/providers.yaml"
-	arn := st.Config.ControlPlane.FleetHubRoleARN
+	arn := st.Config.FleetHubRoleARN()
 
 	note(st, "rendering %s with eks.amazonaws.com/role-arn=%s — the file ships a literal "+
 		"<FLEET_ACCOUNT_ID> placeholder, and applying it unrendered leaves provider-opentofu "+
