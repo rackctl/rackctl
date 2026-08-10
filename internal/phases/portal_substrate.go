@@ -292,6 +292,21 @@ func applyPortalPlatform(ctx context.Context, st *engine.State, ns string) error
 			"no identity to run as", cr, err)
 	}
 
+	// The CR is namespaced, and nothing on a fresh cluster has created the namespace it
+	// names. portal's Platform and BudgetPolicy live in their TENANT's control-plane
+	// namespace — tenants-platform-ops — which is the convention every tenant app in the org
+	// follows. For those apps ArgoCD creates it, because their Application carries
+	// CreateNamespace=true. portal is installed by this tool rather than by the catalog, so
+	// nothing does it here, and `kubectl apply` into a namespace that does not exist fails
+	// outright.
+	//
+	// Not the same namespace the operator derives from the Platform's NAME — that is
+	// tenants-portal, where the workload lands, and the operator creates it. Two namespaces,
+	// easy to conflate, and only this one is rackctl's to create.
+	if err := ensureNamespace(ctx, st, portalControlPlaneNS); err != nil {
+		return err
+	}
+
 	note(st, "portal: applying %s — the Platform the operator derives %s and its tenant-runtime "+
 		"ServiceAccount from", cr, ns)
 	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", cr); err != nil {
@@ -413,4 +428,27 @@ func portalNotReady(ctx context.Context, st *engine.State, ns string, cause erro
 		detail += "\nwarnings:\n" + w
 	}
 	return fmt.Errorf("%w\npods in %s:\n%s", cause, ns, detail)
+}
+
+// ensureNamespace creates a namespace when it is absent, and is a no-op when it is not.
+//
+// Read-then-create rather than an unconditional create whose error is ignored: swallowing
+// the error from a create would also swallow a permissions failure or an unreachable API
+// server, and this runs immediately before an apply that would then fail with a message
+// about the manifest rather than about the cluster.
+func ensureNamespace(ctx context.Context, st *engine.State, ns string) error {
+	if st.Runner.DryRun {
+		note(st, "portal: (apply) ensures namespace %s exists — nothing creates it on a fresh "+
+			"cluster, and the Platform CR is namespaced", ns)
+		return nil
+	}
+	if _, err := st.Runner.Capture(ctx, "kubectl", "get", "namespace", ns, "-o", "name",
+		"--request-timeout=30s"); err == nil {
+		return nil
+	}
+	note(st, "portal: creating namespace %s for portal's control-plane CRs", ns)
+	if err := st.Runner.Run(ctx, "kubectl", "create", "namespace", ns); err != nil {
+		return fmt.Errorf("creating %s, the namespace portal's Platform and BudgetPolicy live in: %w", ns, err)
+	}
+	return nil
 }
