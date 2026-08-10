@@ -153,3 +153,49 @@ func TestWaitPortalReady_ReportsWhyThePodsAreNotRunning(t *testing.T) {
 		t.Errorf("the failure must carry the pod-level reason, not just the rollout timeout:\n%v", err)
 	}
 }
+
+// The namespace portal's Platform and BudgetPolicy live in is not created by anything on a
+// fresh cluster. Every other tenant app gets theirs from ArgoCD (CreateNamespace=true on
+// its Application); portal is installed by this tool, so nothing does — and `kubectl apply`
+// into a namespace that does not exist fails outright.
+func TestEnsureNamespace_CreatesItWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	logf := filepath.Join(dir, "invocations")
+	// `get namespace` fails (absent); everything else succeeds.
+	script := "#!/bin/sh\necho \"$@\" >> " + logf + "\n" +
+		"case \"$*\" in *'get namespace'*) exit 1 ;; esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	st := &engine.State{Config: config.Default(), Runner: exec.New(io.Discard)}
+
+	if err := ensureNamespace(context.Background(), st, portalControlPlaneNS); err != nil {
+		t.Fatalf("ensureNamespace: %v", err)
+	}
+	b, _ := os.ReadFile(logf)
+	if !strings.Contains(string(b), "create namespace "+portalControlPlaneNS) {
+		t.Fatalf("an absent namespace must be created:\n%s", b)
+	}
+}
+
+// And it must not fight a namespace that already exists — the common case once a cluster
+// has been installed before.
+func TestEnsureNamespace_NoOpWhenPresent(t *testing.T) {
+	dir := t.TempDir()
+	logf := filepath.Join(dir, "invocations")
+	script := "#!/bin/sh\necho \"$@\" >> " + logf + "\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	st := &engine.State{Config: config.Default(), Runner: exec.New(io.Discard)}
+
+	if err := ensureNamespace(context.Background(), st, portalControlPlaneNS); err != nil {
+		t.Fatalf("ensureNamespace: %v", err)
+	}
+	b, _ := os.ReadFile(logf)
+	if strings.Contains(string(b), "create namespace") {
+		t.Fatalf("an existing namespace must not be recreated:\n%s", b)
+	}
+}
