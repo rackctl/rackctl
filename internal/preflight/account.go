@@ -339,7 +339,19 @@ func CheckHostedZone(ctx context.Context, env *Env) doctor.Result {
 		return warn(name, "could not list hosted zones")
 	}
 
-	var existing []string
+	// The zones this run's own dns state already tracks. A zone terraform owns is not a
+	// collision with anything — re-applying it is a no-op, and the alternative reading makes
+	// `rackctl apply` refuse to run a second time against a platform it built itself.
+	//
+	// That is not a hypothetical cost. Resuming an install after any later phase fails is
+	// exactly when this check runs against a zone the earlier phases created, and refusing
+	// there leaves the operator with a provisioned cluster and no supported way forward.
+	// CheckStaleState already draws this distinction for every other component ("state exists
+	// and the cluster exists" is a re-apply, not a fault); this is the same rule for the one
+	// resource whose duplicate is invisible to AWS.
+	owned := ownedZoneIDs(ctx, env)
+
+	var existing, foreign []string
 	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 2 && f[0] == want {
@@ -347,19 +359,78 @@ func CheckHostedZone(ctx context.Context, env *Env) doctor.Result {
 			if len(f) >= 3 && strings.EqualFold(f[2], "true") {
 				kind = "private"
 			}
-			existing = append(existing, fmt.Sprintf("%s (%s)", f[1], kind))
+			entry := fmt.Sprintf("%s (%s)", f[1], kind)
+			existing = append(existing, entry)
+			// Route53 reports the id as /hostedzone/ZXXXX; state records the bare id.
+			if !owned[strings.TrimPrefix(f[1], "/hostedzone/")] {
+				foreign = append(foreign, entry)
+			}
 		}
 	}
-	if len(existing) == 0 {
+	switch {
+	case len(existing) == 0:
 		return ok(name, want+" has no zone in this account — dns will mint it")
+	case len(foreign) == 0:
+		return ok(name, fmt.Sprintf(
+			"%s is the zone this install's dns state already tracks (%s) — a re-apply reconciles it "+
+				"rather than minting a second one", want, strings.Join(existing, ", ")))
 	}
 	return fail(name, fmt.Sprintf(
-		"%s already has %d hosted zone(s) in this account — %s. The dns component runs in create "+
-			"mode, so it would mint ANOTHER one; AWS allows that, and the registrar's NS delegation "+
-			"points at only one. external-dns would then publish into a zone nothing resolves, and a "+
-			"later `rackctl destroy` would delete a zone that may be the live one. If this domain is "+
-			"already delegated, dns.hostedZone is not the right way to reach it.",
-		want, len(existing), strings.Join(existing, ", ")))
+		"%s already has %d hosted zone(s) in this account that this install does not own — %s. The "+
+			"dns component runs in create mode, so it would mint ANOTHER one; AWS allows that, and "+
+			"the registrar's NS delegation points at only one. external-dns would then publish into "+
+			"a zone nothing resolves, and a later `rackctl destroy` would delete a zone that may be "+
+			"the live one. If this domain is already delegated, dns.hostedZone is not the right way "+
+			"to reach it.",
+		want, len(foreign), strings.Join(foreign, ", ")))
+}
+
+// ownedZoneIDs returns the Route53 zone ids recorded in this install's dns state.
+//
+// Read from the state object in S3 rather than through terragrunt: this runs before any
+// component is initialised, and `terragrunt state list` needs a backend reinit it has no
+// business performing during a read-only preflight.
+//
+// An unreadable or absent state yields an empty set, which is the conservative answer — the
+// check then treats every existing zone as foreign and fails, which is the behaviour that
+// was there before. Being unable to prove ownership must never read as ownership.
+func ownedZoneIDs(ctx context.Context, env *Env) map[string]bool {
+	cfg := env.Cfg
+	envName := string(cfg.Environment)
+	key := fmt.Sprintf("%s/aws/workload-%s/%s/%s/dns/terraform.tfstate",
+		envName, envName, cfg.Cloud.Region, envName)
+	bucket := fmt.Sprintf("%s-%s-tfstate", cfg.Cloud.AccountID, cfg.Cloud.Region)
+
+	raw, err := env.Run.Capture(ctx, "aws", "s3", "cp",
+		"s3://"+bucket+"/"+key, "-", "--region", cfg.Cloud.Region)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var st struct {
+		Resources []struct {
+			Type      string `json:"type"`
+			Instances []struct {
+				Attributes struct {
+					ZoneID string `json:"zone_id"`
+				} `json:"attributes"`
+			} `json:"instances"`
+		} `json:"resources"`
+	}
+	if json.Unmarshal([]byte(raw), &st) != nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, r := range st.Resources {
+		if r.Type != "aws_route53_zone" {
+			continue
+		}
+		for _, i := range r.Instances {
+			if id := i.Attributes.ZoneID; id != "" {
+				out[id] = true
+			}
+		}
+	}
+	return out
 }
 
 // ─────────────────────────── bedrock's account singleton ───────────────────────────
