@@ -327,3 +327,52 @@ func TestCostAllocation_NothingActiveReportsBothHalves(t *testing.T) {
 		}
 	}
 }
+
+// A zone this install's own dns state already tracks is not a collision. Re-applying it is a
+// no-op, and reading it as a fault makes `rackctl apply` refuse to run a second time against
+// a platform it built itself — which is exactly the situation after any later phase fails and
+// the operator wants to resume.
+func TestHostedZone_AZoneOurStateOwnsIsARepply(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "route53 list-hosted-zones") printf 'hub.nanohype.dev.\t/hostedzone/Z999\tFalse\n' ;;
+  "s3 cp") echo '{"resources":[{"type":"aws_route53_zone","instances":[{"attributes":{"zone_id":"Z999"}}]}]}' ;;
+  *) exit 1 ;;
+esac`)
+	env := testEnv()
+	env.Cfg.DNS = &config.DNS{HostedZone: "hub.nanohype.dev"}
+
+	r := CheckHostedZone(context.Background(), env)
+	if r.Status != doctor.OK {
+		t.Fatalf("a zone in our own dns state is a re-apply, not a second zone: %s — %s", r.Status, r.Detail)
+	}
+}
+
+// And a zone we do NOT own still refuses, which is the whole point of the check. The state
+// read must narrow the failure, never remove it.
+func TestHostedZone_AZoneWeDoNotOwnStillRefuses(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "route53 list-hosted-zones") printf 'hub.nanohype.dev.\t/hostedzone/ZSOMEONEELSE\tFalse\n' ;;
+  "s3 cp") echo '{"resources":[{"type":"aws_route53_zone","instances":[{"attributes":{"zone_id":"Z999"}}]}]}' ;;
+  *) exit 1 ;;
+esac`)
+	env := testEnv()
+	env.Cfg.DNS = &config.DNS{HostedZone: "hub.nanohype.dev"}
+
+	mustFail(t, CheckHostedZone(context.Background(), env), "create mode")
+}
+
+// Unreadable state must not read as ownership. Failing to prove we own a zone is not proof
+// that we do, and the conservative answer is the pre-existing refusal.
+func TestHostedZone_UnreadableStateDoesNotGrantOwnership(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "route53 list-hosted-zones") printf 'hub.nanohype.dev.\t/hostedzone/Z999\tFalse\n' ;;
+  *) exit 1 ;;
+esac`)
+	env := testEnv()
+	env.Cfg.DNS = &config.DNS{HostedZone: "hub.nanohype.dev"}
+
+	mustFail(t, CheckHostedZone(context.Background(), env), "create mode")
+}
