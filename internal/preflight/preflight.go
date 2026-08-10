@@ -474,43 +474,84 @@ func CheckGitHubToken(ctx context.Context, env *Env) doctor.Result {
 //
 // Same bug as the fork, one layer down: "present" is not "current". A stale landing-zone
 // checkout provisions with yesterday's terraform and reports success.
+//
+// It covers every repo THIS install will clone, resolved from the same config the phases
+// read, rather than a hand-kept list. A partial list is the worse failure here: the check
+// still prints a tick, so "checkouts are current" reads as a statement about the install
+// when it was only ever a statement about three of five repos. Portal and eks-fleet are
+// conditional, so they are named only when enabled — a warning about a repo the run will
+// not touch is noise that teaches an operator to skim the line.
 func CheckVendFreshness(ctx context.Context, env *Env) doctor.Result {
 	const name = "local vend"
 
 	repos := engine.RepoPaths(env.Cfg.Org.Name)
-	dirs := map[string]string{
-		"landing-zone":       repos.LandingZone,
-		"eks-gitops":         repos.EKSGitops,
-		"eks-agent-platform": repos.AgentPlatform,
+	dirs := []struct {
+		repo string
+		dir  string
+	}{
+		{"landing-zone", repos.LandingZone},
+		{"eks-gitops", repos.EKSGitops},
+		{"eks-agent-platform", repos.AgentPlatform},
+	}
+	if env.Cfg.ControlPlane.Portal {
+		dirs = append(dirs, struct{ repo, dir string }{"portal", repos.Portal})
+	}
+	if env.Cfg.ControlPlane.EKSFleet {
+		dirs = append(dirs, struct{ repo, dir string }{"eks-fleet", repos.EKSFleet})
 	}
 
-	var behind []string
+	var behind, diverged []string
 	prev := env.Run.Dir
 	defer func() { env.Run.Dir = prev }()
 
-	for repo, dir := range dirs {
-		env.Run.Dir = dir
+	for _, d := range dirs {
+		env.Run.Dir = d.dir
 		if _, err := env.Run.Capture(ctx, "git", "rev-parse", "--git-dir"); err != nil {
 			continue // not cloned yet — init will clone it
 		}
 		if _, err := env.Run.Capture(ctx, "git", "fetch", "--quiet", "origin"); err != nil {
 			continue // offline; not preflight's business to fail on
 		}
-		out, err := env.Run.Capture(ctx, "git", "rev-list", "--count", "HEAD..@{upstream}")
+		// Both sides in one call. Counting only HEAD..upstream measures lag and is blind
+		// to the case that actually matters: a checkout carrying commits the remote does
+		// not have. That one cannot fast-forward, so init leaves it exactly as it is and
+		// the install provisions from code no tag can ever name.
+		out, err := env.Run.Capture(ctx, "git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
 		if err != nil {
 			continue
 		}
-		if n, _ := strconv.Atoi(strings.TrimSpace(out)); n > 0 {
-			behind = append(behind, fmt.Sprintf("%s (%d)", repo, n))
+		fields := strings.Fields(strings.TrimSpace(out))
+		if len(fields) != 2 {
+			continue
+		}
+		ahead, _ := strconv.Atoi(fields[0])
+		lag, _ := strconv.Atoi(fields[1])
+		switch {
+		case ahead > 0:
+			diverged = append(diverged, fmt.Sprintf("%s (+%d/-%d)", d.repo, ahead, lag))
+		case lag > 0:
+			behind = append(behind, fmt.Sprintf("%s (%d)", d.repo, lag))
 		}
 	}
 
-	if len(behind) == 0 {
-		return ok(name, "checkouts are current")
+	switch {
+	case len(diverged) > 0:
+		return warn(name, fmt.Sprintf(
+			"%s carry local commits their remote does not have — init cannot fast-forward these, so "+
+				"the install provisions from whatever is on disk. Nothing published names that state, "+
+				"which means the run is not reproducible and cannot be tagged.%s",
+			strings.Join(diverged, ", "),
+			func() string {
+				if len(behind) == 0 {
+					return ""
+				}
+				return " Also behind: " + strings.Join(behind, ", ") + "."
+			}()))
+	case len(behind) > 0:
+		return warn(name, fmt.Sprintf(
+			"%s behind their remote — init fast-forwards them", strings.Join(behind, ", ")))
 	}
-	return warn(name, fmt.Sprintf(
-		"%s behind their remote — init fast-forwards them, but a divergence would be used as-is",
-		strings.Join(behind, ", ")))
+	return ok(name, "checkouts are current")
 }
 
 // ─────────────────────────── cost pipeline prerequisite ───────────────────────────

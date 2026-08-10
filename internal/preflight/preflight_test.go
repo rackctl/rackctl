@@ -430,6 +430,78 @@ func TestCheckCostPipelinePrerequisite_UnreadableIsNotHealthy(t *testing.T) {
 	}
 }
 
+// ─────────────────────────── local vend ───────────────────────────
+
+// vendEnv points RepoPaths at a temp HOME and creates the five clone directories, so the
+// check's "is it cloned?" probe finds them. The fake git answers rev-list per repo,
+// keyed on the working directory the Runner sets — which is the only thing that
+// distinguishes one repo from another inside the loop.
+func vendEnv(t *testing.T, revList string) *Env {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, r := range []string{"landing-zone", "eks-gitops", "eks-agent-platform", "portal", "eks-fleet"} {
+		if err := os.MkdirAll(filepath.Join(home, ".rackctl", "acme", r), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", r, err)
+		}
+	}
+	fakeBin(t, "git", `
+case "$1 $2" in
+  "rev-parse --git-dir") echo .git; exit 0 ;;
+  "fetch --quiet")       exit 0 ;;
+esac
+repo=$(basename "$PWD")
+`+revList)
+	return testEnv()
+}
+
+// The gap this closes: the repo list was hand-kept and held three names, so an install
+// with portal enabled fetched portal, applied portal, and reported "checkouts are
+// current" — a green tick that was never a statement about portal at all.
+func TestCheckVendFreshness_CoversPortalWhenEnabled(t *testing.T) {
+	env := vendEnv(t, `case "$repo" in portal) printf '0\t2\n' ;; *) printf '0\t0\n' ;; esac`)
+	env.Cfg.ControlPlane.Portal = true
+
+	r := CheckVendFreshness(context.Background(), env)
+	if r.Status != doctor.Warn {
+		t.Fatalf("a stale portal checkout must be reported: %s — %s", r.Status, r.Detail)
+	}
+	if !strings.Contains(r.Detail, "portal") {
+		t.Errorf("the detail must name portal, or the operator cannot act on it:\n%s", r.Detail)
+	}
+}
+
+// The other half of scoping it to the config: warning about a repo this install will not
+// clone teaches the operator that the line is noise, which is how a real warning gets
+// skimmed past later.
+func TestCheckVendFreshness_SilentOnDisabledRepos(t *testing.T) {
+	env := vendEnv(t, `case "$repo" in portal|eks-fleet) printf '0\t2\n' ;; *) printf '0\t0\n' ;; esac`)
+	env.Cfg.ControlPlane.Portal = false
+	env.Cfg.ControlPlane.EKSFleet = false
+
+	if r := CheckVendFreshness(context.Background(), env); r.Status != doctor.OK {
+		t.Fatalf("repos this install never touches must not warn: %s — %s", r.Status, r.Detail)
+	}
+}
+
+// Counting only HEAD..upstream measures lag and is blind to the case that actually
+// breaks reproducibility: a checkout carrying commits the remote does not have. It cannot
+// fast-forward, so init leaves it alone and the install provisions from code no tag names.
+func TestCheckVendFreshness_ReportsDivergenceNotLag(t *testing.T) {
+	env := vendEnv(t, `case "$repo" in landing-zone) printf '3\t1\n' ;; *) printf '0\t0\n' ;; esac`)
+
+	r := CheckVendFreshness(context.Background(), env)
+	if r.Status != doctor.Warn {
+		t.Fatalf("a diverged checkout must be reported: %s — %s", r.Status, r.Detail)
+	}
+	if !strings.Contains(r.Detail, "landing-zone (+3/-1)") {
+		t.Errorf("both sides of the divergence must be shown:\n%s", r.Detail)
+	}
+	if !strings.Contains(r.Detail, "cannot fast-forward") {
+		t.Errorf("divergence must not read like ordinary lag — init cannot fix it:\n%s", r.Detail)
+	}
+}
+
 // ─────────────────────────── identity ───────────────────────────
 
 // The profile is ambient; the account id is declared. Nothing compared them, so a
