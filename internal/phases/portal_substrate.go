@@ -344,3 +344,73 @@ func waitTenantServiceAccount(ctx context.Context, st *engine.State, ns, sa stri
 // namespace of the tenant that owns them, not the workload namespace the operator derives
 // from the Platform's name. platform.yaml pins both, and the two are easy to confuse.
 const portalControlPlaneNS = "tenants-platform-ops"
+
+// waitPortalReady blocks until portal's Deployments are actually serving.
+//
+// `helm upgrade --install` returns as soon as the objects are accepted by the API server.
+// It says nothing about whether a single pod ever ran, which on this phase is the whole
+// question: a Deployment naming a ServiceAccount that does not exist is admitted happily
+// and then never schedules, and an image that cannot be pulled looks identical from helm's
+// side. Reporting the phase green there is the failure this install keeps producing.
+//
+// The set is DISCOVERED and then asserted non-empty, rather than waited on with a label
+// selector. `kubectl wait -l <selector>` matching nothing exits 0 — the same defect that
+// made the catalog-convergence gate vacuous on every install it ever ran. A release that
+// rendered no Deployments at all is a failure, not a fast success.
+func waitPortalReady(ctx context.Context, st *engine.State, ns string, timeout time.Duration) error {
+	out, err := st.Runner.Capture(ctx, "kubectl", "-n", ns, "get", "deploy",
+		"-l", "app.kubernetes.io/instance=portal", "-o", "name", "--request-timeout=30s")
+	if err != nil {
+		return fmt.Errorf("listing portal's deployments in %s: %w", ns, err)
+	}
+	var deploys []string
+	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			deploys = append(deploys, l)
+		}
+	}
+	if len(deploys) == 0 {
+		return fmt.Errorf("helm reported the release installed and %s holds no portal Deployment — "+
+			"nothing was rendered, so there is nothing to become ready and no pod will ever run", ns)
+	}
+
+	note(st, "portal: waiting for %s to become available", strings.Join(deploys, " "))
+	deadline := time.Now().Add(timeout)
+	for _, d := range deploys {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return portalNotReady(ctx, st, ns, fmt.Errorf("ran out of time before %s", d))
+		}
+		if err := st.Runner.Run(ctx, "kubectl", "-n", ns, "rollout", "status", d,
+			fmt.Sprintf("--timeout=%ds", int(left.Seconds()))); err != nil {
+			return portalNotReady(ctx, st, ns, fmt.Errorf("%s did not become available: %w", d, err))
+		}
+	}
+	return nil
+}
+
+// portalNotReady attaches what the cluster says to a readiness failure.
+//
+// A rollout timeout on its own names the Deployment and nothing about why, and the two
+// causes that matter here are both visible one level down: a pod that cannot schedule
+// because its ServiceAccount is missing, and a container that cannot start. Printing the
+// pod-level reason turns a timeout into a diagnosis without the operator having to go
+// looking while the cluster is still up.
+func portalNotReady(ctx context.Context, st *engine.State, ns string, cause error) error {
+	pods, _ := st.Runner.Capture(ctx, "kubectl", "-n", ns, "get", "pods",
+		"-o", `jsonpath={range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}`+
+			`{range .status.conditions[?(@.type=="PodScheduled")]}{.reason}{" "}{.message}{end}{"\n"}{end}`,
+		"--request-timeout=30s")
+	events, _ := st.Runner.Capture(ctx, "kubectl", "-n", ns, "get", "events",
+		"--field-selector=type=Warning", "-o", `jsonpath={range .items[*]}{.reason}: {.message}{"\n"}{end}`,
+		"--request-timeout=30s")
+
+	detail := strings.TrimSpace(pods)
+	if detail == "" {
+		detail = "(no pods at all — the Deployment created none)"
+	}
+	if w := strings.TrimSpace(events); w != "" {
+		detail += "\nwarnings:\n" + w
+	}
+	return fmt.Errorf("%w\npods in %s:\n%s", cause, ns, detail)
+}

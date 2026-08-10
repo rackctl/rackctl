@@ -1311,6 +1311,13 @@ func (portal) Run(ctx context.Context, st *engine.State) error {
 	if err := st.Runner.Run(ctx, "helm", args...); err != nil {
 		return err
 	}
+	// helm returns once the API server accepts the objects, which is not the same as portal
+	// running — and every way this phase has actually failed is invisible from there.
+	if !st.Runner.DryRun {
+		if err := waitPortalReady(ctx, st, ns, 10*time.Minute); err != nil {
+			return &engine.NoRollbackError{Err: err}
+		}
+	}
 	note(st, "portal: no ingress. The chart defaults to ClusterIP, and an ingress before a GitHub "+
 		"OAuth app exists would publish a console whose only login is the development one. Reach it "+
 		"with: kubectl -n %s port-forward svc/portal-web 8080:80", ns)
