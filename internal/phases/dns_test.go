@@ -108,16 +108,30 @@ func TestDNSEnv_OverridesTheCertificateToo(t *testing.T) {
 	}
 }
 
-// The delegation is a human act rackctl cannot perform, so a run that does not say so leaves
-// the operator with a zone, a pending certificate, and no idea what is expected of them.
-func TestDNSEnv_DisclosesTheDelegationStep(t *testing.T) {
+// A run that does not disclose the delegation leaves the operator with a zone, a pending
+// certificate, and no idea what is expected of them — the request expires at 72 hours.
+//
+// What the note may NOT do is name a remedy. Whether the delegation is rackctl's to make or
+// the operator's depends on whether the parent is a public hosted zone in this account, and
+// that is not known until the zone exists — delegateSubdomain runs after this apply and
+// reports which it was. The negative assertion is the load-bearing half: telling an operator
+// rackctl cannot delegate sends them to hand-edit records rackctl has already written.
+func TestDNSEnv_DisclosesTheDelegationClockWithoutGuessingTheRemedy(t *testing.T) {
 	st, out := dnsState(t, "acme.example.com")
 	if _, err := dnsEnv(st, "apply"); err != nil {
 		t.Fatalf("dnsEnv: %v", err)
 	}
-	if !strings.Contains(out.String(), "NS records") {
-		t.Fatalf("the operator has to repoint NS records for the certificate to issue; a run that "+
-			"does not say so hands them a permanently pending cert.\ngot:\n%s", out.String())
+	got := out.String()
+	for _, want := range []string{"delegation", "72 hours"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the note must name %q — without the delegation and the clock, an operator "+
+				"cannot tell a slow certificate from a dead one.\ngot:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "rackctl cannot") {
+		t.Fatalf("the note must not claim rackctl cannot delegate: when the parent is a public "+
+			"zone in this account it does, automatically, moments later. Saying otherwise sends "+
+			"the operator to edit records that are already correct.\ngot:\n%s", got)
 	}
 }
 
