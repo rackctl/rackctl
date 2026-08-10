@@ -6,6 +6,7 @@ package phases
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -853,11 +854,31 @@ func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 	// zone is unreadable and the record cannot be matched for deletion.
 	WithdrawSubdomainDelegation(ctx, st)
 
+	// Every component is attempted. Returning on the first failure is the same defect
+	// `rackctl destroy` had in three places, and it is worse here: a rollback runs on a
+	// platform the operator did NOT ask to keep, and the expensive components are last in
+	// this order.
+	//
+	// fleet-hub makes it concrete and permanent. Its state bucket and CMK carry
+	// prevent_destroy — deliberately, they hold every vended cluster's tofu state — so a
+	// rollback of a fleet-enabled platform ALWAYS fails there, and everything behind it
+	// (dns, observability, managed-monitoring, agent-iam, secrets) was stranded every
+	// time. The cluster and VPC belong to other phases, so they survived on their own
+	// teardown, but the ordering guarantees the rollback stops partway on any install with
+	// controlPlane.eksFleet on.
+	//
+	// Failures are joined and returned, so the engine still reports the rollback as
+	// incomplete and names what did not come down.
 	comps := substrateComponents(st.Config)
+	var failed []error
 	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply, no exceptions
 		if err := destroy(ctx, st, comps[i]); err != nil {
-			return err
+			failed = append(failed, fmt.Errorf("%s: %w", comps[i], err))
+			note(st, "teardown %s failed — continuing with the rest", comps[i])
 		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("%d component(s) did not tear down: %w", len(failed), errors.Join(failed...))
 	}
 	return nil
 }
