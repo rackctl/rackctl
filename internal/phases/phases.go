@@ -1261,6 +1261,22 @@ func (portal) Run(ctx context.Context, st *engine.State) error {
 		return &engine.NoRollbackError{Err: fmt.Errorf("portal substrate: %w", err)}
 	}
 
+	// The Platform CR has to reach the cluster before the chart does, and nothing else
+	// applies it. rackctl reads portal/platform.yaml for its spec.datastores — that is how
+	// tenant-substrate learned to build the Aurora cluster above — but reading a file is not
+	// applying it, and the eks-gitops catalog declares the platform-ops TENANT while naming
+	// no Platform called portal.
+	//
+	// Everything the chart needs is downstream of that one object. The operator derives the
+	// tenants-portal namespace from the Platform's name, creates the tenant-runtime
+	// ServiceAccount in it, and binds that account to the tenant IAM role with a Pod Identity
+	// association. Install the chart first and helm cheerfully creates a namespace and a set
+	// of Deployments whose pods reference a ServiceAccount that does not exist — they never
+	// schedule, and the release still reports deployed.
+	if err := applyPortalPlatform(ctx, st, ns); err != nil {
+		return &engine.NoRollbackError{Err: err}
+	}
+
 	note(st, "deploying portal (Go API + River worker + React) as a Platform tenant in %s", ns)
 	note(st, "portal: database %s, credential from %s — external-secrets composes DATABASE_URL at "+
 		"refresh, so the password never lands in a values file or the helm release",
