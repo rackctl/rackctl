@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/yaml"
+
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
@@ -1299,23 +1301,76 @@ func (portal) Run(ctx context.Context, st *engine.State) error {
 	return nil
 }
 
-// portalChartRef prefers the published chart and falls back to the checkout.
+// portalTenantValues are the values phase 8 sets that only the tenant-substrate wiring
+// declares. They are the contract between this phase and the chart: the ExternalSecret
+// that composes DATABASE_URL from the RDS-managed secret is rendered from them, and a
+// chart that does not declare them cannot compose anything.
+var portalTenantValues = []string{"externalSecret", "tenantInfra"}
+
+// portalChartRef resolves the chart to install, preferring a published chart that can
+// actually satisfy this phase.
 //
-// Both are real paths now: v0.1.0 is in GHCR. The fallback stays because a fork that has
-// not published its own chart still has the source, and because an unreachable registry
-// should not be the thing that stops an install.
+// REACHABLE IS NOT SUFFICIENT. The published chart is a separate artifact on its own
+// version line, and GHCR holding *a* portal chart says nothing about whether it holds one
+// that understands `externalSecret`. Chart 0.1.0 does not: it has no externalsecret.yaml
+// and declares neither value, and it carries no values.schema.json, so helm accepts every
+// --set silently. What stops that install being a running portal wired to nothing is the
+// chart's own `required` on database.url — a guard in the artifact being replaced, which
+// is not a thing to depend on.
+//
+// So ask the resolved chart whether it declares the values this phase is about to set,
+// and fall back to the checkout when it does not. That is the org's recurring failure
+// read from the other side: a control plane reporting Healthy over a data path that was
+// never connected.
+//
+// A PIN OUTRANKS THE REGISTRY. When versions.portal names a ref, the operator has said
+// which portal this install is. Reaching past that for whatever GHCR published last
+// defeats the pin exactly the way an ApplicationSet pinning its own revision and letting
+// children track main does — a pinned install that quietly deploys something else.
 func portalChartRef(st *engine.State) string {
 	const published = "oci://ghcr.io/nanohype/portal/charts/portal"
+
+	checkout := func(why string) string {
+		note(st, "portal: installing from the checkout at %s — %s", st.Repos.Portal, why)
+		st.Runner.Dir = st.Repos.Portal
+		return "deploy/helm/portal"
+	}
+
 	if st.Runner.DryRun {
 		return published
 	}
-	if _, err := st.Runner.Capture(context.Background(), "helm", "show", "chart", published); err == nil {
-		return published
+	if ref := st.Config.Versions.Portal; ref != "" {
+		return checkout(fmt.Sprintf(
+			"versions.portal pins %s, and the published chart is a separate artifact that "+
+				"cannot be resolved from that ref. Honouring the registry here would deploy "+
+				"a portal the pin does not name", ref))
 	}
-	note(st, "portal: %s is unreachable — installing from the checkout at %s",
-		published, st.Repos.Portal)
-	st.Runner.Dir = st.Repos.Portal
-	return "deploy/helm/portal"
+
+	out, err := st.Runner.Capture(context.Background(), "helm", "show", "values", published)
+	if err != nil {
+		return checkout(fmt.Sprintf("%s is unreachable", published))
+	}
+	// Parsed, not grepped. `externalSecret:` appearing anywhere in a comment would
+	// satisfy a line match and hand back a chart that declares nothing — the same
+	// shape of false positive this function exists to remove.
+	var declared map[string]any
+	if err := yaml.Unmarshal([]byte(out), &declared); err != nil {
+		return checkout(fmt.Sprintf("%s returned values that do not parse as YAML: %v", published, err))
+	}
+	var missing []string
+	for _, key := range portalTenantValues {
+		if _, ok := declared[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return checkout(fmt.Sprintf(
+			"%s declares no %s, so it renders no ExternalSecret and DATABASE_URL would never "+
+				"be composed from the RDS-managed secret. The chart has no values.schema.json, "+
+				"so helm would accept every --set below in silence",
+			published, strings.Join(missing, " or ")))
+	}
+	return published
 }
 
 // portalEnvironment maps this install's environment onto the one portal validates against.
