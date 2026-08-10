@@ -131,13 +131,19 @@ func dnsEnv(st *engine.State, verb string) ([]string, error) {
 
 	// Apply only. Told to an operator during `destroy dns`, this instructs them to point a
 	// live domain's delegation at name servers the same run is in the middle of deleting.
+	//
+	// It states the CLOCK and not the remedy, because which remedy applies is not known
+	// until the zone exists: delegateSubdomain runs immediately after this apply, looks for
+	// the parent, and reports what it did. Naming a remedy here would answer that one step
+	// early, and the wrong answer sends an operator to hand-edit records rackctl has
+	// already written correctly — worse than saying nothing.
 	if verb != "destroy" {
-		note(st, "dns: NEXT, and rackctl cannot do it — point %s's NS records at this zone's name "+
-			"servers. Until that lands, ACM cannot resolve the certificate's validation record over "+
-			"public DNS, and the request EXPIRES after 72 hours with status \"Validation timed out\". "+
-			"If the delegation takes longer than that, re-apply the dns component to request a fresh "+
-			"certificate. rackctl does not wait, because the zone is being created by this apply, so "+
-			"the delegation cannot exist yet", zone)
+		note(st, "dns: the certificate is REQUESTED, not issued. ACM validates by resolving a record "+
+			"over public DNS, so nothing happens until %s's delegation points at this zone — and the "+
+			"request hard-expires 72 hours from now with status \"Validation timed out\". Re-apply the "+
+			"dns component after that to request a fresh one. rackctl does not wait here, because the "+
+			"zone is created by this apply and the delegation cannot exist before it. The next step "+
+			"reports whether it delegated for you or the change is yours to make", zone)
 	}
 
 	return env, nil
@@ -151,12 +157,11 @@ func dnsEnv(st *engine.State, verb string) ([]string, error) {
 // resolution fails — the zone exists but nothing on the internet is pointed at it — and
 // the request sits in PENDING_VALIDATION until it hard-expires at 72 hours.
 //
-// rackctl used to print "NEXT, and rackctl cannot do it" and leave the operator with a
-// 72-hour clock. That is true for a zone whose parent is a registrar, and false for the
-// common case this exists for: a platform installed on a subdomain of a domain the org
-// already hosts in Route53. There the parent zone is one API call away, the delegation is
-// a single additive RRSet, and the certificate issues within minutes instead of whenever
-// somebody remembers.
+// Handing that 72-hour clock to the operator is the right answer for a zone whose parent
+// is a registrar, and the wrong one for the case this exists for: a platform installed on
+// a subdomain of a domain the org already hosts in Route53. There the parent zone is one
+// API call away, the delegation is a single additive RRSet, and the certificate issues
+// within minutes rather than whenever somebody remembers.
 //
 // It is deliberately narrow. It writes exactly one NS RRSet for exactly the child zone,
 // into a zone that must already exist in this account; it never creates the parent, never
