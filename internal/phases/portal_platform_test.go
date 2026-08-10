@@ -95,3 +95,61 @@ func TestApplyPortalPlatform_FailsWhenTheServiceAccountNeverAppears(t *testing.T
 		t.Fatal("the wait did not honour its timeout")
 	}
 }
+
+// readyState puts a fake kubectl on PATH: `get deploy -o name` answers `deploys`, and
+// `rollout status` succeeds or fails per `rolloutOK`.
+func readyState(t *testing.T, deploys string, rolloutOK bool) *engine.State {
+	t.Helper()
+	dir := t.TempDir()
+	rollout := "exit 1"
+	if rolloutOK {
+		rollout = "exit 0"
+	}
+	script := "#!/bin/sh\ncase \"$*\" in\n" +
+		"  *'get deploy'*) printf '" + deploys + "' ;;\n" +
+		"  *'rollout status'*) " + rollout + " ;;\n" +
+		"  *'get pods'*) echo 'portal-server-x Pending Unschedulable error looking up service account' ;;\n" +
+		"esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return &engine.State{Config: config.Default(), Runner: exec.New(io.Discard)}
+}
+
+func TestWaitPortalReady_PassesWhenEveryDeploymentRollsOut(t *testing.T) {
+	st := readyState(t, "deployment.apps/portal-server\\ndeployment.apps/portal-web\\n", true)
+
+	if err := waitPortalReady(context.Background(), st, "tenants-portal", 30*time.Second); err != nil {
+		t.Fatalf("a release whose deployments roll out is ready: %v", err)
+	}
+}
+
+// The defect this exists to refuse. `kubectl wait -l <selector>` matching nothing exits 0,
+// which is exactly how the catalog-convergence gate passed vacuously on every install it
+// ever ran. A release that rendered no Deployment is a failure, not a fast success.
+func TestWaitPortalReady_RefusesAnEmptySet(t *testing.T) {
+	st := readyState(t, "", true)
+
+	err := waitPortalReady(context.Background(), st, "tenants-portal", 30*time.Second)
+	if err == nil {
+		t.Fatal("no Deployments must fail — matching nothing is the vacuous pass this replaces")
+	}
+	if !strings.Contains(err.Error(), "no portal Deployment") {
+		t.Errorf("the message must say the set was empty:\n%v", err)
+	}
+}
+
+// A rollout timeout names the Deployment and nothing about why. The two causes that matter
+// — an absent ServiceAccount and a container that cannot start — are both one level down.
+func TestWaitPortalReady_ReportsWhyThePodsAreNotRunning(t *testing.T) {
+	st := readyState(t, "deployment.apps/portal-server\\n", false)
+
+	err := waitPortalReady(context.Background(), st, "tenants-portal", 30*time.Second)
+	if err == nil {
+		t.Fatal("a deployment that never becomes available must fail the phase")
+	}
+	if !strings.Contains(err.Error(), "service account") {
+		t.Errorf("the failure must carry the pod-level reason, not just the rollout timeout:\n%v", err)
+	}
+}
