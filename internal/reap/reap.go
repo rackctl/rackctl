@@ -759,17 +759,97 @@ func fleetSpokes(ctx context.Context, run execer) []string {
 //
 // Best-effort, like everything else here. No ArgoCD, or no Applications, is not an error —
 // it is a platform that never got that far.
+// armedApplications returns the Applications still carrying syncPolicy.automated.
+//
+// The disarm asserts on this rather than on the exit code of its own patch, because the
+// patch succeeding says nothing about whether the setting stuck. See disarmArgoCD.
+func armedApplications(ctx context.Context, run *exec.Runner) []string {
+	out, err := run.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications", "-o",
+		`jsonpath={range .items[?(@.spec.syncPolicy.automated)]}{.metadata.name}{"\n"}{end}`,
+		"--request-timeout=30s")
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, n := range strings.Fields(out) {
+		names = append(names, n)
+	}
+	return names
+}
+
+// disarmArgoCD makes ArgoCD passive so it stops recreating what the reap deletes.
+//
+// Clearing syncPolicy rather than deleting the Applications is deliberate: deleting an
+// Application with prune enabled deletes everything it manages, which on the argocd
+// Application itself means removing ArgoCD in the middle of a teardown that still needs it
+// to not fight back.
+//
+// TWO THINGS THIS GOT WRONG, and the second is the one worth remembering.
+//
+// It ran `kubectl patch applications --all`. There is no --all on patch — it belongs to
+// delete, label and annotate — so the command errored on argument parsing every time and
+// this step had never once disarmed anything. The warning below fired on every teardown
+// and was read as a quirk, because a later safety net (the operator-minted IAM role
+// force-delete) cleans up the failure it predicts.
+//
+// Fixing the flag is not enough, which is the part no amount of reading found. Patching all
+// 46 Applications individually succeeds — every patch returns 0 — and 45 of them carry
+// syncPolicy.automated again seconds later, because the ApplicationSet controller owns those
+// Applications and reconciles the spec straight back. A patch cannot outlive its owner.
+//
+// So the disarm stops the controllers, and then VERIFIES. A step that reports success from
+// its own exit code is exactly the shape of every other bug this teardown has produced: the
+// command ran, the setting did not stick, and nothing looked wrong.
 func disarmArgoCD(ctx context.Context, run *exec.Runner, out io.Writer) {
 	if _, err := run.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications",
 		"-o", "name", "--request-timeout=30s"); err != nil {
 		return // no ArgoCD, or no Applications — nothing to disarm
 	}
 	fmt.Fprintln(out, ui.Step("disarm ArgoCD selfHeal (it recreates what the reap deletes)"))
-	if _, err := run.Capture(ctx, "kubectl", "-n", "argocd", "patch", "applications", "--all",
-		"--type", "merge", "-p", `{"spec":{"syncPolicy":null}}`, "--request-timeout=60s"); err != nil {
-		fmt.Fprintln(out, ui.Fail(
-			"could not clear syncPolicy on the ArgoCD applications — selfHeal may recreate the "+
-				"Platform CRs this reap is about to delete, which leaves their IAM roles behind and "+
-				"fails agent-iam later on DeleteConflict"))
+
+	// Stop the reconcilers first. The applicationset-controller rewrites Application specs
+	// and the application-controller acts on them; with either running, the patch below is
+	// reverted before the reap reaches the CRs it protects. Scaling beats deleting: it is
+	// reversible, it leaves ArgoCD's own resources intact for the destroy that follows, and
+	// the cluster is torn down minutes later regardless.
+	for _, t := range []struct{ kind, name string }{
+		{"deployment", "argocd-applicationset-controller"},
+		{"statefulset", "argocd-application-controller"},
+	} {
+		if _, err := run.Capture(ctx, "kubectl", "-n", "argocd", "scale", t.kind+"/"+t.name,
+			"--replicas=0", "--request-timeout=60s"); err != nil {
+			fmt.Fprintln(out, ui.Warn(fmt.Sprintf(
+				"could not scale %s/%s to zero (%v) — continuing, though the patch below may be "+
+					"reverted by whichever controller is still running", t.kind, t.name, err)))
+		}
 	}
+
+	// Then clear the policy, one Application at a time. `kubectl patch` takes a single
+	// resource; neither --all nor a list of resource/name arguments works.
+	for _, name := range applicationNames(ctx, run) {
+		_, _ = run.Capture(ctx, "kubectl", "-n", "argocd", "patch", "application", name,
+			"--type", "merge", "-p", `{"spec":{"syncPolicy":null}}`, "--request-timeout=60s")
+	}
+
+	// And assert the result, because the patches returning 0 is not the claim being made.
+	if armed := armedApplications(ctx, run); len(armed) > 0 {
+		fmt.Fprintln(out, ui.Fail(fmt.Sprintf(
+			"%d ArgoCD Application(s) still have syncPolicy.automated after the disarm (%s%s) — "+
+				"selfHeal may recreate the Platform CRs this reap is about to delete, which leaves "+
+				"their IAM roles behind and fails agent-iam later on DeleteConflict",
+			len(armed), strings.Join(armed[:min(3, len(armed))], ", "),
+			map[bool]string{true: ", …", false: ""}[len(armed) > 3])))
+		return
+	}
+	fmt.Fprintln(out, ui.OK("ArgoCD is passive — no Application carries syncPolicy.automated"))
+}
+
+// applicationNames lists the Applications in the argocd namespace by bare name.
+func applicationNames(ctx context.Context, run *exec.Runner) []string {
+	out, err := run.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications",
+		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`, "--request-timeout=30s")
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(out)
 }
