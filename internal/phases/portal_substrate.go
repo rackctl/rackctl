@@ -211,12 +211,14 @@ type portalDatastore struct {
 	ARN       string `json:"arn"`
 	Endpoint  string `json:"endpoint"`
 	SecretARN string `json:"secret_arn"`
+	Database  string `json:"database"`
 }
 
 // portalSubstrate is what portal's chart needs from the substrate that was just built.
 type portalSubstrate struct {
 	DBHost      string
 	DBSecretARN string
+	DBName      string
 	CacheHost   string
 	CacheSecret string
 	Bucket      string
@@ -251,7 +253,7 @@ func readPortalSubstrate(st *engine.State) (*portalSubstrate, error) {
 	for name, d := range stores {
 		switch d.Kind {
 		case "relational":
-			out.DBHost, out.DBSecretARN = d.Endpoint, d.SecretARN
+			out.DBHost, out.DBSecretARN, out.DBName = d.Endpoint, d.SecretARN, d.Database
 		case "cache":
 			out.CacheHost, out.CacheSecret = d.Endpoint, d.SecretARN
 		case "objectStore":
@@ -268,6 +270,19 @@ func readPortalSubstrate(st *engine.State) (*portalSubstrate, error) {
 		return nil, fmt.Errorf("portal's relational datastore reported endpoint=%q secret_arn=%q — "+
 			"both are required, and portal bundles no database to fall back on",
 			out.DBHost, out.DBSecretARN)
+	}
+	// The database name is as required as the other two, and is checked separately
+	// because its absence fails LATER and reads as something else entirely. An empty
+	// name here leaves the chart on its own default, and the chart's default is a
+	// guess about a name this module composes (`app_<datastore>`), so the DSN resolves,
+	// connects, authenticates — and then fails with `database "portal" does not exist`,
+	// which looks like a missing database rather than a value nobody passed.
+	if out.DBName == "" {
+		return nil, fmt.Errorf("portal's relational datastore reported no database name — "+
+			"tenant-substrate composes it as app_<datastore> and publishes it on the datastores "+
+			"output; an older component that predates that field leaves the chart guessing, and "+
+			"the guess connects successfully before failing on a database that does not exist "+
+			"(endpoint=%q)", out.DBHost)
 	}
 	return out, nil
 }
