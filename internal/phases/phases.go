@@ -1288,6 +1288,11 @@ func (portal) Run(ctx context.Context, st *engine.State) error {
 		"--set", "externalSecret.enabled=true",
 		"--set", "externalSecret.relationalSecretArn=" + sub.DBSecretARN,
 		"--set", "tenantInfra.relational.host=" + sub.DBHost,
+		// The chart defaults this to "portal", and the substrate names it
+		// app_<datastore>. Left unset the DSN is well-formed and points at a
+		// database that was never created, so every pod connects, authenticates
+		// and then dies on `database "portal" does not exist`.
+		"--set", "tenantInfra.relational.database=" + sub.DBName,
 		"--set", "config.environment=" + portalEnvironment(st),
 		"--set", "serviceAccount.name=tenant-runtime",
 	}
