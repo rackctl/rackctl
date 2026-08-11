@@ -75,8 +75,11 @@ var operatorOwnedKinds = []string{
 func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 	if run.DryRun {
 		fmt.Fprintln(out, ui.Step("reap controller-owned resources (finalizers)"))
-		fmt.Fprintf(out, "    → (dry-run) kubectl patch applications --all -n argocd "+
-			"--type merge -p '{\"spec\":{\"syncPolicy\":null}}'  (stop selfHeal recreating what is reaped)\n")
+		fmt.Fprintf(out, "    → (dry-run) kubectl -n argocd scale deployment/argocd-applicationset-controller "+
+			"statefulset/argocd-application-controller --replicas=0\n")
+		fmt.Fprintf(out, "    → (dry-run) kubectl -n argocd patch application <each> "+
+			"--type merge -p '{\"spec\":{\"syncPolicy\":null}}', then re-read to confirm none is still "+
+			"armed  (stop selfHeal recreating what is reaped)\n")
 		for _, k := range operatorOwnedKinds {
 			fmt.Fprintf(out, "    → (dry-run) kubectl delete %s --all -A --wait --timeout=5m\n", k)
 		}
@@ -770,11 +773,7 @@ func armedApplications(ctx context.Context, run *exec.Runner) []string {
 	if err != nil {
 		return nil
 	}
-	var names []string
-	for _, n := range strings.Fields(out) {
-		names = append(names, n)
-	}
-	return names
+	return strings.Fields(out)
 }
 
 // disarmArgoCD makes ArgoCD passive so it stops recreating what the reap deletes.
