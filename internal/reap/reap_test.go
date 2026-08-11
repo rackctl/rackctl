@@ -658,8 +658,15 @@ func fakeKubectl(t *testing.T) func() []string {
 	t.Helper()
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
+	// Answers the two Application list queries so the disarm's patch loop has something
+	// to iterate, and reports nothing still armed afterwards. Everything else succeeds:
+	// this asserts WHICH commands run and in what order, not what they return.
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
+case "$*" in
+  *"syncPolicy.automated"*) ;;                 # nothing left armed after the disarm
+  *"get applications -o jsonpath"*) echo cilium; echo app-of-apps ;;
+esac
 exit 0
 `, logPath)
 	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
@@ -687,23 +694,44 @@ func TestAll_DisarmsArgoCDBeforeReapingAnything(t *testing.T) {
 	All(context.Background(), exec.New(io.Discard), io.Discard)
 
 	got := calls()
-	patchAt, deleteAt := -1, -1
+	scaleAt, patchAt, verifyAt, deleteAt := -1, -1, -1, -1
 	for i, c := range got {
-		if patchAt < 0 && strings.Contains(c, "patch applications") && strings.Contains(c, "syncPolicy") {
+		switch {
+		// Stopping the reconcilers is the half that makes the patch stick. Without it the
+		// applicationset-controller rewrites the spec back within seconds, which a patch's
+		// exit code cannot see.
+		case scaleAt < 0 && strings.Contains(c, "scale") && strings.Contains(c, "applicationset-controller"):
+			scaleAt = i
+		// Singular: kubectl patch takes one resource. `--all` is not a patch flag and a list
+		// of resource/name arguments is rejected, so this loops.
+		case patchAt < 0 && strings.Contains(c, "patch application ") && strings.Contains(c, "syncPolicy"):
 			patchAt = i
-		}
-		if deleteAt < 0 && strings.Contains(c, "delete platforms.platform.nanohype.dev") {
+		case verifyAt < 0 && strings.Contains(c, "syncPolicy.automated"):
+			verifyAt = i
+		case deleteAt < 0 && strings.Contains(c, "delete platforms.platform.nanohype.dev"):
 			deleteAt = i
 		}
+	}
+	if scaleAt < 0 {
+		t.Fatalf("the ArgoCD reconcilers were never stopped — a syncPolicy patch is reverted by "+
+			"the applicationset-controller before the reap reaches the CRs it protects.\ncalls: %#v", got)
 	}
 	if patchAt < 0 {
 		t.Fatalf("syncPolicy was never cleared — selfHeal recreates every CR this reap deletes.\ncalls: %#v", got)
 	}
+	// The disarm must assert its own effect. Reporting success from the patch's exit code is
+	// how this step spent its whole life broken: `patch applications --all` errored on an
+	// unknown flag every single run, and the warning was read as a quirk.
+	if verifyAt < 0 {
+		t.Fatalf("the disarm never re-read syncPolicy.automated — a patch that returns 0 and is "+
+			"reverted looks identical to one that held.\ncalls: %#v", got)
+	}
 	if deleteAt < 0 {
 		t.Fatalf("the Platform reap did not run at all.\ncalls: %#v", got)
 	}
-	if patchAt > deleteAt {
-		t.Fatalf("ArgoCD was disarmed AFTER the delete (%d > %d) — by then it has already put the "+
-			"Platform back.\ncalls: %#v", patchAt, deleteAt, got)
+	if scaleAt > deleteAt || patchAt > deleteAt || verifyAt > deleteAt {
+		t.Fatalf("ArgoCD was disarmed AFTER the delete (scale=%d patch=%d verify=%d > delete=%d) — "+
+			"by then it has already put the Platform back.\ncalls: %#v",
+			scaleAt, patchAt, verifyAt, deleteAt, got)
 	}
 }
