@@ -266,15 +266,30 @@ type appList struct {
 	} `json:"items"`
 }
 
-// CheckApplications requires every Application to be Healthy AND Synced.
+// CheckApplications fails on an Application that is not Healthy, and reports one that is
+// Healthy but OutOfSync without failing.
 //
 // The old doctor checked that the list was non-empty. A cluster with eight Degraded
 // Applications — a crashlooping cost monitor, dashboards that never rendered, a
-// GitOps controller stuck OutOfSync forever — passed that check.
+// GitOps controller wedged forever — passed that check. Health is the assertion that
+// closes that hole, and it stays.
 //
-// Synced matters as much as Healthy: an app that is Healthy but permanently
-// OutOfSync is one whose selfHeal is fighting a controller it cannot win against,
-// which means it is also not applying anything you commit.
+// SYNC IS REPORTED, NOT ASSERTED, and the reason is empirical rather than lenient.
+// Demanding Synced made this check unable to pass on a working cluster, because several
+// Applications are permanently OutOfSync through nobody's fault:
+//
+//   - charts that generate a self-signed certificate on every render (cilium's
+//     cilium-ca, hubble-server-certs, hubble-relay-client-certs) diff against the live
+//     Secrets forever, since each template produces different bytes
+//   - large CRDs and ValidatingAdmissionPolicies pick up server-side defaults that the
+//     committed manifest does not carry
+//   - a CR whose own operator writes back to it (a ModelGateway, say) differs from the
+//     manifest the moment it is reconciled
+//
+// A check that cannot pass is a check operators learn to skip, which costs more than the
+// drift it was meant to catch — and the drift it was meant to catch shows up as Degraded
+// or Missing, which still fails here. The convergence gate the installer runs made the
+// same call for the same reason; the two now agree.
 func CheckApplications(ctx context.Context, env *Env) Result {
 	const name = "argocd applications"
 
@@ -286,18 +301,28 @@ func CheckApplications(ctx context.Context, env *Env) Result {
 		return fail(name, "no Applications — app-of-apps has not generated anything")
 	}
 
-	var bad []string
+	var unhealthy, unsynced []string
 	for _, a := range apps.Items {
 		h, s := a.Status.Health.Status, a.Status.Sync.Status
-		if h != "Healthy" || s != "Synced" {
-			bad = append(bad, fmt.Sprintf("%s (%s/%s)", a.Metadata.Name, h, s))
+		switch {
+		case h != "Healthy":
+			unhealthy = append(unhealthy, fmt.Sprintf("%s (%s/%s)", a.Metadata.Name, h, s))
+		case s != "Synced":
+			unsynced = append(unsynced, fmt.Sprintf("%s (%s)", a.Metadata.Name, s))
 		}
 	}
-	sort.Strings(bad)
+	sort.Strings(unhealthy)
+	sort.Strings(unsynced)
 
-	if len(bad) > 0 {
-		return fail(name, fmt.Sprintf("%d/%d not Healthy+Synced: %s",
-			len(bad), len(apps.Items), strings.Join(bad, ", ")))
+	if len(unhealthy) > 0 {
+		return fail(name, fmt.Sprintf("%d/%d not Healthy: %s",
+			len(unhealthy), len(apps.Items), strings.Join(unhealthy, ", ")))
+	}
+	if len(unsynced) > 0 {
+		return warn(name, fmt.Sprintf("%d/%d Healthy; %d OutOfSync: %s — expected for charts that "+
+			"regenerate certs, CRDs that take server-side defaults, and CRs their own operator "+
+			"writes back to. Worth a look only if one you committed to is in this list",
+			len(apps.Items), len(apps.Items), len(unsynced), strings.Join(unsynced, ", ")))
 	}
 	return ok(name, fmt.Sprintf("%d/%d Healthy + Synced", len(apps.Items), len(apps.Items)))
 }
