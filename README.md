@@ -14,7 +14,7 @@ especially the footguns that strand a human today.
 ## Install
 
 ```sh
-curl -fsSL rackctl.com/install | sh
+curl -fsSL rackctl.sh/install | sh
 ```
 
 ## Usage

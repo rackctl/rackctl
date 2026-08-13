@@ -36,7 +36,7 @@ brews:
       # cannot push the formula bump directly — it opens a PR instead.
       pull_request:
         enabled: true
-    homepage: "https://rackctl.com"
+    homepage: "https://rackctl.sh"
     description: "The day-0 installer for a nanohype platform"
     license: "Apache-2.0"
     install: |

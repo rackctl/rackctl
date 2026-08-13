@@ -1,5 +1,5 @@
 #!/bin/sh
-# rackctl installer — curl -fsSL rackctl.com/install | sh
+# rackctl installer — curl -fsSL rackctl.sh/install | sh
 set -e
 
 REPO="rackctl/rackctl"
