@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -73,27 +74,45 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		// The pre-spend set. Its runner discards output because the checks are queries and
 		// their verdict IS the output.
 		q := exec.New(io.Discard)
-		q.Env = []string{"AWS_PROFILE=" + cfg.Cloud.Profile, "AWS_REGION=" + cfg.Cloud.Region}
+		q.Env = awsEnv(cfg)
 		results := preflight.Run(ctx, &preflight.Env{Cfg: cfg, Run: q})
 		printResults(results)
 		failed := preflight.Failed(results)
 
-		// The health set, only where it can mean anything. `kubectl get nodes` is the probe
-		// rather than `describe-cluster`, because the question is whether THIS shell can reach
-		// the cluster — a cluster that exists in EKS but is unreachable from here cannot have
-		// its in-cluster invariants asserted, and pretending otherwise produces failures that
-		// are about the kubeconfig rather than about the platform.
+		// The health set, only where it can mean anything. The probe reads the kubeconfig
+		// rather than calling `describe-cluster`, because the question is whether THIS shell
+		// resolves the cluster — one that exists in EKS but is unreachable from here cannot
+		// have its in-cluster invariants asserted, and pretending otherwise produces failures
+		// that are about the kubeconfig rather than about the platform.
 		run := exec.New(os.Stdout)
-		if out, err := run.Capture(ctx, "kubectl", "get", "nodes", "--no-headers"); err == nil && out != "" {
-			fmt.Println()
+		run.Env = awsEnv(cfg) // same identity as the preflight runner above, not the ambient one
+
+		// Reachability is not enough — the cluster has to be the RIGHT one. `kubectl get
+		// nodes` answers "can this shell reach a cluster", and doctor then asserted the
+		// platform's invariants against whatever that was. Running `rackctl check -c
+		// staging.yaml` from a shell pointed at development reported development's health
+		// under staging's title, in both directions: a healthy answer about the wrong
+		// cluster, or failures blamed on a platform that was never examined.
+		//
+		// check is read-only, so it refuses rather than repointing. `rackctl destroy`
+		// repoints because it is about to act; a diagnostic must not rewrite the
+		// operator's kubeconfig as a side effect of being run.
+		fmt.Println()
+		switch got, err := currentKubeCluster(ctx, run); {
+		case err != nil || got == "":
+			fmt.Println(ui.Step("no reachable cluster — platform health not asserted (nothing is provisioned yet, " +
+				"or this shell is not pointed at it)"))
+		case got != cfg.ClusterName():
+			fmt.Println(ui.Warn(fmt.Sprintf(
+				"kubectl is pointed at %q but this config is for %q — platform health NOT asserted. "+
+					"Run `aws eks update-kubeconfig --name %s --region %s --profile %s` to check this one.",
+				got, cfg.ClusterName(), cfg.ClusterName(), cfg.Cloud.Region, cfg.Cloud.Profile)))
+			failed = true
+		default:
 			fmt.Println(ui.OK("cluster reachable — asserting platform health"))
 			health := doctor.Run(ctx, &doctor.Env{Cfg: cfg, Run: run})
 			printResults(health)
 			failed = failed || doctor.Failed(health)
-		} else {
-			fmt.Println()
-			fmt.Println(ui.Step("no reachable cluster — platform health not asserted (nothing is provisioned yet, " +
-				"or this shell is not pointed at it)"))
 		}
 
 		fmt.Println()
@@ -107,4 +126,27 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 
 func init() {
 	checkCmd.Flags().StringVarP(&checkConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
+}
+
+// currentKubeCluster reports the EKS cluster the ambient kubeconfig resolves to,
+// without changing it.
+func currentKubeCluster(ctx context.Context, run *exec.Runner) (string, error) {
+	out, err := run.Capture(ctx, "kubectl", "config", "view", "--minify",
+		"-o", "jsonpath={.clusters[0].name}")
+	if err != nil {
+		return "", err
+	}
+	return eksClusterName(strings.TrimSpace(out)), nil
+}
+
+// eksClusterName pulls the cluster name out of a kubeconfig cluster entry. EKS
+// writes the ARN (arn:aws:eks:<region>:<account>:cluster/<name>); anything else is
+// returned unchanged, so a non-EKS context is reported as itself and compared —
+// and therefore refused — rather than being parsed into something that happens to
+// match the configured name.
+func eksClusterName(entry string) string {
+	if i := strings.LastIndex(entry, ":cluster/"); i >= 0 {
+		return entry[i+len(":cluster/"):]
+	}
+	return entry
 }

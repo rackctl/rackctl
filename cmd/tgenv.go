@@ -6,6 +6,21 @@ import (
 	"github.com/rackctl/rackctl/internal/config"
 )
 
+// awsEnv is the AWS identity every rackctl subprocess must run under.
+//
+// Composed in one place because it was previously composed in three, and one of
+// them forgot: `rackctl check` pinned the profile on its preflight runner and not
+// on the runner it handed to doctor, so the pre-spend checks asked about the
+// configured account while the health checks asked about whatever the ambient
+// environment happened to be. Identity that is assembled per call site is
+// identity that will eventually disagree with itself.
+func awsEnv(cfg *config.Config) []string {
+	return []string{
+		"AWS_PROFILE=" + cfg.Cloud.Profile,
+		"AWS_REGION=" + cfg.Cloud.Region,
+	}
+}
+
 // tgEnv builds the environment every terragrunt invocation runs with.
 //
 // landing-zone's root.hcl resolves the account via TERRAGRUNT_ACCOUNT_ID (its
@@ -50,10 +65,8 @@ import (
 // BECAUSE it depends on another component having run is a variable rackctl must supply,
 // because rackctl is the only thing that knows which components it ran.
 func tgEnv(cfg *config.Config) []string {
-	env := []string{
-		"AWS_PROFILE=" + cfg.Cloud.Profile,
-		"AWS_REGION=" + cfg.Cloud.Region,
-		"TERRAGRUNT_ACCOUNT_ID=" + cfg.Cloud.AccountID,
+	env := append(awsEnv(cfg),
+		"TERRAGRUNT_ACCOUNT_ID="+cfg.Cloud.AccountID,
 		// Both derived from the one tier field, so they cannot disagree.
 		//
 		// observability_tier is published as the observability/tier label on the ArgoCD cluster
@@ -106,12 +119,12 @@ func tgEnv(cfg *config.Config) []string {
 		// This is the one place rackctl injects a value that is not "different from the
 		// leaf's" — there is no leaf pin to respect here, only a component default, and
 		// leaving a credential lying around is not a default worth inheriting.
-		"TF_VAR_observability_tier=" + string(cfg.Observability.Tier),
-		"TF_VAR_enable_managed_monitoring=" + strconv.FormatBool(cfg.FullObservability()),
-		"TF_VAR_enable_agent_platform=" + strconv.FormatBool(cfg.AgentPlatform.Enabled()),
-		"TF_VAR_enable_external_dns=" + strconv.FormatBool(cfg.HasDNS()),
-		"TF_VAR_enable_portal_reader=" + strconv.FormatBool(cfg.ControlPlane.Portal),
-	}
+		"TF_VAR_observability_tier="+string(cfg.Observability.Tier),
+		"TF_VAR_enable_managed_monitoring="+strconv.FormatBool(cfg.FullObservability()),
+		"TF_VAR_enable_agent_platform="+strconv.FormatBool(cfg.AgentPlatform.Enabled()),
+		"TF_VAR_enable_external_dns="+strconv.FormatBool(cfg.HasDNS()),
+		"TF_VAR_enable_portal_reader="+strconv.FormatBool(cfg.ControlPlane.Portal),
+	)
 	if u := cfg.Org.GitOps.GitURL(); u != "" {
 		env = append(env, "TF_VAR_gitops_repo_url="+u)
 	}
