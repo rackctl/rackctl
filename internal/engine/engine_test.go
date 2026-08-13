@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -203,7 +204,7 @@ func TestEngineDoesNotRollBackOnNoRollbackError(t *testing.T) {
 // operator does not lose a wait, they lose the platform.
 func TestEngineNeverRollsBackAPlatformItDidNotBuild(t *testing.T) {
 	orig := PlatformExists
-	PlatformExists = func(context.Context, *State) bool { return true } // already provisioned
+	PlatformExists = func(context.Context, *State) PlatformState { return PlatformPresent }
 	defer func() { PlatformExists = orig }()
 
 	var log []string
@@ -232,7 +233,7 @@ func TestEngineNeverRollsBackAPlatformItDidNotBuild(t *testing.T) {
 // it back — otherwise a failed fresh install strands billable resources.
 func TestEngineStillRollsBackWhatItBuilt(t *testing.T) {
 	orig := PlatformExists
-	PlatformExists = func(context.Context, *State) bool { return false } // provisioning from zero
+	PlatformExists = func(context.Context, *State) PlatformState { return PlatformAbsent }
 	defer func() { PlatformExists = orig }()
 
 	var log []string
@@ -450,5 +451,101 @@ func TestRun_AFailedOptionalPhaseDoesNotCancelTheNextOne(t *testing.T) {
 		if strings.HasPrefix(entry, "teardown:core") {
 			t.Errorf("an optional failure must never tear down a core phase.\nlog = %v", log)
 		}
+	}
+}
+
+// The rollback guard must FAIL CLOSED. PlatformExists used to be `err == nil` over a
+// describe-cluster, so expired credentials, a throttle or a dropped network — any
+// error that is not "no such cluster" — read as "no platform here" and ARMED the
+// teardown. The one error path the guard owned led straight to the demolition it
+// exists to prevent.
+func TestEngineDoesNotRollBackWhenItCannotTellWhetherAPlatformExists(t *testing.T) {
+	orig := PlatformExists
+	PlatformExists = func(context.Context, *State) PlatformState { return PlatformUnknown }
+	defer func() { PlatformExists = orig }()
+
+	var log []string
+	eng := &Engine{
+		Phases: []Phase{
+			recPhase{id: "cluster", enabled: true, log: &log},
+			recPhase{id: "gitops", enabled: true, fail: true, log: &log},
+		},
+		Out:         io.Discard,
+		CleanOnFail: true,
+	}
+
+	if err := eng.Run(context.Background(), &State{}); err == nil {
+		t.Fatal("the phase failed; Run must still report the error")
+	}
+	for _, entry := range log {
+		if strings.HasPrefix(entry, "teardown:") {
+			t.Fatalf("could not determine whether a platform pre-existed, and the engine tore "+
+				"down anyway. An unreadable answer must suppress the rollback, not enable it.\ngot: %v", log)
+		}
+	}
+}
+
+// An optional phase failing must not cancel the optional phases after it — including
+// on a RE-APPLY, which is when preexisting is true and is the ordinary way an operator
+// retries. `case preexisting:` used to be evaluated first and shadowed the optional
+// arm, so the `continue` never ran in exactly the case it was written for: a portal
+// that failed to install meant smoke — the tenant vend that proves the platform works
+// — was never attempted.
+func TestOptionalPhaseFailureDoesNotCancelLaterOptionalPhasesOnReapply(t *testing.T) {
+	orig := PlatformExists
+	PlatformExists = func(context.Context, *State) PlatformState { return PlatformPresent }
+	defer func() { PlatformExists = orig }()
+
+	var log []string
+	eng := &Engine{
+		Phases: []Phase{
+			recPhase{id: "cluster", enabled: true, log: &log},
+			recPhase{id: "portal", enabled: true, optional: true, fail: true, log: &log},
+			recPhase{id: "smoke", enabled: true, optional: true, log: &log},
+		},
+		Out:         io.Discard,
+		CleanOnFail: true,
+	}
+
+	err := eng.Run(context.Background(), &State{})
+	if err == nil {
+		t.Fatal("an optional phase failed; the run must still exit non-zero")
+	}
+
+	var ranSmoke bool
+	for _, entry := range log {
+		if entry == "run:smoke" {
+			ranSmoke = true
+		}
+		if strings.HasPrefix(entry, "teardown:") {
+			t.Fatalf("an optional phase failing must never roll back\ngot: %v", log)
+		}
+	}
+	if !ranSmoke {
+		t.Fatalf("portal failed and smoke was never attempted — one optional phase "+
+			"cancelled the next\ngot: %v", log)
+	}
+}
+
+// The other half of failing closed, on the DEFAULT implementation rather than a test
+// double: when the AWS call itself fails, the answer must be Unknown. This is the
+// exact line that was wrong — `return err == nil` mapped every error, including
+// expired credentials and throttles, onto "there is no platform", which is the
+// answer that arms the teardown.
+func TestDefaultPlatformExistsReportsUnknownWhenTheCallFails(t *testing.T) {
+	run := exec.New(io.Discard)
+	run.Dir = filepath.Join(t.TempDir(), "does-not-exist") // makes any exec fail, aws installed or not
+
+	got := PlatformExists(context.Background(), &State{
+		Runner: run,
+		Config: &config.Config{},
+	})
+
+	if got != PlatformUnknown {
+		t.Errorf("PlatformExists = %v when the query failed, want PlatformUnknown — "+
+			"an unanswerable question must not read as 'no platform here'", got)
+	}
+	if got.rollbackBlocked() != true {
+		t.Error("an Unknown platform state must block rollback")
 	}
 }
