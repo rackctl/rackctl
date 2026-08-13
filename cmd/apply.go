@@ -101,7 +101,9 @@ func runPipeline(write bool) error {
 	st := &engine.State{Config: cfg, Runner: run}
 
 	if applyTUI {
-		return tui.RunInit(title, st, phases.All())
+		// CleanOnFail must match the non-TUI construction below — hardcoding it here
+		// meant --no-clean-on-failure was silently ignored under --tui.
+		return tui.RunInit(context.Background(), title, st, phases.All(), !applyNoClean)
 	}
 
 	fmt.Println(ui.Title(title))
