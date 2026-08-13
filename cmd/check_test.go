@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/rackctl/rackctl/internal/config"
@@ -87,6 +88,46 @@ func TestAWSEnvDoesNotShareBackingArray(t *testing.T) {
 	for _, e := range b {
 		if e == "TF_VAR_leaked=yes" {
 			t.Fatal("awsEnv returned a slice sharing state with a previous call")
+		}
+	}
+}
+
+// The destroy runbook tells operators to "confirm the account, region, and profile
+// in the printed title before you run it". The title carried the org name, the
+// region and the environment — neither of the two fields that decide WHICH CLOUD is
+// about to be changed. A region is shared by every account an operator has, so the
+// instruction was unfollowable as written.
+func TestCommandTitleCarriesAccountAndProfile(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Org.Name = "acme"
+	cfg.Cloud.AccountID = "351619759866"
+	cfg.Cloud.Profile = "stxkxs"
+	cfg.Cloud.Region = "us-west-2"
+	cfg.Environment = "development"
+
+	got := commandTitle("destroy", cfg)
+
+	for _, want := range []string{"destroy", "acme", "351619759866", "stxkxs", "us-west-2", "development"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("title %q is missing %q", got, want)
+		}
+	}
+}
+
+// One helper for all three commands, so the banner cannot say different things
+// depending on which verb you reached it by.
+func TestCommandTitleIsConsistentAcrossVerbs(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Org.Name = "acme"
+	cfg.Cloud.AccountID = "351619759866"
+	cfg.Cloud.Profile = "stxkxs"
+	cfg.Cloud.Region = "us-west-2"
+	cfg.Environment = "development"
+
+	base := strings.TrimPrefix(commandTitle("apply", cfg), "rackctl apply")
+	for _, verb := range []string{"plan", "destroy", "check"} {
+		if got := strings.TrimPrefix(commandTitle(verb, cfg), "rackctl "+verb); got != base {
+			t.Errorf("%s title tail = %q, want %q — the verbs have drifted apart", verb, got, base)
 		}
 	}
 }

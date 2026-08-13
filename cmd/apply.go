@@ -97,7 +97,7 @@ func runPipeline(write bool) error {
 	if write {
 		verb = "apply"
 	}
-	title := fmt.Sprintf("rackctl %s — %s · %s · %s", verb, cfg.Org.Name, cfg.Cloud.Region, cfg.Environment)
+	title := commandTitle(verb, cfg)
 	st := &engine.State{Config: cfg, Runner: run}
 
 	if applyTUI {
@@ -118,7 +118,7 @@ func runPipeline(write bool) error {
 // deliberately quiet on success — the operator asked to provision, not to read an audit.
 func runPreflightGate(ctx context.Context, cfg *config.Config) error {
 	q := exec.New(io.Discard) // the checks are queries; their verdict is the output
-	q.Env = []string{"AWS_PROFILE=" + cfg.Cloud.Profile, "AWS_REGION=" + cfg.Cloud.Region}
+	q.Env = awsEnv(cfg)
 
 	results := preflight.Run(ctx, &preflight.Env{Cfg: cfg, Run: q})
 	if !preflight.Failed(results) {

@@ -66,8 +66,7 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 			return err
 		}
 
-		fmt.Println(ui.Title(fmt.Sprintf("rackctl check — %s · %s · %s",
-			cfg.Org.Name, cfg.Cloud.Region, cfg.Environment)))
+		fmt.Println(ui.Title(commandTitle("check", cfg)))
 		fmt.Println(ui.OK("required tools present"))
 		fmt.Println()
 

@@ -102,7 +102,7 @@ wedge there until that lands upstream.`,
 		run.Env = tgEnv(cfg)
 		run.Dir = engine.RepoPaths(cfg.Org.Name).LandingZone
 
-		fmt.Println(ui.Title(fmt.Sprintf("rackctl destroy — %s · %s · %s", cfg.Org.Name, cfg.Cloud.Region, cfg.Environment)))
+		fmt.Println(ui.Title(commandTitle("destroy", cfg)))
 		if run.DryRun {
 			fmt.Println(ui.Warn("dry-run — no cloud changes"))
 		}
