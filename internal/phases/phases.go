@@ -449,6 +449,17 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir, ref string) 
 		if fresh {
 			return nil
 		}
+		// Removing a pin has to actually unpin. A previous pinned run left this
+		// checkout on a detached HEAD, and `git pull --ff-only` cannot fast-forward
+		// one — so dropping the entry from `versions` used to leave the repo sitting
+		// on the old commit forever, while the note blamed a divergence that had not
+		// happened. The config said latest, the disk said the old tag, and the
+		// diagnosis pointed somewhere else entirely.
+		if err := reattachHEAD(ctx, st, name); err != nil {
+			note(st, "%s: unpinned, but could not return to the default branch (%v) — this run "+
+				"will use the code as it stands on disk", name, err)
+			return nil
+		}
 		if err := st.Runner.Run(ctx, "git", "pull", "--ff-only"); err != nil {
 			note(st, "%s: could not fast-forward — it has diverged from upstream, and this run "+
 				"will use the code as it stands on disk", name)
@@ -476,6 +487,29 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir, ref string) 
 			"%s has no ref %q. versions pins this repo to that ref, and rackctl will not fall "+
 				"back to the default branch — a pin that silently tracks HEAD is worse than no "+
 				"pin. Check the tag exists on the remote, or remove the entry from versions", name, ref)}
+	}
+	// --force discards uncommitted work without a word. That is the opposite of the
+	// rule the unpinned path above states for this same directory — rackctl owns it,
+	// but the operator may have touched it, and a divergence must be REPORTED rather
+	// than driven over. forkOrSync applies the rule too ("`gh repo sync` hard-resets
+	// ONLY with --force, which is deliberately not passed"). This path was the one
+	// place that broke it.
+	//
+	// The case is ordinary: an apply fails on a landing-zone component, the operator
+	// edits the leaf to unblock it, and re-runs — which is the documented recovery.
+	// acquire then threw the edit away and re-applied the pinned tree, so they watched
+	// the same failure recur with no indication their fix had been deleted.
+	//
+	// Refuse instead. A pinned run that cannot reach its pin must not proceed — the
+	// same argument the unknown-ref branch above makes — and it must not buy its way
+	// there with the operator's work.
+	if !fresh {
+		if dirty, err := st.Runner.Capture(ctx, "git", "status", "--porcelain"); err == nil && strings.TrimSpace(dirty) != "" {
+			return &engine.NoRollbackError{Err: fmt.Errorf(
+				"%s has uncommitted changes and versions pins it to %q, which needs a clean tree "+
+					"to check out:\n%s\nCommit them, `git stash` them, or `git checkout .` in %s to "+
+					"discard them — rackctl will not decide that for you", name, ref, dirty, dir)}
+		}
 	}
 	if err := st.Runner.Run(ctx, "git", "-c", "advice.detachedHead=false", "checkout", "--force", ref); err != nil {
 		return err
@@ -1509,4 +1543,29 @@ func (smoke) Run(ctx context.Context, st *engine.State) error {
 func (smoke) Teardown(ctx context.Context, st *engine.State) error {
 	return st.Runner.Run(ctx, "helm", "uninstall", st.Config.FirstTenant.Name,
 		"-n", tenantControlPlaneNamespace, "--ignore-not-found")
+}
+
+// reattachHEAD returns a checkout left on a detached HEAD by a previous pinned run
+// to the remote's default branch, so that removing a pin actually unpins.
+//
+// A no-op when HEAD is already on a branch, which is the common case.
+func reattachHEAD(ctx context.Context, st *engine.State, name string) error {
+	if _, err := st.Runner.Capture(ctx, "git", "symbolic-ref", "-q", "HEAD"); err == nil {
+		return nil // already on a branch
+	}
+	def, err := st.Runner.Capture(ctx, "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	if err != nil {
+		// The remote HEAD ref is not always populated on a clone; ask the remote once.
+		if err := st.Runner.Run(ctx, "git", "remote", "set-head", "origin", "--auto"); err != nil {
+			return fmt.Errorf("resolving %s's default branch: %w", name, err)
+		}
+		if def, err = st.Runner.Capture(ctx, "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err != nil {
+			return fmt.Errorf("resolving %s's default branch: %w", name, err)
+		}
+	}
+	branch := strings.TrimPrefix(strings.TrimSpace(def), "origin/")
+	if branch == "" {
+		return fmt.Errorf("%s reported an empty default branch", name)
+	}
+	return st.Runner.Run(ctx, "git", "checkout", branch)
 }
