@@ -99,7 +99,14 @@ wedge there until that lands upstream.`,
 		ctx := context.Background()
 		run := exec.New(os.Stdout)
 		run.DryRun = destroyDryRun
-		run.Env = tgEnv(cfg)
+		// Same resolution as apply: with cloud.assumeRole set, a destroy runs as the
+		// role too. A teardown that ran as the operator while the apply ran as a role
+		// would be acting with different permissions on the same resources.
+		base, err := resolveEnv(ctx, cfg, run)
+		if err != nil {
+			return err
+		}
+		run.Env = tgEnvWith(base, cfg)
 		run.Dir = engine.RepoPaths(cfg.Org.Name).LandingZone
 
 		fmt.Println(ui.Title(commandTitle("destroy", cfg)))

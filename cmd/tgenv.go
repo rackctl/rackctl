@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"context"
 	"strconv"
 
+	"github.com/rackctl/rackctl/internal/awsid"
 	"github.com/rackctl/rackctl/internal/config"
+	"github.com/rackctl/rackctl/internal/exec"
 )
 
 // awsEnv is the AWS identity every rackctl subprocess must run under.
@@ -15,10 +18,32 @@ import (
 // environment happened to be. Identity that is assembled per call site is
 // identity that will eventually disagree with itself.
 func awsEnv(cfg *config.Config) []string {
-	return []string{
-		"AWS_PROFILE=" + cfg.Cloud.Profile,
-		"AWS_REGION=" + cfg.Cloud.Region,
+	return awsid.Base(cfg)
+}
+
+// identity is the process's AWS identity, resolved once. A command is a
+// single-shot process, so one Identity for its lifetime is the whole scope — and
+// caching it here is what lets a long apply re-assume transparently instead of
+// holding a session that lapses mid-run.
+var identity *awsid.Identity
+
+// resolveEnv returns the environment every subprocess of this command runs with.
+//
+// It is the single composition point for AWS identity. Callers must not build
+// their own: the bug this replaces was `rackctl check` pinning the profile on one
+// of its two runners and not the other, so the two halves of one command asked AWS
+// as different principals.
+//
+// Without cloud.assumeRole this is the profile and region, exactly as before.
+func resolveEnv(ctx context.Context, cfg *config.Config, run *exec.Runner) ([]string, error) {
+	if identity == nil {
+		identity = awsid.New(cfg, run)
 	}
+	env, err := identity.Env(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return env, nil
 }
 
 // tgEnv builds the environment every terragrunt invocation runs with.
@@ -64,8 +89,8 @@ func awsEnv(cfg *config.Config) []string {
 // The lesson generalises past this flag: any landing-zone variable that is opt-in
 // BECAUSE it depends on another component having run is a variable rackctl must supply,
 // because rackctl is the only thing that knows which components it ran.
-func tgEnv(cfg *config.Config) []string {
-	env := append(awsEnv(cfg),
+func tgEnvWith(base []string, cfg *config.Config) []string {
+	env := append(append([]string{}, base...),
 		"TERRAGRUNT_ACCOUNT_ID="+cfg.Cloud.AccountID,
 		// Both derived from the one tier field, so they cannot disagree.
 		//
@@ -142,3 +167,8 @@ func tgEnv(cfg *config.Config) []string {
 	}
 	return env
 }
+
+// tgEnv is tgEnvWith over the base (unassumed) identity. Retained for callers that
+// have no resolved identity to hand — notably tests, which assert on the TF_VARs
+// rather than on credentials.
+func tgEnv(cfg *config.Config) []string { return tgEnvWith(awsEnv(cfg), cfg) }
