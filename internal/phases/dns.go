@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/rackctl/rackctl/internal/engine"
@@ -219,6 +220,33 @@ func delegateSubdomain(ctx context.Context, st *engine.State) {
 		return
 	}
 
+	// Read the parent's existing delegation BEFORE replacing it.
+	//
+	// The write below is an UPSERT, which replaces the whole value set of whatever NS
+	// RRSet sits at this name. That is deliberate and stays — a re-run must be a no-op,
+	// and a delegation pointing at a zone this run replaced must be corrected rather
+	// than left stale. What was missing is that it did so blind: the previous name
+	// servers were overwritten with nothing recorded, so an overwrite of a delegation
+	// rackctl did not own was both silent and unrecoverable. Nobody could say what had
+	// been there.
+	//
+	// The destroy path forty lines down already reads the RRSet back before touching
+	// it, and says why. This is the same discipline on the way in.
+	existing := delegatedServers(ctx, st, parentID, zone)
+	switch {
+	case sameServers(existing, servers):
+		note(st, "dns: %s is already delegated from %s to these name servers — nothing to change", zone, parent)
+		return
+	case len(existing) > 0:
+		// Not refused: a child zone recreated with new name servers is indistinguishable
+		// from a foreign delegation, and that first case is the one UPSERT exists for.
+		// Printed instead, so the replaced values survive somewhere the operator can read.
+		note(st, "dns: %s already has an NS record in %s pointing at %s — replacing it with %s. "+
+			"If that first set is not a zone this platform owns, restore it by hand: this "+
+			"redirects the subdomain",
+			zone, parent, strings.Join(existing, ", "), strings.Join(servers, ", "))
+	}
+
 	records := make([]map[string]string, 0, len(servers))
 	for _, s := range servers {
 		records = append(records, map[string]string{"Value": s})
@@ -334,4 +362,49 @@ func publicZoneID(ctx context.Context, st *engine.State, name string) string {
 		return ""
 	}
 	return id
+}
+
+// delegatedServers returns the name servers the parent zone currently delegates
+// this subdomain to, or nil when there is no NS record for it.
+//
+// Read-only, and deliberately forgiving: a failure here must not stop the
+// delegation, only leave it uninformed. The caller treats nil as "nothing was
+// there", which for a first delegation is the truth and for a failed read is the
+// same behaviour rackctl had before it looked at all.
+func delegatedServers(ctx context.Context, st *engine.State, parentID, zone string) []string {
+	out, err := st.Runner.Capture(ctx, "aws", "route53", "list-resource-record-sets",
+		"--hosted-zone-id", parentID,
+		"--query", fmt.Sprintf("ResourceRecordSets[?Name=='%s.' && Type=='NS'].ResourceRecords[].Value", zone),
+		"--output", "json")
+	if err != nil || strings.TrimSpace(out) == "" {
+		return nil
+	}
+	var servers []string
+	if err := json.Unmarshal([]byte(out), &servers); err != nil {
+		return nil
+	}
+	return servers
+}
+
+// sameServers reports whether two delegations name the same set of servers.
+// Route53 does not promise an order, and a trailing dot is not a difference.
+func sameServers(a, b []string) bool {
+	if len(a) == 0 || len(a) != len(b) {
+		return false
+	}
+	norm := func(in []string) []string {
+		out := make([]string, len(in))
+		for i, s := range in {
+			out[i] = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), "."))
+		}
+		sort.Strings(out)
+		return out
+	}
+	na, nb := norm(a), norm(b)
+	for i := range na {
+		if na[i] != nb[i] {
+			return false
+		}
+	}
+	return true
 }
