@@ -233,3 +233,18 @@ firstTenant:                      # optional smoke test (phase 9). Vends this te
 #   eksAgentPlatform: v1.0.0
 #   portal: v0.1.0
 #   eksFleet: v1.0.0
+
+# Optional: run as a role instead of as the operator's own SSO session.
+#
+# Without this, every AWS write — creating IAM roles and KMS keys, deleting
+# clusters and volumes — is attributed in CloudTrail to whoever ran the command,
+# and there is no identity to scope permissions to or hand to CI.
+#
+# cloud.profile stays the SOURCE identity; this is what it assumes. rackctl
+# re-assumes automatically when a long apply approaches the session's expiry.
+#
+#   assumeRole:
+#     roleArn: arn:aws:iam::111111111111:role/rackctl-deploy
+#     externalId: ""          # required by trust policies that set sts:ExternalId
+#     sessionName: ""         # defaults to rackctl-<environment>, for CloudTrail
+#     durationSeconds: 3600   # 900-43200, capped by the role's MaxSessionDuration

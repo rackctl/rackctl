@@ -20,6 +20,9 @@ var rfc1123Label = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$`)
 // cluster_version validation) accept. No patch component, no leading "v".
 var k8sMajorMinor = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
 
+// stsSessionName is sts:AssumeRole's own RoleSessionName constraint.
+var stsSessionName = regexp.MustCompile(`^[a-zA-Z0-9=,.@-]{2,64}$`)
+
 // iamRoleARN is the shape of an IAM role ARN. IAM is global, so there is no region
 // segment: arn:<partition>:iam::<account>:role/<path...><name>.
 var iamRoleARN = regexp.MustCompile(`^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$`)
@@ -219,6 +222,49 @@ type Cloud struct {
 	AccountID string   `json:"accountId"`
 	Region    string   `json:"region"`
 	Profile   string   `json:"profile"` // AWS SSO profile
+
+	// AssumeRole makes rackctl act as a role rather than as the operator.
+	//
+	// Without it every AWS write — creating IAM roles and KMS keys, deleting
+	// clusters and volumes — runs on whoever's SSO session is ambient. That is
+	// fine for one person on a laptop and wrong everywhere else: CloudTrail
+	// attributes the whole install to a human, there is no identity to scope
+	// permissions to, and nothing to hand to CI or to move when the platform is
+	// promoted to its own account.
+	//
+	// Optional. Absent, rackctl behaves exactly as before.
+	AssumeRole *AssumeRole `json:"assumeRole,omitempty"`
+}
+
+// AssumeRole is the role rackctl assumes before it touches the cloud.
+//
+// It composes with Profile rather than replacing it: the profile (or whatever
+// ambient credentials exist) is the SOURCE identity, and this role is what that
+// identity assumes. "Run as me" and "run as this role, starting from me" are both
+// expressible, which is what makes the same config work on a laptop and in CI.
+type AssumeRole struct {
+	// RoleARN is the role to assume. Required when the block is present.
+	RoleARN string `json:"roleArn"`
+
+	// ExternalID is presented as sts:ExternalId. Cross-account trust policies
+	// that follow the confused-deputy guidance require it, and landing-zone's
+	// own fleet-vend trust is one of them.
+	ExternalID string `json:"externalId,omitempty"`
+
+	// SessionName names the session in CloudTrail. Defaults to
+	// rackctl-<environment>, so the audit trail says which config did the work
+	// rather than just which role.
+	SessionName string `json:"sessionName,omitempty"`
+
+	// DurationSeconds is the requested session length. Defaults to one hour,
+	// which is also the AWS default and the floor for a role that has not raised
+	// its MaxSessionDuration.
+	//
+	// A full apply builds a VPC and an EKS control plane and can outlive an hour,
+	// so rackctl re-assumes when a session nears expiry rather than letting a
+	// long run die halfway. Raising this reduces how often that happens; it does
+	// not decide whether the run survives.
+	DurationSeconds int `json:"durationSeconds,omitempty"`
 }
 
 type Cluster struct {
@@ -667,6 +713,29 @@ func (c *Config) Validate() error {
 	}
 	if c.Cloud.Profile == "" {
 		errs = append(errs, "cloud.profile is required (AWS SSO profile)")
+	}
+	if ar := c.Cloud.AssumeRole; ar != nil {
+		switch {
+		case ar.RoleARN == "":
+			errs = append(errs, "cloud.assumeRole.roleArn is required when cloud.assumeRole is set "+
+				"(remove the block to run as the profile itself)")
+		case !iamRoleARN.MatchString(ar.RoleARN):
+			// Caught here rather than at the sts call, because that failure arrives
+			// after preflight has already spent time and reads as a permissions
+			// problem rather than a typo.
+			errs = append(errs, fmt.Sprintf("cloud.assumeRole.roleArn %q is not an IAM role ARN "+
+				"(arn:<partition>:iam::<account>:role/<name>)", ar.RoleARN))
+		}
+		// AWS accepts 900s-43200s and rejects anything outside it; a role's own
+		// MaxSessionDuration may cap it lower, which only sts can tell us.
+		if d := ar.DurationSeconds; d != 0 && (d < 900 || d > 43200) {
+			errs = append(errs, fmt.Sprintf("cloud.assumeRole.durationSeconds %d is outside the "+
+				"900-43200 AWS allows (the role's own MaxSessionDuration may cap it lower)", d))
+		}
+		if n := ar.SessionName; n != "" && !stsSessionName.MatchString(n) {
+			errs = append(errs, fmt.Sprintf("cloud.assumeRole.sessionName %q must be 2-64 chars of "+
+				"[a-zA-Z0-9=,.@-] — it lands in CloudTrail as the session identifier", n))
+		}
 	}
 	switch c.Environment {
 	case EnvDev, EnvStaging, EnvProduction:

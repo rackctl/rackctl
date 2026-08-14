@@ -76,7 +76,16 @@ func runPipeline(write bool) error {
 
 	run := exec.New(os.Stdout)
 	run.DryRun = !write
-	run.Env = tgEnv(cfg)
+
+	// Resolve identity BEFORE anything else touches AWS. With cloud.assumeRole set
+	// this performs the assume, so a role that cannot be assumed fails here — before
+	// preflight, before any spend — rather than as a permissions error somewhere in
+	// the middle of a phase.
+	base, err := resolveEnv(context.Background(), cfg, run)
+	if err != nil {
+		return err
+	}
+	run.Env = tgEnvWith(base, cfg)
 
 	// Gate the spend.
 	//
@@ -88,7 +97,7 @@ func runPipeline(write bool) error {
 	// --skip-preflight exists because a check can be wrong and must never be the thing that
 	// stands between an operator and their own cloud — but it has to be asked for.
 	if write && !applySkipPreflight {
-		if err := runPreflightGate(context.Background(), cfg); err != nil {
+		if err := runPreflightGate(context.Background(), cfg, base); err != nil {
 			return err
 		}
 	}
@@ -97,11 +106,13 @@ func runPipeline(write bool) error {
 	if write {
 		verb = "apply"
 	}
-	title := fmt.Sprintf("rackctl %s — %s · %s · %s", verb, cfg.Org.Name, cfg.Cloud.Region, cfg.Environment)
+	title := commandTitle(verb, cfg)
 	st := &engine.State{Config: cfg, Runner: run}
 
 	if applyTUI {
-		return tui.RunInit(title, st, phases.All())
+		// CleanOnFail must match the non-TUI construction below — hardcoding it here
+		// meant --no-clean-on-failure was silently ignored under --tui.
+		return tui.RunInit(context.Background(), title, st, phases.All(), !applyNoClean)
 	}
 
 	fmt.Println(ui.Title(title))
@@ -114,9 +125,9 @@ func runPipeline(write bool) error {
 
 // runPreflightGate asserts the install can succeed before it starts spending. It is
 // deliberately quiet on success — the operator asked to provision, not to read an audit.
-func runPreflightGate(ctx context.Context, cfg *config.Config) error {
+func runPreflightGate(ctx context.Context, cfg *config.Config, env []string) error {
 	q := exec.New(io.Discard) // the checks are queries; their verdict is the output
-	q.Env = []string{"AWS_PROFILE=" + cfg.Cloud.Profile, "AWS_REGION=" + cfg.Cloud.Region}
+	q.Env = env
 
 	results := preflight.Run(ctx, &preflight.Env{Cfg: cfg, Run: q})
 	if !preflight.Failed(results) {

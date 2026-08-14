@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/ui"
@@ -37,19 +38,55 @@ type Engine struct {
 	Hook        func(Event) // if set, receives events and suppresses default printing
 }
 
+// PlatformState answers "was the platform already standing when this run began?" —
+// including the third case a bool could not express.
+type PlatformState int
+
+const (
+	// PlatformAbsent means we asked and it is definitively not there.
+	PlatformAbsent PlatformState = iota
+	// PlatformPresent means we asked and it is definitively there.
+	PlatformPresent
+	// PlatformUnknown means the question could not be answered — expired
+	// credentials, a throttle, no network, a denied permission.
+	PlatformUnknown
+)
+
+// rollbackBlocked reports whether this state must suppress a rollback. Unknown
+// counts, and that is the entire point of the type.
+func (s PlatformState) rollbackBlocked() bool { return s != PlatformAbsent }
+
 // PlatformExists reports whether the platform was ALREADY provisioned when this run
 // started. It is the difference between a rollback and a demolition.
 //
+// It FAILS CLOSED. This used to be `return err == nil` over a describe-cluster,
+// which collapsed "there is no platform" and "I could not find out" into the same
+// answer — and picked the one that ARMS the rollback. Expired credentials midway
+// through a long run, a throttle, or a transient network fault was enough to make a
+// re-apply against a healthy platform look like a fresh install, and the teardown
+// below destroys the EKS cluster and the VPC. The failure mode the whole rollback
+// guard exists to prevent was reachable by the guard's own error path.
+//
+// list-clusters rather than describe-cluster because it separates the two answers
+// without needing stderr: the call either succeeds — in which case membership is
+// definitive either way — or it fails, which is the unknown.
+//
 // Overridable for tests; the default asks EKS.
-var PlatformExists = func(ctx context.Context, st *State) bool {
+var PlatformExists = func(ctx context.Context, st *State) PlatformState {
 	if st.Runner == nil || st.Config == nil || st.Runner.DryRun {
-		return false
+		return PlatformAbsent
 	}
-	_, err := st.Runner.Capture(ctx, "aws", "eks", "describe-cluster",
-		"--name", st.Config.ClusterName(),
+	out, err := st.Runner.Capture(ctx, "aws", "eks", "list-clusters",
 		"--region", st.Config.Cloud.Region,
-		"--query", "cluster.status", "--output", "text")
-	return err == nil
+		"--query", fmt.Sprintf("contains(clusters, '%s')", st.Config.ClusterName()),
+		"--output", "text")
+	if err != nil {
+		return PlatformUnknown
+	}
+	if strings.EqualFold(strings.TrimSpace(out), "true") {
+		return PlatformPresent
+	}
+	return PlatformAbsent
 }
 
 // Run executes each phase in order. On failure, completed phases are torn down
@@ -83,9 +120,22 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 	// So: if the cluster was already standing when the run began, never roll back. Report
 	// the failure and leave everything exactly as it was. Tearing a platform down is
 	// `rackctl destroy` — an explicit, separate act.
-	preexisting := PlatformExists(ctx, st)
-	if preexisting && e.Hook == nil {
-		fmt.Fprintln(e.Out, ui.Step("existing platform detected — a failure will NOT roll it back"))
+	state := PlatformExists(ctx, st)
+	preexisting := state.rollbackBlocked()
+	if e.Hook == nil {
+		switch state {
+		case PlatformPresent:
+			fmt.Fprintln(e.Out, ui.Step("existing platform detected — a failure will NOT roll it back"))
+		case PlatformUnknown:
+			// Say it out loud. The operator is the only one who can tell whether this
+			// run is building from zero, and a silent fail-closed would leave a genuine
+			// first install without the cleanup it expects.
+			fmt.Fprintln(e.Out, ui.Warn(
+				"could not determine whether a platform already exists — rollback is DISABLED "+
+					"for this run. A failure will leave everything standing rather than risk "+
+					"destroying a platform this run did not build. Fix the credentials or "+
+					"connectivity and re-run to restore normal cleanup."))
+		}
 	}
 
 	total := len(e.Phases)
@@ -112,16 +162,14 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 			// see NoRollbackError. A workload that has not converged is not a reason to
 			// destroy the cloud it is running on.
 			var noRollback *NoRollbackError
+			// Optionality is decided FIRST. `case preexisting:` used to come first and
+			// shadowed this arm entirely: on a re-apply — which is when preexisting is
+			// true, and the ordinary way an operator retries — a failing optional phase
+			// took the preexisting branch, fell out of the switch and returned. The
+			// `continue` below was unreachable in exactly the situation it was written
+			// for, so one optional phase failing still cancelled every optional phase
+			// after it. Neither arm rolls back; only this one lets the run go on.
 			switch {
-			case preexisting:
-				// The platform was already up before this run touched it. Whatever just
-				// failed, destroying it is not the remedy — this run did not build it.
-				if e.Hook == nil {
-					fmt.Fprintln(e.Out, ui.Warn(
-						"the platform was already provisioned before this run — leaving it standing. "+
-							"Nothing was rolled back. Run `rackctl check` to see what is wrong, or "+
-							"`rackctl destroy` to tear it down deliberately."))
-				}
 			case p.Optional():
 				// An OPTIONAL phase runs after the platform is already usable, and nothing
 				// it installs is a prerequisite for anything before it. fleet installs a
@@ -165,6 +213,16 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 							"to tear it down deliberately."))
 				}
 				continue
+			case preexisting:
+				// The platform was already up before this run touched it — or we could not
+				// establish that it wasn't. Whatever just failed, destroying it is not the
+				// remedy: this run did not build it.
+				if e.Hook == nil {
+					fmt.Fprintln(e.Out, ui.Warn(
+						"the platform was already provisioned before this run — leaving it standing. "+
+							"Nothing was rolled back. Run `rackctl check` to see what is wrong, or "+
+							"`rackctl destroy` to tear it down deliberately."))
+				}
 			case e.CleanOnFail && !errors.As(err, &noRollback):
 				// The phase that FAILED is torn down too. It failed partway, which
 				// means it may have created resources before it died — a terragrunt
