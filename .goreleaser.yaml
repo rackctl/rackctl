@@ -37,10 +37,28 @@ brews:
       pull_request:
         enabled: true
     homepage: "https://rackctl.sh"
-    description: "The day-0 installer for a nanohype platform"
+    # No leading article. `brew audit` flags a desc that starts with one, and the
+    # formula's desc is generated from this field — editing rackctl.rb directly is
+    # undone by the next release, because that file carries goreleaser's DO NOT EDIT
+    # header. The CLI's own `Short` in cmd/root.go keeps its article; that string is
+    # help text, not a formula field, and homebrew's rule does not reach it.
+    description: "Day-0 installer for a nanohype platform"
     license: "Apache-2.0"
     install: |
       bin.install "rackctl"
+    # What `brew test rackctl` runs. Without this field goreleaser emits no `test do`
+    # block at all, so the formula ships untestable — and a `test do` hand-added to the
+    # tap is overwritten by the next release for the same DO NOT EDIT reason.
+    #
+    # Asserting on the reported version rather than just a zero exit makes this a real
+    # check of the release rather than a smoke test. The version is injected at build
+    # time (`-X github.com/rackctl/rackctl/cmd.Version={{ .Version }}` in the build's
+    # ldflags), so a binary built without those flags reports the `0.0.0-dev` default
+    # and a binary built from the wrong tag reports the wrong number. Both install
+    # cleanly and both fail here, which is precisely the failure a formula test exists
+    # to catch.
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/rackctl version")
 
 release:
   github:
