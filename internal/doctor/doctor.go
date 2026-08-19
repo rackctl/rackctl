@@ -147,6 +147,7 @@ func CheckStuckFinalizers(ctx context.Context, env *Env) Result {
 	}
 
 	var stuck []string
+	read := 0
 	for _, kind := range terminatingKinds {
 		var list struct {
 			Items []item `json:"items"`
@@ -155,6 +156,7 @@ func CheckStuckFinalizers(ctx context.Context, env *Env) Result {
 		if err := env.kubectlJSON(ctx, &list, "get", kind, "-A"); err != nil {
 			continue
 		}
+		read++
 		for _, it := range list.Items {
 			ts := it.Metadata.DeletionTimestamp
 			if ts == nil || time.Since(*ts) < stuckFor {
@@ -179,6 +181,15 @@ func CheckStuckFinalizers(ctx context.Context, env *Env) Result {
 			"%d object(s) cannot finish deleting — ArgoCD rates a resource pending deletion as "+
 				"Progressing, so each of these holds its Application at Progressing forever and the "+
 				"convergence gate can never pass: %s", len(stuck), strings.Join(stuck, "; ")))
+	}
+	// Skipping an absent CRD is right; skipping every kind is not the same answer. `pvc` and
+	// `namespaces` are core resources, so a run that reads none of the kinds did not meet a
+	// cluster missing the optional CRDs — it failed to read the API at all, and the tick below
+	// would rest on zero observations.
+	if read == 0 {
+		return warn(name, "could not read any of "+strings.Join(terminatingKinds, ", ")+
+			" — an object wedged in Terminating holds its Application at Progressing forever, "+
+			"and nothing here rules that out")
 	}
 	return ok(name, "nothing wedged in Terminating")
 }

@@ -122,8 +122,15 @@ func TestCheckStuckFinalizers_IgnoresLiveObjects(t *testing.T) {
 }
 
 // An uninstalled CRD is not a failure — the agent platform is optional.
+//
+// The core kinds still answer, because that is what a cluster without the platform CRDs
+// does. A double where nothing at all is readable describes an unreachable API rather than
+// an absent CRD, and those are separate verdicts.
 func TestCheckStuckFinalizers_ToleratesMissingCRDs(t *testing.T) {
-	env := fakeKubectl(t, map[string]string{}) // every kind errors
+	env := fakeKubectl(t, map[string]string{
+		"pvc":        `{"items":[]}`,
+		"namespaces": `{"items":[]}`,
+	})
 
 	if r := CheckStuckFinalizers(context.Background(), env); r.Status != OK {
 		t.Fatalf("a cluster without the platform CRDs must pass; got %s: %s", r.Status, r.Detail)
