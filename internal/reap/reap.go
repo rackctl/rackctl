@@ -766,14 +766,44 @@ func fleetSpokes(ctx context.Context, run execer) []string {
 //
 // The disarm asserts on this rather than on the exit code of its own patch, because the
 // patch succeeding says nothing about whether the setting stuck. See disarmArgoCD.
-func armedApplications(ctx context.Context, run *exec.Runner) []string {
-	out, err := run.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications", "-o",
-		`jsonpath={range .items[?(@.spec.syncPolicy.automated)]}{.metadata.name}{"\n"}{end}`,
-		"--request-timeout=30s")
+// armedApplications returns the Applications still carrying syncPolicy.automated, and an
+// error when that set could not be established.
+//
+// The list is parsed rather than read as text, and the difference is the whole value. A
+// jsonpath query renders "no Application is armed" and "no Application was read" as the
+// same empty string, so a kubectl that exits 0 without printing — a shimmed binary, an
+// API that answers with no body, a query whose shape stopped matching — produces the
+// evidence for a green disarm verdict without an Application having been examined. A JSON
+// document has to arrive and parse before a count means anything, which is what makes the
+// empty result trustworthy when it does occur.
+func armedApplications(ctx context.Context, run *exec.Runner) ([]string, error) {
+	out, err := run.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications",
+		"-o", "json", "--request-timeout=30s")
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return strings.Fields(out)
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				SyncPolicy struct {
+					Automated json.RawMessage `json:"automated"`
+				} `json:"syncPolicy"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return nil, fmt.Errorf("no readable Application list: %w", err)
+	}
+	var armed []string
+	for _, it := range list.Items {
+		if len(it.Spec.SyncPolicy.Automated) > 0 {
+			armed = append(armed, it.Metadata.Name)
+		}
+	}
+	return armed, nil
 }
 
 // disarmArgoCD makes ArgoCD passive so it stops recreating what the reap deletes.
@@ -831,7 +861,18 @@ func disarmArgoCD(ctx context.Context, run *exec.Runner, out io.Writer) {
 	}
 
 	// And assert the result, because the patches returning 0 is not the claim being made.
-	if armed := armedApplications(ctx, run); len(armed) > 0 {
+	// An unreadable answer is not the same as a disarmed one: the tick below states a
+	// safety property, and it is withheld unless the Applications were actually read.
+	armed, err := armedApplications(ctx, run)
+	if err != nil {
+		fmt.Fprintln(out, ui.Warn(
+			"could not confirm the ArgoCD disarm ("+err.Error()+") — the patches were sent, but "+
+				"nothing here proves selfHeal is off. If an Application is still armed it will "+
+				"recreate the Platform CRs this reap deletes, leaving their IAM roles behind for "+
+				"agent-iam to fail on later with DeleteConflict."))
+		return
+	}
+	if len(armed) > 0 {
 		fmt.Fprintln(out, ui.Fail(fmt.Sprintf(
 			"%d ArgoCD Application(s) still have syncPolicy.automated after the disarm (%s%s) — "+
 				"selfHeal may recreate the Platform CRs this reap is about to delete, which leaves "+

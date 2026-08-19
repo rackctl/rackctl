@@ -658,14 +658,18 @@ func fakeKubectl(t *testing.T) func() []string {
 	t.Helper()
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
-	// Answers the two Application list queries so the disarm's patch loop has something
-	// to iterate, and reports nothing still armed afterwards. Everything else succeeds:
-	// this asserts WHICH commands run and in what order, not what they return.
+	// Answers the two Application list queries so the disarm's patch loop has something to
+	// iterate, and reports nothing still armed afterwards. Everything else succeeds: this
+	// asserts WHICH commands run and in what order, not what they return.
+	//
+	// The jsonpath arm is matched first because "-o json" is a prefix of "-o jsonpath", and
+	// the verification arm answers with a document rather than an empty string — an empty
+	// stdout is what the disarm treats as an unreadable answer.
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 case "$*" in
-  *"syncPolicy.automated"*) ;;                 # nothing left armed after the disarm
   *"get applications -o jsonpath"*) echo cilium; echo app-of-apps ;;
+  *"get applications -o json"*) echo '{"items":[]}' ;;
 esac
 exit 0
 `, logPath)
@@ -706,7 +710,9 @@ func TestAll_DisarmsArgoCDBeforeReapingAnything(t *testing.T) {
 		// of resource/name arguments is rejected, so this loops.
 		case patchAt < 0 && strings.Contains(c, "patch application ") && strings.Contains(c, "syncPolicy"):
 			patchAt = i
-		case verifyAt < 0 && strings.Contains(c, "syncPolicy.automated"):
+		// Any re-read of the Applications after the patch, whatever shape the query takes.
+		// Pinning this to one query string ties the property to an implementation of it.
+		case verifyAt < 0 && patchAt >= 0 && strings.Contains(c, "get applications"):
 			verifyAt = i
 		case deleteAt < 0 && strings.Contains(c, "delete platforms.platform.nanohype.dev"):
 			deleteAt = i
@@ -723,8 +729,8 @@ func TestAll_DisarmsArgoCDBeforeReapingAnything(t *testing.T) {
 	// how this step spent its whole life broken: `patch applications --all` errored on an
 	// unknown flag every single run, and the warning was read as a quirk.
 	if verifyAt < 0 {
-		t.Fatalf("the disarm never re-read syncPolicy.automated — a patch that returns 0 and is "+
-			"reverted looks identical to one that held.\ncalls: %#v", got)
+		t.Fatalf("the disarm never re-read the Applications after patching — a patch that returns 0 "+
+			"and is reverted looks identical to one that held.\ncalls: %#v", got)
 	}
 	if deleteAt < 0 {
 		t.Fatalf("the Platform reap did not run at all.\ncalls: %#v", got)
