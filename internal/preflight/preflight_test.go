@@ -389,10 +389,18 @@ exit 0`)
 
 // A published contract passes.
 func TestCheckCostPipelinePrerequisite_OKWhenPublished(t *testing.T) {
-	// An empty InvalidParameters list renders as AWS's literal "None" under --output text,
-	// which is the case a naive non-empty check reads as three missing parameters.
+	// Two queries answer for the healthy case, and they must be distinguished. An empty
+	// InvalidParameters list renders as AWS's literal "None" under --output text — the case a
+	// naive non-empty check reads as three missing parameters — while the count of resolved
+	// parameters is what separates a published contract from a response this check cannot
+	// read. A double that answered "None" to both would describe an account resolving nothing.
 	fakeBin(t, "aws", `
-if [ "$1" = "ssm" ]; then echo None; fi
+if [ "$1" = "ssm" ]; then
+  case "$*" in
+    *"length(Parameters)"*) echo 3 ;;
+    *) echo None ;;
+  esac
+fi
 exit 0`)
 
 	if r := CheckCostPipelinePrerequisite(context.Background(), testEnv()); r.Status != doctor.OK {
