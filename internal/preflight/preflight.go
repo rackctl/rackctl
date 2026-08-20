@@ -253,8 +253,19 @@ func CheckCollisions(ctx context.Context, env *Env) doctor.Result {
 
 	// If the cluster is live this is a re-apply and every "collision" below is simply
 	// the platform's own running infrastructure.
-	if _, err := env.aws(ctx, "eks", "describe-cluster", "--name", cluster, "--query", "cluster.status"); err == nil {
-		return ok(name, cluster+" is live — these resources are its own")
+	//
+	// The status has to be read, not merely requested. A zero exit says the command ran; it
+	// does not say a cluster answered. An `aws` that exits 0 with no output — a wrong --query
+	// path, a shimmed binary, a response shape that no longer carries cluster.status — takes
+	// this early return and skips every collision below while reporting the run clean. That is
+	// the failure the alias list further down calls out: a check that enumerates two of three
+	// passes a run it should have blocked, which is worse than not checking at all. Requiring a
+	// status keeps the unreadable case on the enumerating path, which errs toward checking.
+	if status, err := env.aws(ctx, "eks", "describe-cluster", "--name", cluster,
+		"--query", "cluster.status"); err == nil {
+		if s := strings.TrimSpace(status); s != "" && s != "None" {
+			return ok(name, cluster+" is live ("+s+") — these resources are its own")
+		}
 	}
 
 	var found []string
@@ -618,6 +629,26 @@ func CheckCostPipelinePrerequisite(ctx context.Context, env *Env) doctor.Result 
 		missing = nil
 	}
 	if len(missing) == 0 {
+		// An empty InvalidParameters is the absence of a negative, which is not the presence of
+		// the contract. The same empty string comes back from a --query path that no longer
+		// matches, a stubbed binary, or any response carrying no InvalidParameters field at all,
+		// and each of those would publish a clean verdict over an account that resolves none of
+		// the three. Counting what did resolve turns the verdict into an assertion about the
+		// parameters rather than about the shape of an error list.
+		found, err := env.aws(ctx, append(args, "--query", "length(Parameters)")...)
+		if err != nil {
+			return warn(name, fmt.Sprintf(
+				"read no invalid names for the CUR export contract but could not count the "+
+					"resolved ones (%s) — verify by hand before relying on this run",
+				strings.Join(curExportParams, ", ")))
+		}
+		if strings.TrimSpace(found) != strconv.Itoa(len(curExportParams)) {
+			return warn(name, fmt.Sprintf(
+				"the CUR export contract reported no invalid names, yet %s of %d parameters "+
+					"resolved — SSM answered in a shape this check cannot read, so it proves "+
+					"nothing about %s. Verify by hand before relying on this run",
+				strings.TrimSpace(found), len(curExportParams), strings.Join(curExportParams, ", ")))
+		}
 		return ok(name, "the CUR export contract is published — cost-pipeline and cost-access can resolve it")
 	}
 
