@@ -86,9 +86,13 @@ druid is covered: the permitting apply clears its Aurora deletion_protection in
 the same act that lands force_destroy, so act 2 reaches both the per-tenant
 buckets and the DB cluster.
 
-Note: eks-agent-platform's bedrock and cost-pipeline buckets (ledger O5) do not
-yet accept force_destroy_buckets — a destroy after the platform has run may still
-wedge there until that lands upstream.`,
+--account-scoped extends the same two-act sequence to eks-agent-platform's account
+buckets: cost-pipeline accepts force_destroy_buckets, and bedrock-account derives
+force_destroy from its object-lock mode, which live/org pins to GOVERNANCE for this
+reason. Bedrock's invocations bucket carries per-object GOVERNANCE retention on top
+of that, so tearing it down also requires s3:BypassGovernanceRetention on the caller
+— a permission rackctl neither declares nor checks, so a destroy without it fails at
+the object rather than at the flag.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load(destroyConfig)
 		if err != nil {
@@ -283,9 +287,9 @@ wedge there until that lands upstream.`,
 		// AgentPlatformTeardown. --account-scoped opts in; the phase names what it leaves or
 		// takes either way.
 		//
-		// O5 has landed upstream, so --force-buckets now reaches that tree too: cost-pipeline
-		// accepts force_destroy_buckets and bedrock-account derives force_destroy from its
-		// object-lock mode, which live/org pins to GOVERNANCE for this reason.
+		// --force-buckets reaches that tree too: cost-pipeline accepts force_destroy_buckets
+		// and bedrock-account derives force_destroy from its object-lock mode, which live/org
+		// pins to GOVERNANCE for this reason.
 		// Every failure this teardown hits, so the command can attempt everything and
 		// still exit non-zero naming all of them.
 		var failed []error
