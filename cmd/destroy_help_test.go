@@ -27,12 +27,25 @@ func TestDestroyHelp_DoesNotCarryTheRetiredDruidCarveOut(t *testing.T) {
 	}
 }
 
-// The O5 disclosure STAYS. bedrock and cost-pipeline still have no force_destroy_buckets
-// upstream, so a destroy after the platform has run can still wedge there. Retiring one
-// carve-out must not quietly retire its neighbour — each has its own owner and its own end.
-func TestDestroyHelp_StillDisclosesTheAgentPlatformGap(t *testing.T) {
-	if !strings.Contains(destroyCmd.Long, "O5") {
-		t.Error("the eks-agent-platform bedrock/cost-pipeline gap (ledger O5) is still open " +
-			"upstream and must still be disclosed")
+// The disclosure stays, and names the constraint that actually blocks a teardown.
+//
+// cost-pipeline declares force_destroy_buckets (components/cost-pipeline/variables.tf) and
+// bedrock-account deliberately declares no such lever, deriving force_destroy from
+// object_lock_mode instead — which live/org pins to GOVERNANCE, resolving it true. So the
+// flag reaches both roots, and help that sends an operator to clear them by hand is help
+// that describes a refusal the flag already handles.
+//
+// What survives is a permission, not a lever: bedrock's invocations bucket carries per-object
+// GOVERNANCE retention, so the caller needs s3:BypassGovernanceRetention, which rackctl
+// neither declares nor checks. A destroy without it fails at the object. That is the sentence
+// an operator needs, and this is what holds it in the help.
+func TestDestroyHelp_DisclosesTheBypassGovernanceRequirement(t *testing.T) {
+	if !strings.Contains(destroyCmd.Long, "s3:BypassGovernanceRetention") {
+		t.Error("destroy long help must name the permission a bedrock teardown requires")
+	}
+	for _, stale := range []string{"do not\nyet accept", "until that lands upstream"} {
+		if strings.Contains(destroyCmd.Long, stale) {
+			t.Errorf("destroy long help still describes the retired O5 gap: %q", stale)
+		}
 	}
 }

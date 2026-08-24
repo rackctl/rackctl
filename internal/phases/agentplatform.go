@@ -527,12 +527,11 @@ func noteAgentPlatformTeardown(st *engine.State) {
 		strings.Join(agentPlatformComponentNames(agentPlatformComponents(st.Config)), ", "))
 	note(st, "agent-platform substrate: NOTE — the account-scoped buckets take writes from the first "+
 		"PUT (S3 server-access logs land immediately), so a teardown meets BucketNotEmpty unless "+
-		"force_destroy is landed in state first. cost-pipeline now accepts force_destroy_buckets and "+
+		"force_destroy is landed in state first. cost-pipeline accepts force_destroy_buckets and "+
 		"bedrock-account derives it from object_lock_mode != COMPLIANCE, which live/org pins to "+
-		"GOVERNANCE for exactly this reason — so `rackctl destroy --account-scoped --force-buckets` "+
-		"can now take them down, where before this had to be done by hand. Bedrock's invocations "+
-		"bucket still carries per-object GOVERNANCE retention, so that path needs "+
-		"s3:BypassGovernanceRetention on the caller")
+		"GOVERNANCE for exactly this reason, so `rackctl destroy --account-scoped --force-buckets` "+
+		"takes them down. Bedrock's invocations bucket carries per-object GOVERNANCE retention "+
+		"on top of that, so that path also needs s3:BypassGovernanceRetention on the caller")
 }
 
 // assertAgentPlatformRoots verifies each component has a live root in the checkout, for the

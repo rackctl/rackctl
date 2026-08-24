@@ -1141,13 +1141,13 @@ func (platform) Teardown(ctx context.Context, st *engine.State) error {
 //
 // What this phase does NOT do, and why:
 //
-//   - It does not apply landing-zone's fleet-hub component. That lives under
-//     live/aws/fleet/… (a dedicated fleet account), and componentDir can only
-//     address live/aws/workload-<env>/…. Same boundary as the multi-account
-//     seam (ledger S10): rackctl reaches the workload tree, not the fleet tree.
-//     The IRSA role + nanohype-eks-fleet-tfstate bucket that fleet-hub mints are
-//     a prerequisite the operator supplies (or that a future rung-0 campaign
-//     vends); without them provider-opentofu has no ambient credentials.
+//   - It does not apply landing-zone's fleet-hub component. CoreComponents does,
+//     in the substrate phase, for the three reasons stated there: acquire asserts
+//     its live root before a dollar is spent, the substrate teardown destroys it
+//     in reverse with everything else, and it lands once, early, rather than at
+//     the point Crossplane is already installing. The IRSA role and the tofu
+//     state bucket it mints are therefore in place before this phase runs;
+//     without them provider-opentofu has no ambient credentials.
 //   - It does not write Cluster CRs into org.gitops.clustersRepo. That is the
 //     day-2 vending surface; this phase only installs the factory.
 //
