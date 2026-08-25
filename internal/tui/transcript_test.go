@@ -99,7 +99,7 @@ func TestTranscript_UnopenableIsNotFatalAndSaysSo(t *testing.T) {
 }
 
 // The path is reported on success too. A run that worked is also the one an operator comes
-// back to when something turns out to be wrong later.
+// back to when a problem surfaces later.
 func TestTranscript_ReportNamesThePath(t *testing.T) {
 	tr := newTranscript(t.TempDir(), "apply")
 	defer tr.Close()

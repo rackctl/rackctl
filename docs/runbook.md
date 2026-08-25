@@ -134,8 +134,8 @@ only thing that knows they exist. Tear the spokes down first.
 
 `rackctl apply --tui` owns the terminal, so subprocess output cannot go to stdout. It is
 written to a transcript instead, and the path is printed when the view exits — on success
-as well as on failure, because a run that worked is also the one you come back to when
-something turns out to be wrong later.
+as well as on failure, because a run that worked is also the one you come back to when a
+problem surfaces later.
 
 ```
 transcript: ~/.rackctl/<org>/logs/apply-1234567890.log

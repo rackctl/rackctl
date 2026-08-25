@@ -97,7 +97,7 @@ func RunInit(ctx context.Context, title string, st *engine.State, ph []engine.Ph
 	}, opts...).Run()
 	// The path is reported after the view exits, so it survives the alternate screen
 	// buffer, and on success as well as on failure — a run that worked is also the one an
-	// operator comes back to when something turns out to be wrong later.
+	// operator comes back to when a problem surfaces later.
 	tr.Report(os.Stderr)
 	if err != nil {
 		return err
