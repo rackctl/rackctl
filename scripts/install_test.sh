@@ -65,7 +65,14 @@ echo "install_test: a valid release installs and reports its version"
 rm -f "$WORK/bin/rackctl"
 cp "$TARBALL" "$WORK/good.tar.gz"
 printf 'tampered' >> "$TARBALL"
-cmp -s "$TARBALL" "$WORK/good.tar.gz" && fail "control 2: the tamper did not change the tarball"
+# Sizes, not `cmp`. `cmp -s A B && fail ...` fails OPEN: with cmp absent the command exits
+# 127, the && short-circuits, and the check that the tamper LANDED is silently skipped —
+# which is the exact failure this line was added to catch, since a mutation that does not
+# mutate makes control 2 pass having tampered with nothing. Compared this way an absent `wc`
+# leaves both sides empty, the inequality is false, and the guard fires.
+before="$(wc -c < "$WORK/good.tar.gz")"
+after="$(wc -c < "$TARBALL")"
+[ "$before" != "$after" ] || fail "control 2: the tamper did not change the tarball (before=$before after=$after)"
 if run_installer; then cat "$WORK/out" >&2; fail "control 2: a tampered tarball INSTALLED"; fi
 grep -q "checksum verification failed" "$WORK/out" || { cat "$WORK/out" >&2; fail "control 2: rejected without naming the checksum"; }
 [ ! -e "$WORK/bin/rackctl" ] || fail "control 2: rejected but installed anyway"
