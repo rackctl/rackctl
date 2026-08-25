@@ -125,6 +125,17 @@ class Manager:
         return False
 
 
+# The keys Renovate requires of a customManager, and the full set it recognises. Held here
+# so a misspelling is a failure rather than an absence — see load_managers.
+REQUIRED_MANAGER_KEYS = {"customType", "matchStrings", "depNameTemplate", "datasourceTemplate"}
+KNOWN_MANAGER_KEYS = REQUIRED_MANAGER_KEYS | {
+    "managerFilePatterns", "fileMatch", "description", "versioningTemplate",
+    "currentValueTemplate", "registryUrlTemplate", "extractVersionTemplate",
+    "depTypeTemplate", "autoReplaceStringTemplate", "packageNameTemplate",
+    "matchStringsStrategy",
+}
+
+
 def load_managers(path):
     try:
         cfg = json.load(open(path))
@@ -139,6 +150,20 @@ def load_managers(path):
         strings = m.get("matchStrings") or []
         if not pats or not strings:
             die(f"{path}: a customManager for {m.get('depNameTemplate','?')} has no file pattern or no matchStrings")
+        # A typo in a manager KEY is silent on BOTH sides: Renovate drops the manager, and
+        # a gate that merely counts what it found sees one fewer pattern and says nothing.
+        # So each entry is asserted to have PARSED as Renovate requires — every key it must
+        # carry, and no key Renovate would not recognise. A misspelled key makes the value
+        # it was meant to set ABSENT rather than wrong, which is the invisible direction.
+        name = m.get("depNameTemplate", "?")
+        missing = REQUIRED_MANAGER_KEYS - set(m)
+        if missing:
+            die(f"{path}: the customManager for {name} is missing {sorted(missing)} — "
+                "Renovate drops a manager it cannot parse, and it does so silently")
+        unknown = set(m) - KNOWN_MANAGER_KEYS
+        if unknown:
+            die(f"{path}: the customManager for {name} carries {sorted(unknown)}, which "
+                "Renovate does not recognise — most likely a misspelled key")
         managers.append(Manager(
             m.get("depNameTemplate", "?"),
             [renovate_re(p) for p in pats],
@@ -166,7 +191,20 @@ VERSION_COMMENT = re.compile(r"#[ \t]*v?\d+(\.\d+)*[ \t]*$")
 # the expectation "pins live here" would decide what gets read, so a pin added anywhere else
 # is invisible — and invisible is the state this gate exists to prevent.
 SCANNED_SUFFIXES = (".yml", ".yaml", ".sh")
-SCANNED_NAMES = ("Makefile",)
+SCANNED_NAMES = ("Makefile", "Dockerfile", ".tool-versions")
+
+# The known escape surface, demonstrated by probe rather than reasoned about, and stated
+# because a gate that hides its limits is worse than one that has none:
+#
+#   .json  NOT scanned. renovate.json is itself full of version-shaped fragments — the
+#          regexes that do the watching — so scanning JSON would report the watcher as an
+#          unwatched pin. A version pinned in some other JSON file therefore escapes.
+#   two pins on one line are counted once. The gate reports per line, so a second pin on a
+#          line whose first is watched inherits that verdict.
+#
+# Neither shape carries a pin in this tree: the only JSON files are renovate.json itself and
+# a terragrunt-output test fixture, and no scanned line holds two pins. The class is open;
+# the instance is not.
 SKIP_DIRS = {".git", "vendor", "node_modules", "dist", "bin"}
 
 
@@ -201,7 +239,13 @@ def discover(root):
                     exempted = True
             if exempted:
                 continue
-            if USES.match(line):
+            # .tool-versions is space-separated (`golang 1.26.6`), which none of the
+            # colon/at/equals shapes above matches. Every non-comment line in it is a pin
+            # by definition, so the file's NAME is the rule rather than a pattern that
+            # would have to be loose enough to fire on ordinary prose elsewhere.
+            if os.path.basename(path) == ".tool-versions":
+                pins.append(("value", path, n, raw.rstrip()))
+            elif USES.match(line):
                 pins.append(("action", path, n, raw.rstrip()))
             elif VERSION_SHAPED.search(line):
                 pins.append(("value", path, n, raw.rstrip()))

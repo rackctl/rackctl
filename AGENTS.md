@@ -98,11 +98,14 @@ gates.
 | `scripts/coverage.sh` | the org coverage floor, and 100% on every function that decides what gets destroyed |
 | `scripts/pins.py` | every version pinned in the tree is watched by a real [`.github/renovate.json`](.github/renovate.json) manager |
 | `scripts/prose.py` | the enforceable subset of `documentation-voice` |
-| `scripts/gates.sh` | the anti-vacuity floor: the gates above can still reject |
+| `scripts/floor.py` | the anti-vacuity floor: it FEEDS each gate above a known-bad input and reads the exit status, consulting nothing the gate prints about itself |
 
-If you add a gate, it needs `--controls-only` and controls that fail without the behaviour
-they guard. Verify by mutation: a control counts as landed only when the fixture changed,
-the marker it claimed to plant is present, and it was not already there.
+If you add a gate, it needs a known-good and known-bad fixture pair registered in
+`scripts/floor.py`. A gate with no pair fails the floor — a gate is proven by being fed a
+bad input and watched to reject it, and nothing it prints about itself is evidence. It
+also needs `--controls-only` with controls that fail without the behaviour they guard, and
+a control counts as landed only when the fixture changed, the marker it claimed to plant is
+present, and it was not already there.
 
 ## Conventions
 

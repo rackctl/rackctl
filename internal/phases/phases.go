@@ -706,16 +706,33 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 
 func (cluster) Teardown(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
+
+	// Every component is attempted, and the sweep runs whatever happened. Returning on the
+	// first failure is the defect substrate.Teardown, engine.teardown and `rackctl destroy`
+	// each name and avoid — and it lands hardest here, because `network` is LAST and holds
+	// the VPC, its NAT gateways and their EIPs.
+	//
+	// The shape it produces: `terragrunt destroy cluster` fails on a DependencyViolation —
+	// a lingering ENI, a security group still held — and the VPC behind it is never even
+	// attempted. The operator is billed for a NAT gateway attached to nothing, reported
+	// only as the cluster error that preceded it.
+	//
+	// The volume sweep runs after the attempt rather than after success for the same
+	// reason. A cluster that partly came down has orphaned volumes whether or not the
+	// component reported cleanly, and skipping the sweep on failure withholds it in exactly
+	// the case that produces the most orphans.
+	var failed []error
 	for _, comp := range []string{"cluster", "network"} { // reverse of apply
 		if err := destroy(ctx, st, comp); err != nil {
-			return err
+			failed = append(failed, fmt.Errorf("destroy %s: %w", comp, err))
 		}
 	}
-	// The cluster is gone, so nothing of its can still be attached. Anything still
-	// tagged for it is an orphan by definition — sweep it, or it bills forever.
+
+	// Anything still tagged for this cluster is an orphan — sweep it, or it bills forever.
 	reap.OrphanedVolumes(ctx, st.Runner, os.Stdout,
 		st.Config.ClusterName(), st.Config.Cloud.Region)
-	return nil
+
+	return errors.Join(failed...)
 }
 
 // substrateComponents is the AWS substrate the GitOps layer consumes: every landing-zone

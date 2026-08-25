@@ -272,7 +272,18 @@ func (e *Engine) report(ev Event, line string) {
 // each destroying one terragrunt component, plus the reap sweeps ahead of them. Half an
 // hour is above that walk's honest worst case and below leaving the operator with no
 // process and no answer.
-const teardownBudget = 30 * time.Minute
+// It must exceed exec.DefaultRunTimeout, and by more than one command's worth. At 30
+// minutes it was HALF the ceiling a single terragrunt destroy is allowed, so one slow
+// component could consume the whole budget and every phase after it would then run on an
+// expired context — returning `context deadline exceeded` instantly and destroying
+// nothing. The reverse walk puts the EKS cluster and the VPC last, so the phases silently
+// skipped are exactly the ones holding the expensive resources the rollback exists to
+// remove.
+//
+// Three hours: above a realistic worst case (an EKS control plane alone runs 15-25
+// minutes, and substrate walks several components) with room for the per-command ceiling
+// to be spent more than once, and still bounded rather than open-ended.
+const teardownBudget = 3 * time.Hour
 
 // teardown reverses the completed phases and returns whatever could not be undone.
 //

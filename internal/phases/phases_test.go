@@ -832,3 +832,40 @@ func TestTG_DestroyRetriesATransientFailureAndApplyDoesNot(t *testing.T) {
 		}
 	}
 }
+
+// A failed `cluster` destroy must NOT prevent `network` from being attempted.
+//
+// network is LAST in the reverse walk and holds the VPC, its NAT gateways and their EIPs.
+// Returning on the first failure bills the operator for a NAT gateway attached to nothing,
+// reported only as the cluster error that preceded it — and it is the defect
+// substrate.Teardown, engine.teardown and `rackctl destroy` each name and avoid.
+func TestClusterTeardown_AttemptsNetworkEvenWhenClusterFails(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "argv")
+	// A terragrunt that fails every `destroy cluster` and records every invocation.
+	script := "#!/bin/sh\necho \"$*\" >> " + log + "\n" +
+		"case \"$*\" in *destroy*) case \"$*\" in *-cluster*|*/cluster*) exit 1 ;; esac ;; esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	st := &engine.State{Config: baseCfg(), Runner: exec.New(io.Discard),
+		Repos: engine.Repos{LandingZone: t.TempDir()}}
+	err := (cluster{}).Teardown(context.Background(), st)
+
+	if err == nil {
+		t.Fatal("a failed component must still be reported")
+	}
+	b, _ := os.ReadFile(log)
+	if !strings.Contains(string(b), "network") {
+		t.Fatalf("network was never attempted after cluster failed — the VPC and its NAT "+
+			"gateways are stranded, and the run reports only the cluster error.\nargv:\n%s", b)
+	}
+	if !strings.Contains(err.Error(), "cluster") {
+		t.Errorf("the cluster failure must survive into the returned error: %v", err)
+	}
+}

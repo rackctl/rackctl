@@ -27,6 +27,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gatelib import blank_comment_body  # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO, "scripts")
 
@@ -35,18 +38,41 @@ SCRIPTS = os.path.join(REPO, "scripts")
 # excused.
 NOT_A_GATE = {
     "install.sh": "shipped to operators, not a gate",
-    "floor.py": "this file",
+    "floor.py": "this file — the floor cannot probe itself, which is its own blind spot",
+    "gatelib.py": "helpers the gates import; it makes no verdict of its own",
 }
+
+# Ways a workflow step can fail without failing the job. Enumerated by PROBE, not by
+# reasoning: `continue-on-error` and `|| true` were the two this scan originally knew, and
+# running the others against it showed each slipping through.
+SOFT_FAIL = (
+    "continue-on-error",
+    "|| true",
+    "||true",
+    "|| :",
+    "||:",
+    "|| exit 0",
+    "set +e",
+)
 
 
 def run(cmd, cwd=None, env=None):
-    """Run a gate and return ONLY its exit status. Output is deliberately not returned."""
+    """Run a gate and return (exit status, combined output).
+
+    THE VERDICT COMES FROM THE EXIT STATUS. The output is used for exactly one thing: to
+    confirm a rejection NAMES the violation this floor planted. That is not the gate
+    describing its own success — a gate is never asked whether it passed, and one that
+    exits 0 fails here no matter what it prints. It closes the gap between "it failed" and
+    "it found what I planted": a gate can reject a bad fixture for an unrelated reason —
+    an empty enumeration, a missing file, a parse error — and a floor reading only the
+    status would score that as proof it catches the planted thing.
+    """
     e = dict(os.environ)
     if env:
         e.update(env)
-    p = subprocess.run(cmd, cwd=cwd, env=e, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
-    return p.returncode
+    p = subprocess.run(cmd, cwd=cwd, env=e, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True)
+    return p.returncode, p.stdout or ""
 
 
 # ── fixtures, one good and one bad per gate ─────────────────────────────────
@@ -79,7 +105,8 @@ def coverage_fixtures(d):
     entries[0] = (entries[0][0], entries[0][1], "13.37%")
     open(bad, "w").write(profile(entries, "88.8%"))
     return (["sh", os.path.join(SCRIPTS, "coverage.sh"), "--check-report", good], None, None), \
-           (["sh", os.path.join(SCRIPTS, "coverage.sh"), "--check-report", bad], None, None)
+           (["sh", os.path.join(SCRIPTS, "coverage.sh"), "--check-report", bad], None, None), \
+           "orphanedNodes"
 
 
 RENOVATE = {
@@ -123,7 +150,8 @@ def pins_fixtures(d):
         return root
     cmd = ["python3", os.path.join(SCRIPTS, "pins.py")]
     return (cmd, None, {"REPO_ROOT": tree("pins-good", WF_GOOD)}), \
-           (cmd, None, {"REPO_ROOT": tree("pins-bad", WF_BAD)})
+           (cmd, None, {"REPO_ROOT": tree("pins-bad", WF_BAD)}), \
+           "actions/checkout@v4"
 
 
 PROSE_GOOD = """\
@@ -146,7 +174,8 @@ def prose_fixtures(d):
         return root
     cmd = ["python3", os.path.join(SCRIPTS, "prose.py")]
     return (cmd, None, {"REPO_ROOT": tree("prose-good", PROSE_GOOD)}), \
-           (cmd, None, {"REPO_ROOT": tree("prose-bad", PROSE_BAD)})
+           (cmd, None, {"REPO_ROOT": tree("prose-bad", PROSE_BAD)}), \
+           "Ledger O27"
 
 
 FIXTURES = {
@@ -184,33 +213,56 @@ def main():
             status = 1
             continue
 
-        (good_cmd, good_cwd, good_env), (bad_cmd, bad_cwd, bad_env) = FIXTURES[name](d)
+        (good_cmd, good_cwd, good_env), (bad_cmd, bad_cwd, bad_env), marker = FIXTURES[name](d)
 
-        if run(good_cmd, good_cwd, good_env) != 0:
+        rc, _ = run(good_cmd, good_cwd, good_env)
+        if rc != 0:
             print(f"floor: {name} REJECTED a known-good input — a gate that fails everything "
                   "fails nothing", file=sys.stderr)
             status = 1
             continue
-        if run(bad_cmd, bad_cwd, bad_env) == 0:
+
+        rc, out = run(bad_cmd, bad_cwd, bad_env)
+        if rc == 0:
             print(f"floor: {name} ACCEPTED a known-bad input — it cannot reject", file=sys.stderr)
             status = 1
             continue
-        print(f"floor: {name} accepted a known-good input and rejected a known-bad one")
+        # The rejection must NAME the planted violation. Rejecting for an unrelated reason
+        # — an empty enumeration, a missing file, a parse error — looks identical in the
+        # exit status, and scoring that as proof credits the gate with catching something
+        # it never saw.
+        if marker not in out:
+            print(f"floor: {name} rejected the known-bad input but never named {marker!r} — "
+                  "it failed for some other reason, so this proves nothing about the "
+                  "violation that was planted", file=sys.stderr)
+            status = 1
+            continue
+        print(f"floor: {name} accepted a known-good input and rejected a known-bad one, "
+              f"naming {marker!r}")
 
     # ── no workflow step may fail without failing the job ───────────────────
-    wf_dir = os.path.join(REPO, ".github", "workflows")
+    #
+    # Overridable so this check is itself probeable. A check that can only be run against
+    # the real tree cannot be shown to reject: the real tree is, by construction, the one
+    # case where it passes.
+    wf_dir = os.environ.get("WORKFLOWS", os.path.join(REPO, ".github", "workflows"))
     wfs = sorted(f for f in os.listdir(wf_dir) if f.endswith((".yml", ".yaml")))
     if not wfs:
         print(f"floor: no workflows under {wf_dir} — nothing was scanned", file=sys.stderr)
         status = 1
     for wf in wfs:
         for n, raw in enumerate(open(os.path.join(wf_dir, wf)), 1):
-            # Comment bodies blanked: a commented-out continue-on-error is not an active
-            # setting, and this check is looking for a live one.
-            line = raw.split("#", 1)[0] if raw.lstrip().startswith("#") else raw
-            if "continue-on-error" in line or "|| true" in line:
-                print(f"floor: {wf}:{n} can fail without failing the job", file=sys.stderr)
-                status = 1
+            # Comment bodies blanked through the SHARED stripper: a commented-out
+            # continue-on-error is not an active setting, and this check is looking for a
+            # live one. Quote-aware, so a `|| true` inside a quoted string is not read as
+            # a shell operator.
+            line = blank_comment_body(raw)
+            for shape in SOFT_FAIL:
+                if shape in line:
+                    print(f"floor: {wf}:{n} can fail without failing the job ({shape})",
+                          file=sys.stderr)
+                    status = 1
+                    break
     if wfs and status == 0:
         print(f"floor: {len(wfs)} workflow(s) scanned, no step soft-fails")
 

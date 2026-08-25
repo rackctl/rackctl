@@ -37,7 +37,16 @@ REPO = os.environ.get("REPO_ROOT", ".")
 SCANNING_THE_REPO = "REPO_ROOT" not in os.environ
 
 SKIP_DIRS = {".git", "vendor", "node_modules", "dist", "bin"}
-PROSE_SUFFIXES = (".go", ".md", ".yml", ".yaml", ".sh", ".py")
+PROSE_SUFFIXES = (".go", ".md", ".yml", ".yaml", ".sh", ".py", ".json", ".tf", ".hcl", ".txt")
+PROSE_NAMES = ("Makefile", "Dockerfile")
+
+# Files whose prose is not this repo's to write. documentation-voice excludes vendored
+# upstream text explicitly. Asserted, not described: an entry naming a file that no longer
+# exists fails the run.
+NOT_OUR_PROSE = [
+    (re.compile(r"^LICENSE$"), "the Apache 2.0 text, vendored verbatim"),
+    (re.compile(r"^coverage\.out$"), "a generated cover profile, not prose"),
+]
 
 # ── the rules ────────────────────────────────────────────────────────────────
 #
@@ -110,6 +119,11 @@ EXEMPT = [
         re.compile(r"scripts/prose\.py$"),
         "this file, whose rules and controls necessarily quote the shapes they reject",
     ),
+    (
+        re.compile(r"scripts/floor\.py$"),
+        "the floor, whose known-bad fixtures are by construction the violations the gates "
+        "it probes exist to reject",
+    ),
 ]
 
 
@@ -119,6 +133,7 @@ def is_exempt(path):
 
 # ── prose extraction ─────────────────────────────────────────────────────────
 GO_LINE_COMMENT = re.compile(r"//(.*)$")
+GO_BLOCK_OPEN = re.compile(r"/\*")
 HASH_COMMENT = re.compile(r"(?:^|\s)#(.*)$")
 GO_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"|`([^`]*)`')
 
@@ -151,6 +166,60 @@ def python_prose(text):
         return
 
 
+def go_prose(text):
+    """Yield (lineno, prose) for every comment and string literal in Go source.
+
+    A scanner rather than a regex. A per-line `//` match reads none of a /* */ block, and
+    this repo carries seventeen of them — so the rule that a gate must read its input the
+    way the language does applies here as much as it did to Python docstrings. Raw strings
+    and escapes are tracked because both can contain what looks like a comment opener.
+    """
+    i, line, n = 0, 1, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+            i += 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            yield line, text[i + 2:end]
+            i = end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            end = n if end < 0 else end
+            body = text[i + 2:end]
+            start = line
+            for offset, seg in enumerate(body.split("\n")):
+                yield start + offset, seg
+            line += body.count("\n")
+            i = end + 2
+        elif c == "`":
+            end = text.find("`", i + 1)
+            end = n if end < 0 else end
+            body = text[i + 1:end]
+            start = line
+            for offset, seg in enumerate(body.split("\n")):
+                yield start + offset, seg
+            line += body.count("\n")
+            i = end + 1
+        elif c == '"':
+            j, buf = i + 1, []
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    buf.append(text[j + 1])
+                    j += 2
+                    continue
+                if text[j] == "\n":
+                    break
+                buf.append(text[j])
+                j += 1
+            yield line, "".join(buf)
+            i = j + 1
+        else:
+            i += 1
+
+
 def prose_lines(path, text):
     """Yield (lineno, prose) for every human-readable span in a file.
 
@@ -161,14 +230,11 @@ def prose_lines(path, text):
     if suffix == ".py":
         yield from python_prose(text)
         return
+    if suffix == ".go":
+        yield from go_prose(text)
+        return
     for n, raw in enumerate(text.splitlines(), 1):
-        if suffix == ".go":
-            m = GO_LINE_COMMENT.search(raw)
-            if m:
-                yield n, m.group(1)
-            for sm in GO_STRING.finditer(raw):
-                yield n, sm.group(1) or sm.group(2) or ""
-        elif suffix in (".yml", ".yaml", ".sh"):
+        if suffix in (".yml", ".yaml", ".sh", ".tf", ".hcl") or os.path.basename(path) in PROSE_NAMES:
             m = HASH_COMMENT.search(raw)
             if m:
                 yield n, m.group(1)
@@ -180,11 +246,11 @@ def walk(root):
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in sorted(filenames):
-            if not name.endswith(PROSE_SUFFIXES):
+            if not (name.endswith(PROSE_SUFFIXES) or name in PROSE_NAMES):
                 continue
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, root)
-            if is_exempt(rel):
+            if is_exempt(rel) or any(r.search(rel) for r, _ in NOT_OUR_PROSE):
                 continue
             try:
                 yield rel, open(full, encoding="utf-8").read()
