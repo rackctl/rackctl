@@ -377,7 +377,7 @@ func (preflight) Run(ctx context.Context, st *engine.State) error {
 		"--service-code", "ec2", "--quota-code", "L-1216C47A"); err != nil {
 		return err
 	}
-	if st.Config.Quotas.AutoRequest {
+	if st.Config.Quotas.AutoRequestEnabled() {
 		// Only file an increase if we are actually below the target. Service Quotas
 		// rejects a request for a value at or below the current one:
 		//

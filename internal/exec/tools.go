@@ -41,6 +41,20 @@ type Runner struct {
 	Env    []string // extra environment (appended to os.Environ)
 	Out    io.Writer
 
+	// EnvSource resolves the identity a subprocess runs as, once per invocation.
+	//
+	// It exists because a long apply outlives its credentials. An assumed STS session is
+	// 1h by default and an EKS control plane alone takes a quarter of that; resolving the
+	// identity once and freezing it into Env means the run dies mid-phase on an expired
+	// token, with the rollback needing the same credentials it just lost. Consulted per
+	// call, the identity provider can re-assume before expiry — which is what makes its
+	// refresh window reachable rather than decorative.
+	//
+	// Its entries are placed BEFORE Env, so a variable scoped to one invocation still
+	// wins. An error fails the call: running as the wrong principal is worse than not
+	// running.
+	EnvSource func(context.Context) ([]string, error)
+
 	// RunTimeout overrides DefaultRunTimeout for Run. Zero takes the default.
 	RunTimeout time.Duration
 	// QueryTimeout overrides DefaultQueryTimeout for Capture and Query. Zero takes
@@ -54,6 +68,23 @@ func New(out io.Writer) *Runner {
 		out = os.Stdout
 	}
 	return &Runner{Out: out}
+}
+
+// env composes the environment for one invocation: the process environment, then the
+// identity EnvSource resolves now, then Env — later entries win, so a scoped TF_VAR beats
+// an ambient one.
+func (r *Runner) env(ctx context.Context) ([]string, error) {
+	if r.EnvSource == nil {
+		if len(r.Env) == 0 {
+			return nil, nil
+		}
+		return append(os.Environ(), r.Env...), nil
+	}
+	identity, err := r.EnvSource(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return append(append(os.Environ(), identity...), r.Env...), nil
 }
 
 func (r *Runner) runTimeout() time.Duration {
@@ -113,11 +144,13 @@ func (r *Runner) Run(ctx context.Context, name string, args ...string) error {
 	timeout := r.runTimeout()
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	env, err := r.env(ctx)
+	if err != nil {
+		return fmt.Errorf("%s: resolving the identity to run as: %w", name, err)
+	}
 	cmd := exec.CommandContext(child, name, args...)
 	cmd.Dir = r.Dir
-	if len(r.Env) > 0 {
-		cmd.Env = append(os.Environ(), r.Env...)
-	}
+	cmd.Env = env
 	// Both streams already reach the operator, so the error carries no duplicate of them.
 	cmd.Stdout = r.Out
 	cmd.Stderr = r.Out
@@ -135,11 +168,13 @@ func (r *Runner) Capture(ctx context.Context, name string, args ...string) (stri
 	timeout := r.queryTimeout()
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	env, err := r.env(ctx)
+	if err != nil {
+		return "", fmt.Errorf("%s: resolving the identity to run as: %w", name, err)
+	}
 	cmd := exec.CommandContext(child, name, args...)
 	cmd.Dir = r.Dir
-	if len(r.Env) > 0 {
-		cmd.Env = append(os.Environ(), r.Env...)
-	}
+	cmd.Env = env
 	// stderr is captured separately rather than discarded, and separately rather than
 	// merged: it is the only place aws, kubectl and git say WHY a call failed, and every
 	// caller here parses stdout, so merging the two would corrupt the value on the path
@@ -191,10 +226,12 @@ func (r *Runner) Query(ctx context.Context, name string, args ...string) (string
 	timeout := r.queryTimeout()
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(child, name, args...)
-	if len(r.Env) > 0 {
-		cmd.Env = append(os.Environ(), r.Env...)
+	env, err := r.env(ctx)
+	if err != nil {
+		return "", fmt.Errorf("%s: resolving the identity to run as: %w", name, err)
 	}
+	cmd := exec.CommandContext(child, name, args...)
+	cmd.Env = env
 	// Captured, not discarded — the same reason Capture gives. An enumeration that fails
 	// on AccessDenied and one that fails because the account is empty are the same exit
 	// status, and a sweep that cannot tell them apart cannot report honestly.

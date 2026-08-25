@@ -81,11 +81,14 @@ func runPipeline(ctx context.Context, write bool) error {
 	// this performs the assume, so a role that cannot be assumed fails here — before
 	// preflight, before any spend — rather than as a permissions error somewhere in
 	// the middle of a phase.
-	base, err := resolveEnv(ctx, cfg, run)
+	base, err := bindIdentity(ctx, cfg, run)
 	if err != nil {
 		return err
 	}
-	run.Env = tgEnvWith(base, cfg)
+	// TF_VARs only. The identity rides EnvSource so it is re-resolved per invocation
+	// rather than frozen here, and the phases' per-component scoping copies and restores
+	// exactly this slice.
+	run.Env = tgEnvWith(nil, cfg)
 
 	// Gate the spend.
 	//

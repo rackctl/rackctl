@@ -73,11 +73,9 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		// The pre-spend set. Its runner discards output because the checks are queries and
 		// their verdict IS the output.
 		q := exec.New(io.Discard)
-		env, err := resolveEnv(ctx, cfg, q)
-		if err != nil {
+		if _, err := bindIdentity(ctx, cfg, q); err != nil {
 			return err
 		}
-		q.Env = env
 		results := preflight.Run(ctx, &preflight.Env{Cfg: cfg, Run: q})
 		printResults(results)
 		failed := preflight.Failed(results)
@@ -88,7 +86,12 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		// have its in-cluster invariants asserted, and pretending otherwise produces failures
 		// that are about the kubeconfig rather than about the platform.
 		run := exec.New(os.Stdout)
-		run.Env = env // the SAME resolved identity as the preflight runner above, not the ambient one
+		// The SAME identity as the preflight runner above, not the ambient one — the two
+		// halves of one command must not ask AWS as different principals. Bound rather than
+		// copied so both re-resolve from the one session cache.
+		if _, err := bindIdentity(ctx, cfg, run); err != nil {
+			return err
+		}
 
 		// Reachability is not enough — the cluster has to be the RIGHT one. `kubectl get
 		// nodes` answers "can this shell reach a cluster", and doctor then asserted the

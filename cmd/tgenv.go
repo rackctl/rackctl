@@ -21,29 +21,48 @@ func awsEnv(cfg *config.Config) []string {
 	return awsid.Base(cfg)
 }
 
-// identity is the process's AWS identity, resolved once. A command is a
-// single-shot process, so one Identity for its lifetime is the whole scope — and
-// caching it here is what lets a long apply re-assume transparently instead of
-// holding a session that lapses mid-run.
+// identity is the process's AWS identity. A command is a single-shot process, so one
+// Identity for its lifetime is the whole scope, and it holds the session cache that
+// re-assumes before expiry.
 var identity *awsid.Identity
 
-// resolveEnv returns the environment every subprocess of this command runs with.
+// resolveEnv returns the identity every subprocess of this command runs as, resolving
+// it now.
 //
-// It is the single composition point for AWS identity. Callers must not build
-// their own: the bug this replaces was `rackctl check` pinning the profile on one
-// of its two runners and not the other, so the two halves of one command asked AWS
-// as different principals.
+// It is the single composition point for AWS identity. Callers must not build their own:
+// a command that pins the profile on one of its two runners and not the other asks AWS as
+// two different principals for the two halves of one answer.
 //
-// Without cloud.assumeRole this is the profile and region, exactly as before.
+// Without cloud.assumeRole this is the profile and region.
 func resolveEnv(ctx context.Context, cfg *config.Config, run *exec.Runner) ([]string, error) {
 	if identity == nil {
 		identity = awsid.New(cfg, run)
 	}
-	env, err := identity.Env(ctx)
+	return identity.Env(ctx)
+}
+
+// bindIdentity makes every subprocess of this command resolve its identity per
+// invocation, and returns the identity as it stands now so a caller can fail early.
+//
+// Resolving once and freezing the result into Runner.Env is what leaves a long apply
+// holding a session that lapses mid-run: an assumed STS session defaults to an hour, the
+// EKS control plane alone takes a quarter of that, and the rollback that would clean up
+// needs the same credentials the run just lost. awsid.Identity caches its session and
+// re-assumes inside a refresh window — machinery that only runs if something asks it
+// again, which is what Runner.EnvSource does.
+//
+// The first resolve happens here rather than lazily so a role that cannot be assumed
+// fails before preflight and before any spend, not as a permissions error partway
+// through a phase.
+func bindIdentity(ctx context.Context, cfg *config.Config, run *exec.Runner) ([]string, error) {
+	base, err := resolveEnv(ctx, cfg, run)
 	if err != nil {
 		return nil, err
 	}
-	return env, nil
+	run.EnvSource = func(ctx context.Context) ([]string, error) {
+		return identity.Env(ctx)
+	}
+	return base, nil
 }
 
 // tgEnv builds the environment every terragrunt invocation runs with.

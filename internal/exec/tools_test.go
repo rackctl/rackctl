@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -165,5 +166,72 @@ func TestCapture_StderrDoesNotContaminateStdout(t *testing.T) {
 	}
 	if out != "value" {
 		t.Fatalf("got %q, want %q — stderr leaked into the parsed value", out, "value")
+	}
+}
+
+// The identity is resolved once per invocation, not once per Runner.
+//
+// This is what makes an identity provider's refresh window reachable. An assumed STS
+// session defaults to an hour and a full apply outlives that; a Runner that froze the
+// credentials at construction would die mid-phase on an expired token, with the rollback
+// needing the same credentials it just lost.
+func TestEnvSource_IsResolvedPerInvocation(t *testing.T) {
+	var calls int
+	r := New(&bytes.Buffer{})
+	r.EnvSource = func(context.Context) ([]string, error) {
+		calls++
+		return []string{"RACKCTL_SESSION=" + strconv.Itoa(calls)}, nil
+	}
+
+	for i := 1; i <= 3; i++ {
+		out, err := r.Capture(context.Background(), "sh", "-c", "printf %s \"$RACKCTL_SESSION\"")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if out != strconv.Itoa(i) {
+			t.Fatalf("call %d saw session %q — the identity was resolved once and frozen", i, out)
+		}
+	}
+	if calls != 3 {
+		t.Fatalf("EnvSource called %d times for 3 invocations", calls)
+	}
+}
+
+// A variable scoped to one invocation still wins over the identity, because the phases
+// copy and restore Runner.Env around a single component's terragrunt pair and an ambient
+// value overriding that would put the scoping back where it started.
+func TestEnvSource_ScopedEnvWinsOverTheIdentity(t *testing.T) {
+	r := New(&bytes.Buffer{})
+	r.EnvSource = func(context.Context) ([]string, error) {
+		return []string{"AWS_REGION=us-west-2"}, nil
+	}
+	r.Env = []string{"AWS_REGION=us-east-1"}
+
+	out, err := r.Capture(context.Background(), "sh", "-c", "printf %s \"$AWS_REGION\"")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "us-east-1" {
+		t.Fatalf("got %q, want the scoped value — Env must beat EnvSource", out)
+	}
+}
+
+// An identity that cannot be resolved fails the call. Running as whatever principal
+// happens to be ambient is worse than not running: it is how a command asks about one
+// account and acts on another.
+func TestEnvSource_FailureFailsTheCall(t *testing.T) {
+	r := New(&bytes.Buffer{})
+	r.EnvSource = func(context.Context) ([]string, error) {
+		return nil, errors.New("ExpiredToken")
+	}
+
+	if _, err := r.Capture(context.Background(), "sh", "-c", "true"); err == nil {
+		t.Fatal("an unresolvable identity must fail the call, not fall back to the ambient one")
+	}
+	if err := r.Run(context.Background(), "sh", "-c", "true"); err == nil {
+		t.Fatal("Run must fail too")
+	}
+	if _, err := r.Query(context.Background(), "sh", "-c", "true"); err == nil {
+		t.Fatal("Query must fail too")
 	}
 }

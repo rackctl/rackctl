@@ -151,6 +151,9 @@ func (i *Identity) assume(ctx context.Context) ([]string, time.Time, error) {
 	// config asked for anyway.
 	src := *i.run
 	src.Env = Base(i.cfg)
+	// And NOT the caller's EnvSource, which resolves back into this function: the assume
+	// would ask for the identity it is in the middle of establishing.
+	src.EnvSource = nil
 
 	// Query, not Capture: Capture returns "" under dry-run, which would leave a
 	// `rackctl plan` unable to assume and therefore planning as the WRONG identity —

@@ -44,6 +44,29 @@ func CheckSessionLifetime(ctx context.Context, env *Env) doctor.Result {
 	// time it is inconvenient.
 	const needed = time.Hour
 
+	// With cloud.assumeRole set, the session every subprocess of this run actually uses is
+	// the STS session minted from that role — not the source profile's. Its lifetime is
+	// assumeRole.durationSeconds, which Validate accepts anywhere in the 900-43200 AWS
+	// allows, so a 15-minute session would sail past a gate whose entire purpose is
+	// refusing sessions shorter than an hour.
+	//
+	// The source profile still has to outlive the run too, because rackctl re-assumes from
+	// it as the session nears expiry — so both are checked, shortest first.
+	if ar := env.Cfg.Cloud.AssumeRole; ar != nil && ar.RoleARN != "" {
+		d := time.Duration(ar.DurationSeconds) * time.Second
+		if ar.DurationSeconds == 0 {
+			d = time.Hour // the awsid default, and AWS's
+		}
+		if d < needed {
+			return fail(name, fmt.Sprintf(
+				"cloud.assumeRole.durationSeconds is %s, and a full install needs about an hour. "+
+					"Every AWS call this run makes uses the assumed session, not the profile's, so a "+
+					"short one lapses mid-phase and leaves a half-applied run that cannot roll itself "+
+					"back — the rollback needs the same credentials. Raise it (the role's own "+
+					"MaxSessionDuration may cap it, which only sts can tell you)", d))
+		}
+	}
+
 	raw, err := env.Run.Capture(ctx, "aws", "configure", "export-credentials",
 		"--profile", env.Cfg.Cloud.Profile, "--format", "process")
 	if err != nil {
