@@ -69,20 +69,26 @@ jobs:
           # These write executables onto PATH, and a tag can be moved. Read from the
           # published sums file rather than a hash committed here, so a Renovate bump does
           # not have to carry a hash it cannot compute.
+          # Downloaded under the names the sums files use. `sha256sum -c` reads the NAME out
+          # of each line and opens that path, so renaming on the way down makes it look for a
+          # file that is not there — a failure that reads like a bad checksum.
+          tg=terragrunt_linux_amd64
+          tofu_zip=tofu_${TOFU_VERSION}_linux_amd64.zip
+
           base=https://github.com/gruntwork-io/terragrunt/releases/download/$TERRAGRUNT_VERSION
-          curl -fsSL -o terragrunt "$base/terragrunt_linux_amd64"
+          curl -fsSL -o "$tg" "$base/$tg"
           curl -fsSL -o tg.sums "$base/SHA256SUMS"
-          grep ' terragrunt_linux_amd64$' tg.sums | sha256sum -c -
-          sudo install -m 0755 terragrunt /usr/local/bin/terragrunt
+          grep " $tg\$" tg.sums | sha256sum -c -
+          sudo install -m 0755 "$tg" /usr/local/bin/terragrunt
 
           base=https://github.com/opentofu/opentofu/releases/download/v$TOFU_VERSION
-          curl -fsSL -o tofu.zip "$base/tofu_${TOFU_VERSION}_linux_amd64.zip"
+          curl -fsSL -o "$tofu_zip" "$base/$tofu_zip"
           curl -fsSL -o tofu.sums "$base/tofu_${TOFU_VERSION}_SHA256SUMS"
-          grep " tofu_${TOFU_VERSION}_linux_amd64.zip$" tofu.sums | sha256sum -c -
-          unzip -q tofu.zip tofu
+          grep " $tofu_zip\$" tofu.sums | sha256sum -c -
+          unzip -q "$tofu_zip" tofu
           sudo install -m 0755 tofu /usr/local/bin/tofu
 
-          rm -f terragrunt tg.sums tofu tofu.zip tofu.sums
+          rm -f "$tg" tg.sums tofu "$tofu_zip" tofu.sums
           terragrunt --version
           tofu version
       - name: test
