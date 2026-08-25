@@ -59,6 +59,13 @@ func TestRun_EveryCheckIsRegistered(t *testing.T) {
 	fakeBin(t, "aws", `exit 1`)
 	fakeBin(t, "gh", `exit 1`)
 	t.Setenv("GITHUB_TOKEN", "")
+	// git and HOME are shimmed too, because Run() executes every check — including
+	// CheckVendFreshness, which sets Runner.Dir from engine.RepoPaths($HOME/.rackctl/...)
+	// and shells out to git. Left real, this test reaches the operator's own checkouts and
+	// runs `git fetch --quiet origin` against the network: a unit test whose result depends
+	// on a machine's disk and an upstream being reachable.
+	t.Setenv("HOME", t.TempDir())
+	fakeBin(t, "git", `exit 1`)
 
 	var names []string
 	for _, r := range Run(context.Background(), testEnv()) {

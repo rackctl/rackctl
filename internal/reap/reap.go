@@ -478,6 +478,10 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 //
 // Enumeration runs in dry-run so the selection can be shown rather than described.
 func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
+	orphanedNodes(ctx, run, run.DryRun, out, cluster, region)
+}
+
+func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster, region string) {
 	if cluster == "" {
 		return
 	}
@@ -499,7 +503,7 @@ func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster
 	}
 	ids = strings.TrimSpace(ids)
 	if ids == "" || ids == "None" {
-		if run.DryRun {
+		if dryRun {
 			fmt.Fprintln(out, ui.OK("no EC2 instances tagged karpenter.sh/managed-by="+cluster+
 				" — this sweep selects nothing"))
 		}
@@ -507,7 +511,7 @@ func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster
 	}
 
 	insts := strings.Fields(ids)
-	if run.DryRun {
+	if dryRun {
 		fmt.Fprintln(out, ui.Step(fmt.Sprintf("(dry-run) would terminate %d Karpenter instance(s): %s",
 			len(insts), strings.Join(insts, ", "))))
 		return
@@ -577,6 +581,10 @@ func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster
 // Tagging them properly is upstream work — a configuration_values block on the addon — and is
 // filed as such. This is what rackctl can do without it.
 func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
+	orphanedVolumes(ctx, run, run.DryRun, out, cluster, region)
+}
+
+func orphanedVolumes(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster, region string) {
 	if cluster == "" {
 		return
 	}
@@ -596,7 +604,7 @@ func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, clust
 	}
 	ids = strings.TrimSpace(ids)
 	if ids == "" || ids == "None" {
-		if run.DryRun {
+		if dryRun {
 			fmt.Fprintln(out, ui.OK("no available EBS volumes tagged kubernetes.io/cluster/"+cluster+
 				" — this sweep selects nothing"))
 		}
@@ -604,7 +612,7 @@ func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, clust
 	}
 
 	vols := strings.Fields(ids)
-	if run.DryRun {
+	if dryRun {
 		fmt.Fprintln(out, ui.Step(fmt.Sprintf("(dry-run) would delete %d orphaned EBS volume(s): %s",
 			len(vols), strings.Join(vols, ", "))))
 		return

@@ -33,6 +33,12 @@ jobs:
           version: v2.12.2
       - run: go build ./...
       - run: go test -race ./...
+      # A coverage floor that nothing gates on is a number, not a guarantee: it falls
+      # silently, and it falls fastest in the code least pleasant to test — which here is
+      # the code that terminates instances and deletes roles. Runs as a step of `build`
+      # for the same reason lint does, so it gates a merge rather than being advisory.
+      - name: coverage
+        run: ./scripts/coverage.sh
       # Two-layer supply-chain gate. govulncheck is Go-native and
       # reachability-aware (flags only vulnerabilities reachable in the call
       # graph); osv-scanner is the estate-wide OSV-database gate every JS repo
