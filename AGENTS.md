@@ -106,6 +106,18 @@ gates.
 | `scripts/prose.py` | the enforceable subset of `documentation-voice` |
 | `scripts/floor.py` | the anti-vacuity floor: it FEEDS each gate above a known-bad input and reads the exit status, consulting nothing the gate prints about itself |
 
+`make gates` also runs `shellcheck -s sh` over `scripts/*.sh`. It is a tool, not a
+floor-paired gate — the floor discovers scripts in `scripts/`, so a tool invocation in the
+Makefile is outside its reach. The severity flag is load-bearing: the bash-ism diagnostics
+are warnings, and a default-severity run would report them and exit 0.
+
+Shellcheck parses; it does not run. CI also executes both scripts under the runner's
+`/bin/sh`, which is `dash` — asserted in the step rather than assumed, since an image that
+shipped bash as `/bin/sh` would turn the step into a bash run and stop testing what it
+exists to test. Locally the two disagree: `/bin/sh` on macOS is bash in POSIX mode and
+ACCEPTS bash-isms, so a script that works on a developer's machine can still break on
+Debian.
+
 If you add a gate, it needs a known-good and known-bad fixture pair registered in
 `scripts/floor.py`. A gate with no pair fails the floor — a gate is proven by being fed a
 bad input and watched to reject it, and nothing it prints about itself is evidence. It
