@@ -127,18 +127,6 @@
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "opentofu/opentofu",
       "extractVersionTemplate": "^v(?<version>.*)$"
-    },
-    {
-      "customType": "regex",
-      "description": "goreleaser, pinned in a `go install` line so CI can build the release config. No manager reads an inline module path in a run: block.",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "go install github\\.com/goreleaser/goreleaser/v2@(?<currentValue>v[\\d.]+)"
-      ],
-      "datasourceTemplate": "go",
-      "depNameTemplate": "github.com/goreleaser/goreleaser/v2"
     }
   ]
 }

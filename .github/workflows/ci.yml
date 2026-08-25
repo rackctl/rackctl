@@ -155,6 +155,17 @@ jobs:
           # `declare -A` and case-modification expansion. Only executing rejects them.
           /bin/sh ./scripts/install_test.sh
           /bin/sh ./scripts/coverage.sh --controls-only
+      # zizmor: ignore[cache-poisoning]
+      # The audit's shape is real and this job is not it: `install-only` plus
+      # `build --snapshot` publishes nothing, so a poisoned module cache has no artifact to
+      # reach. The job that DOES publish is release.yml, and it runs setup-go with
+      # `cache: false` for exactly this reason.
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          install-only: true
+          # The same constraint the release job resolves, so this step checks the config
+          # against the goreleaser that will actually publish it.
+          version: "~> v2"
       - name: release config
         # The release path was config-read-only: nothing ever ran goreleaser, so a config
         # that had stopped producing binaries would surface at tag time.
@@ -167,7 +178,6 @@ jobs:
         # upstream fails too, which is exactly the trigger .goreleaser.yaml says to revisit
         # this on.
         run: |
-          go install github.com/goreleaser/goreleaser/v2@v2.18.0
           goreleaser build --snapshot --clean --single-target
           # In an `if` condition, so a non-zero status does not end the step under `set -e`
           # and does not need a soft-fail idiom to survive. The status is not the verdict
