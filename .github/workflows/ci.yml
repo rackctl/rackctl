@@ -77,16 +77,11 @@ jobs:
         run: |
           pip install --quiet zizmor==1.16.3
           zizmor --offline --persona regular .github/workflows/
-      # Two-layer supply-chain gate. govulncheck is Go-native and
-      # reachability-aware (flags only vulnerabilities reachable in the call
-      # graph); osv-scanner is the estate-wide OSV-database gate every JS repo
-      # runs, here broadening coverage to the whole module graph. Both are pinned
-      # for reproducible CI and both fail the build.
-      - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
-      - name: osv-scanner
-        uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
-        with:
-          scan-args: |-
-            --recursive
-            ./
+      # The vulnerability scanners are NOT here. Their verdict changes when a CVE is
+      # published, which is not something the commit under test caused — blocking a merge
+      # on the world changing is how a gate teaches people to bypass it. They run on a
+      # schedule instead, blocking there, in .github/workflows/vulnerabilities.yml.
+      #
+      # What stays blocking is what the commit controls: formatting, vet, lint, the build,
+      # the tests, the coverage floors, the gate suite, pin coverage, prose, and the
+      # workflow audit — which runs --offline for exactly this reason.

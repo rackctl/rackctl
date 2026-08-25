@@ -794,3 +794,41 @@ func TestSubstrate_DisclosesThatNothingRoutesAlertsIntoTheSeverityTopics(t *test
 		}
 	}
 }
+
+// A destroy is retried and an apply is not, and the difference is convergence rather than
+// mutation: `terragrunt destroy` re-reads state and reconciles toward empty, so a second
+// attempt removes what is left. An apply that failed partway has already moved state.
+//
+// Driven through a fake terragrunt that fails transiently, so this asserts which Runner
+// method each verb reached rather than which one the source appears to name.
+func TestTG_DestroyRetriesATransientFailureAndApplyDoesNot(t *testing.T) {
+	for _, tc := range []struct {
+		verb    string
+		attempts string
+	}{
+		{"destroy", "3"},
+		{"apply", "1"},
+	} {
+		dir := t.TempDir()
+		counter := filepath.Join(dir, "n")
+		script := "#!/bin/sh\n" +
+			"case \"$*\" in *" + tc.verb + "*) ;; *) exit 0 ;; esac\n" +
+			"n=$(cat " + counter + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " + counter + "\n" +
+			"if [ \"$n\" -lt 3 ]; then echo 'An error occurred (ThrottlingException)' >&2; exit 254; fi\n" +
+			"exit 0\n"
+		if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte(script), 0o755); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		st := &engine.State{Config: baseCfg(), Runner: exec.New(io.Discard),
+			Repos: engine.Repos{LandingZone: t.TempDir()}}
+		_ = tg(context.Background(), st, tc.verb, "network")
+
+		n, _ := os.ReadFile(counter)
+		if strings.TrimSpace(string(n)) != tc.attempts {
+			t.Errorf("%s was attempted %s time(s), want %s", tc.verb,
+				strings.TrimSpace(string(n)), tc.attempts)
+		}
+	}
+}

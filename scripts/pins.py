@@ -40,6 +40,7 @@ REPO = os.environ.get("REPO_ROOT", ".")
 # the thing it exempted.
 NOT_A_PIN = [
     (r"fetch-depth:", "a git history depth, not a version"),
+    (r"\b\d{1,3}(\.\d{1,3}){3}/\d{1,2}\b", "a CIDR block, not a version"),
 ]
 
 
@@ -155,30 +156,49 @@ SHA_PIN = re.compile(r"@[0-9a-f]{40}(\s|$)")
 VERSION_COMMENT = re.compile(r"#[ \t]*v?\d+(\.\d+)*[ \t]*$")
 
 
+# Files a pin can live in. Scanning only .github/workflows would make the PATH the oracle:
+# the expectation "pins live here" would decide what gets read, so a pin added anywhere else
+# is invisible — and invisible is the state this gate exists to prevent.
+SCANNED_SUFFIXES = (".yml", ".yaml", ".sh")
+SCANNED_NAMES = ("Makefile",)
+SKIP_DIRS = {".git", "vendor", "node_modules", "dist", "bin"}
+
+
+def scannable(root):
+    """Yield (repo-relative path, absolute path) for every file a pin could live in."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in sorted(filenames):
+            if name.endswith(SCANNED_SUFFIXES) or name in SCANNED_NAMES:
+                full = os.path.join(dirpath, name)
+                yield os.path.relpath(full, root), full
+
+
 def discover(root):
     pins, exempt_hits = [], {p: 0 for p, _ in NOT_A_PIN}
-    wf_dir = os.path.join(root, ".github", "workflows")
+    files = 0
 
-    if os.path.isdir(wf_dir):
-        for name in sorted(os.listdir(wf_dir)):
-            if not name.endswith((".yml", ".yaml")):
+    for path, full in scannable(root):
+        files += 1
+        try:
+            lines = open(full, encoding="utf-8").readlines()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for n, raw in enumerate(lines, 1):
+            line = blank_comment_body(raw).rstrip()
+            if not line.strip():
                 continue
-            path = os.path.join(".github", "workflows", name)
-            for n, raw in enumerate(open(os.path.join(wf_dir, name)), 1):
-                line = blank_comment_body(raw).rstrip()
-                if not line.strip():
-                    continue
-                exempted = False
-                for pat, _ in NOT_A_PIN:
-                    if re.search(pat, line):
-                        exempt_hits[pat] += 1
-                        exempted = True
-                if exempted:
-                    continue
-                if USES.match(line):
-                    pins.append(("action", path, n, raw.rstrip()))
-                elif VERSION_SHAPED.search(line):
-                    pins.append(("value", path, n, raw.rstrip()))
+            exempted = False
+            for pat, _ in NOT_A_PIN:
+                if re.search(pat, line):
+                    exempt_hits[pat] += 1
+                    exempted = True
+            if exempted:
+                continue
+            if USES.match(line):
+                pins.append(("action", path, n, raw.rstrip()))
+            elif VERSION_SHAPED.search(line):
+                pins.append(("value", path, n, raw.rstrip()))
 
     gomod = os.path.join(root, "go.mod")
     if os.path.isfile(gomod):
@@ -186,12 +206,12 @@ def discover(root):
             if re.match(r"^[ \t]+\S+/\S+ v\d", raw):
                 pins.append(("gomod", "go.mod", n, raw.rstrip()))
 
-    return pins, exempt_hits
+    return pins, exempt_hits, files
 
 
 def check(root, renovate_path, assert_exemptions=False):
     cfg, managers = load_managers(renovate_path)
-    pins, exempt_hits = discover(root)
+    pins, exempt_hits, files = discover(root)
     problems = []
 
     if not pins:
@@ -202,7 +222,7 @@ def check(root, renovate_path, assert_exemptions=False):
         "gomod" in json.dumps(cfg.get("packageRules", []))
         for _ in [0]) or "config:recommended" in cfg.get("extends", [])
 
-    counts = {"action": 0, "value": 0, "gomod": 0}
+    counts = {"action": 0, "value": 0, "gomod": 0, "files": files}
     for kind, path, n, raw in pins:
         counts[kind] += 1
         line = blank_comment_body(raw)
@@ -406,7 +426,7 @@ def main():
         sys.exit(1)
 
     print(f"pins: {counts['action']} action ref(s), {counts['value']} value pin(s), "
-          f"{counts['gomod']} module(s) — all watched")
+          f"{counts['gomod']} module(s) across {counts['files']} scanned file(s) — all watched")
     for m in managers:
         print(f"  {m.dep}: {m.hits} pin(s) matched")
 

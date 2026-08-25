@@ -1,0 +1,46 @@
+name: vulnerabilities
+
+# Scheduled, not blocking on a pull request.
+#
+# Whether a CVE landed overnight is not something a commit caused, so failing a merge on
+# it punishes whoever pushed next and teaches everyone to bypass the gate. What the commit
+# controls — the dependency versions themselves — is watched by Renovate and asserted by
+# scripts/pins.py in ci.yml. What the world controls is watched here.
+#
+# It DOES fail. A scheduled run that only reports is a dashboard nobody opens; a red run
+# on the default branch is the signal, and the fix is a dependency bump rather than a
+# revert.
+
+on:
+  schedule:
+    # Daily, early UTC. A CVE published overnight is actionable at the start of a day
+    # rather than whenever someone next opens a pull request.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+          cache: true
+      # Two layers, and they answer different questions. govulncheck is Go-native and
+      # reachability-aware, so it reports only vulnerabilities this code can actually
+      # reach; osv-scanner reads the whole module graph against the OSV database, which
+      # catches what reachability analysis prunes but a transitive bump would fix.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+      - name: osv-scanner
+        uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+        with:
+          scan-args: |-
+            --recursive
+            ./

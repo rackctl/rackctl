@@ -345,3 +345,53 @@ func TestRetryRead_CancellationBeatsTheBackoff(t *testing.T) {
 		t.Fatalf("a cancelled context must end the retry loop, got %v", err)
 	}
 }
+
+// Reconcile retries where Run does not, and the difference is CONVERGENCE rather than
+// mutation. A `terragrunt destroy` re-reads state and reconciles toward empty, so a second
+// attempt removes what is left rather than repeating what the first completed — and the
+// alternative to retrying a throttle mid-teardown is a stopped teardown with resources
+// still billing.
+func TestReconcile_RetriesAConvergingMutation(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "n")
+	script := "#!/bin/sh\n" +
+		"n=$(cat " + counter + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " + counter + "\n" +
+		"if [ \"$n\" -lt 3 ]; then echo 'An error occurred (ThrottlingException)' >&2; exit 254; fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "converge"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	r := New(&bytes.Buffer{})
+	if err := r.Reconcile(context.Background(), "converge"); err != nil {
+		t.Fatalf("a throttle that clears must not fail a converging mutation: %v", err)
+	}
+	if n, _ := os.ReadFile(counter); strings.TrimSpace(string(n)) != "3" {
+		t.Fatalf("attempted %s times, want 3", strings.TrimSpace(string(n)))
+	}
+}
+
+// Reconcile is not a licence to retry anything. A non-transient failure — the shapes the
+// backoff cannot remediate — still fails on the first attempt, or the retry is decorative
+// and only delays the answer.
+func TestReconcile_DoesNotRetryANonTransientFailure(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "n")
+	script := "#!/bin/sh\n" +
+		"n=$(cat " + counter + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " + counter + "\n" +
+		"echo 'Error: DependencyViolation' >&2; exit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "blocked"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	r := New(&bytes.Buffer{})
+	if err := r.Reconcile(context.Background(), "blocked"); err == nil {
+		t.Fatal("a DependencyViolation must fail the teardown, not be retried")
+	}
+	if n, _ := os.ReadFile(counter); strings.TrimSpace(string(n)) != "1" {
+		t.Fatalf("attempted %s times — retrying a failure the backoff cannot remediate only "+
+			"delays the answer", strings.TrimSpace(string(n)))
+	}
+}

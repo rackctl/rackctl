@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,15 +35,20 @@ const (
 	// already carry --request-timeout=30s for the same reason.
 	DefaultQueryTimeout = 2 * time.Minute
 
-	// DefaultReadAttempts is how many times a READ is tried before its error stands.
+	// DefaultReadAttempts is how many times a READ, or a converging mutation, is tried
+	// before its error stands.
 	//
-	// Reads only, and the asymmetry is the whole design. A cloud API answering
-	// ThrottlingException or a resolver dropping one packet is the case retry exists for,
-	// and a list or describe is idempotent by construction — asking twice costs a request.
-	// A MUTATION is not: re-running a terragrunt apply that failed halfway is a second
-	// apply against state the first one already moved, and an installer that does that on
-	// the operator's behalf is worse than one that stops and says so. Run therefore never
-	// retries, and that is deliberate rather than unfinished.
+	// The test is CONVERGENCE, not whether the call mutates. An operation that re-derives
+	// its work from observed state on each attempt can be retried safely, because the
+	// second attempt does not repeat what the first completed — it looks again and does
+	// what is left. A list or describe qualifies trivially. So does `terragrunt destroy`,
+	// which re-reads state and reconciles toward empty.
+	//
+	// A NON-CONVERGENT mutation never retries: anything that appends, increments, charges,
+	// sends or issues. `terragrunt apply` is in that class in practice — re-running one
+	// that failed halfway is a second apply against state the first already moved — so Run
+	// does not retry, and a caller that knows its call converges opts in through Reconcile
+	// with the reason written at the call site.
 	//
 	// Three, because the failures worth retrying are transient in seconds — a throttle, a
 	// re-elected endpoint, a DNS blip. A read still failing on the third attempt is not
@@ -194,7 +200,79 @@ func truncate(s string) string {
 	return s[:max] + "… (truncated)"
 }
 
+// Reconcile executes a MUTATION that re-derives its work from observed state on each
+// attempt, retrying transient failures the way a read is retried.
+//
+// Separate from Run so the contract is visible at every call site rather than inferred:
+// the caller is asserting that a second attempt does not repeat what the first completed.
+// That is a claim about the specific command, not about retries being acceptable in
+// general, and the reason belongs beside the call.
+//
+// Wrong for anything that appends, increments, charges, sends or issues. Right for a
+// teardown, where the alternative to retrying a throttle is a stopped teardown with
+// resources still billing.
+func (r *Runner) Reconcile(ctx context.Context, name string, args ...string) error {
+	_, err := r.retryRead(ctx, name, func() (string, error) {
+		return "", r.runTee(ctx, name, args...)
+	})
+	return err
+}
+
+// runTee is Run with the child's stderr TEED rather than only streamed: it reaches the
+// operator as it happens AND is kept for the returned error.
+//
+// Run streams both pipes straight to the operator, which is right for a foreground apply
+// and leaves nothing in the error but an exit status. That is fine when the caller only
+// reports the failure, and wrong the moment the caller has to CLASSIFY it: retryable reads
+// the transient shape by name, so a Reconcile built on Run would decide whether to retry
+// from a string that says only "terragrunt: exit status 254" and would never retry
+// anything. The diagnostic has to survive to the point where the decision is made.
+func (r *Runner) runTee(ctx context.Context, name string, args ...string) error {
+	line := name + " " + strings.Join(args, " ")
+	if r.DryRun {
+		fmt.Fprintf(r.Out, "    → (dry-run) %s\n", line)
+		return nil
+	}
+	fmt.Fprintf(r.Out, "    → %s\n", line)
+	timeout := r.runTimeout()
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	env, err := r.env(ctx)
+	if err != nil {
+		return fmt.Errorf("%s: resolving the identity to run as: %w", name, err)
+	}
+	cmd := exec.CommandContext(child, name, args...)
+	cmd.Dir = r.Dir
+	cmd.Env = env
+	// os/exec copies stdout and stderr on separate goroutines UNLESS the two are the same
+	// writer, in which case it hands both the one descriptor. Teeing stderr breaks that
+	// identity, so both must be serialised explicitly or the two copiers race on r.Out.
+	// Plain Run is safe only because it assigns r.Out to both.
+	out := &syncWriter{w: r.Out}
+	var errb bytes.Buffer
+	cmd.Stdout = out
+	cmd.Stderr = io.MultiWriter(out, &errb)
+	if err := cmd.Run(); err != nil {
+		return fail(ctx, child, name, timeout, errb.String(), err)
+	}
+	return nil
+}
+
+// syncWriter serialises writes from the two copier goroutines os/exec starts.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
 // Run executes name+args, streaming output. In dry-run it prints the command.
+//
+// Never retried. A caller whose command converges uses Reconcile instead.
 func (r *Runner) Run(ctx context.Context, name string, args ...string) error {
 	line := name + " " + strings.Join(args, " ")
 	if r.DryRun {

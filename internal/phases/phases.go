@@ -328,6 +328,22 @@ func tg(ctx context.Context, st *engine.State, verb, component string, extraEnv 
 	// terragrunt 1.0+ takes global flags (--working-dir, --non-interactive) before
 	// the command; -auto-approve is a tofu flag after it. The old post-command
 	// --terragrunt-working-dir is silently ignored by 1.0.x (runs in the cwd).
+	//
+	// A DESTROY may be retried; an APPLY may not, and the difference is convergence rather
+	// than mutation. `terragrunt destroy` re-reads state and reconciles toward empty, so a
+	// second attempt does not repeat a deletion the first completed — it looks again and
+	// removes what is left. `terragrunt apply` has no such guarantee: one that failed
+	// partway has already moved state, and re-running it on the operator's behalf is a
+	// second apply against that moved state.
+	//
+	// The asymmetry earns its place on the teardown path specifically. The alternative to
+	// retrying a throttle mid-destroy is a stopped teardown with the EKS control plane, the
+	// VPC and the NAT gateway still billing — the exact outcome the reverse walk exists to
+	// prevent. Only the named transient shapes in internal/exec retry; anything else, an
+	// AccessDenied or a DependencyViolation, fails on the first attempt and is reported.
+	if verb == "destroy" {
+		return st.Runner.Reconcile(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", verb, "-auto-approve")
+	}
 	return st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", verb, "-auto-approve")
 }
 
