@@ -228,6 +228,13 @@ fi
 self_test || exit 1
 [ "${1:-}" = "--controls-only" ] && exit 0
 
+# Preconditions asserted before anything is run, so a failure names what is missing rather
+# than surfacing as whatever the tool says about it. `go test` in a directory with no module
+# reports "directory prefix . does not contain main module", which is a true sentence about
+# go and tells the reader nothing about this gate.
+command -v go >/dev/null 2>&1 || { echo "coverage: go is not installed; no verdict was reached" >&2; exit 2; }
+[ -f go.mod ] || { echo "coverage: no go.mod here; this gate measures THIS module and was run somewhere else" >&2; exit 2; }
+
 go test -coverprofile="$PROFILE" -covermode=set ./... >/dev/null
 
 # Not piped into check_report. A pipeline's status is its LAST element, so a failing

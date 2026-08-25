@@ -39,6 +39,12 @@ import tempfile
 
 REPO = os.environ.get("REPO_ROOT", ".")
 
+# Floors on what was EXAMINED, set WELL UNDER the real counts. "Greater than zero"
+# catches a gate that reached nothing and misses one that reached almost nothing.
+# Sized to fire on "matched almost nothing", so normal growth needs no edit here.
+# Real counts when written: 9 action refs, 11 value pins, 28 modules, 10 files.
+FLOOR = {"action": 4, "value": 4, "gomod": 12, "files": 5}
+
 # Repo-hygiene checks — a dead exemption, a manager matching nothing — are findings about
 # THIS tree, not about whether the gate can reject. They run only against the default root.
 # A fixture built to exercise one rule carries neither, so asserting them there would make
@@ -444,6 +450,14 @@ def main():
         for p in problems:
             print(f"  {p}", file=sys.stderr)
         sys.exit(1)
+
+    if SCANNING_THE_REPO:
+        low = [f"{k} {counts.get(k, 0)} < floor {v}"
+               for k, v in FLOOR.items() if counts.get(k, 0) < v]
+        if low:
+            print(f"pins: {'; '.join(low)}. A gate that stopped reaching the tree reports "
+                  "the same clean line as one that found every pin watched.", file=sys.stderr)
+            sys.exit(1)
 
     print(f"pins: {counts['action']} action ref(s), {counts['value']} value pin(s), "
           f"{counts['gomod']} module(s) across {counts['files']} scanned file(s) — all watched")

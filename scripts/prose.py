@@ -36,6 +36,13 @@ REPO = os.environ.get("REPO_ROOT", ".")
 # every fixture fail and prove nothing about the gate.
 SCANNING_THE_REPO = "REPO_ROOT" not in os.environ
 
+# Floors on what was EXAMINED, set WELL UNDER the real counts. "Greater than zero" catches a
+# gate that reached nothing and misses one that reached almost nothing — a walk that starts
+# skipping a directory, a matcher that stops recognising a comment form. Sized to fire on
+# "matched almost nothing" rather than on "someone deleted a file", so normal growth and
+# pruning need no edit here. Below floor is a non-zero exit with a sentence, not a warning.
+FLOOR = {"files outside": 40, "prose spans": 4000, "path claims": 15}
+
 SKIP_DIRS = {".git", "vendor", "node_modules", "dist", "bin"}
 PROSE_SUFFIXES = (".go", ".md", ".yml", ".yaml", ".sh", ".py", ".json", ".tf", ".hcl", ".txt")
 PROSE_NAMES = ("Makefile", "Dockerfile")
@@ -474,6 +481,12 @@ def run_controls():
         sys.exit(1)
 
 
+def scanned_outside(root, own):
+    """How many scanned files are repo content rather than the gate's own directory."""
+    return sum(1 for rel, _ in walk(root)
+               if not any(rel == d or rel.startswith(d + os.sep) for d in own))
+
+
 def main():
     run_controls()
     if "--controls-only" in sys.argv:
@@ -489,13 +502,50 @@ def main():
             print(f"      {remedy}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"prose: {scanned} file(s) scanned, no tallies, internal references, "
-          f"agent-addressed prose or unowned markers")
+    # PRINTING a denominator is not GATING on it. A rule that examined nothing passes
+    # exactly like a rule that examined everything and found nothing, and the line saying so
+    # scrolls past in a green run that nobody reads. Every rule here has targets in this
+    # repository, so zero means the walk stopped reaching them, not that the tree got tidier.
+    # Only when pointed at THIS repository. Every rule here has targets, so zero means the
+    # walk stopped reaching them. It is not a law about any tree: a fixture legitimately
+    # exercises one rule, and demanding all of them would make this gate reject a known-good
+    # input — which its floor correctly reports as a gate that fails everything.
+    vacuous = [what for what, n in examined.items() if n == 0] if SCANNING_THE_REPO else []
+
+    # And the count has to be of REPO CONTENT, not of whatever the walk happened to match.
+    # Pointed at a directory holding only these gate scripts, the prose-span count is in the
+    # hundreds — their own comments — while nothing the gate exists to check is present at
+    # all. A floor of "at least one span" is satisfied by the gate reading itself.
+    # This half is unconditional, and it is the one that catches the case a rule-count floor
+    # cannot: a tree holding only these gate scripts yields prose spans in the HUNDREDS, all
+    # of them the gate's own comments, while nothing it exists to check is present.
+    own = {"scripts", "testdata"}
+    outside = scanned_outside(REPO, own)
+    measured = {"files outside": outside, **examined}
+    below = [f"{k} {v} < floor {FLOOR[k]}" for k, v in measured.items()
+             if SCANNING_THE_REPO and v < FLOOR[k]]
+
+    if vacuous or outside == 0 or below:
+        if vacuous:
+            print(f"prose: {', '.join(vacuous)}: 0 examined. Every rule here has targets in "
+                  "this repository, so a rule that asserted NOTHING did not find a tidier "
+                  "tree — it stopped reaching one.", file=sys.stderr)
+        if below:
+            print(f"prose: {'; '.join(below)}. A floor well under the real count is what "
+                  "separates a rule that found nothing from a rule that stopped looking; "
+                  "if the tree really did shrink this far, move the floor deliberately.",
+                  file=sys.stderr)
+        if outside == 0:
+            print(f"prose: {scanned} file(s) scanned and NONE outside {sorted(own)}. The gate "
+                  "read its own comments and nothing it exists to check; a floor counting "
+                  "files matched rather than repo content present is satisfied by that.",
+                  file=sys.stderr)
+        sys.exit(1)
+
+    print(f"prose: {scanned} file(s) scanned ({outside} outside {sorted(own)}), no tallies, "
+          f"internal references, agent-addressed prose or unowned markers")
     for what, n in examined.items():
-        if n == 0:
-            print(f"  {what}: 0 examined — this rule asserted NOTHING on this tree")
-        else:
-            print(f"  {what}: {n} examined")
+        print(f"  {what}: {n} examined")
 
 
 if __name__ == "__main__":
