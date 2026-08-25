@@ -1,0 +1,62 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "postUpdateOptions": ["gomodTidy"],
+  "packageRules": [
+    {
+      "description": "Action pins are SHAs. Renovate reads the adjacent version comment to know what the SHA currently is, and rewrites both together.",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    },
+    {
+      "description": "The Go toolchain moves as one. go.mod, both workflows and the toolchain directive have to agree, or a clean local run stops predicting a clean CI run.",
+      "matchPackageNames": ["go", "golang"],
+      "groupName": "go toolchain"
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "The Go version both workflows install. Native managers do not read setup-go's input, so without this the CI toolchain silently diverges from go.mod.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": ["go-version:\\s*\"(?<currentValue>\\d+\\.\\d+(\\.\\d+)?)\""],
+      "depNameTemplate": "go",
+      "datasourceTemplate": "golang-version",
+      "versioningTemplate": "npm"
+    },
+    {
+      "description": "golangci-lint's own version, which is an input to the action rather than the action's tag. Pinned to what Homebrew ships so a clean local run means a clean CI run — and that only holds while something watches it.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.ya?ml$/"],
+      "matchStrings": ["version:\\s*(?<currentValue>v\\d+\\.\\d+\\.\\d+)\\s*$"],
+      "depNameTemplate": "golangci/golangci-lint",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "govulncheck, pinned in a `go run` line. No manager reads an inline module@version in a shell command.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.ya?ml$/"],
+      "matchStrings": ["golang\\.org/x/vuln/cmd/govulncheck@(?<currentValue>v\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "golang.org/x/vuln",
+      "datasourceTemplate": "go"
+    },
+    {
+      "description": "zizmor, pinned in the pip install that provides the workflow audit. An unwatched security gate is one that stops catching what its newer rules would.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.ya?ml$/"],
+      "matchStrings": ["zizmor==(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "zizmor",
+      "datasourceTemplate": "pypi"
+    },
+    {
+      "description": "goreleaser's own version constraint, an input to the action rather than its tag.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/release\\.ya?ml$/"],
+      "matchStrings": ["version:\\s*\"~>\\s*(?<currentValue>v\\d+)\""],
+      "depNameTemplate": "goreleaser/goreleaser",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "loose"
+    }
+  ]
+}

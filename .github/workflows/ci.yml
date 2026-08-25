@@ -5,12 +5,26 @@ on:
     branches: [main]
   pull_request:
 
+# The default GITHUB_TOKEN is read-write on a push to main. Nothing in this workflow
+# writes anything, so the token it runs with should not be able to — an action compromised
+# anywhere in the graph inherits whatever the job holds.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Actions are pinned to a commit SHA, not a tag. A tag is mutable: whoever can move
+      # it can change what runs here, and the version comment is what Renovate reads to
+      # keep the pin current.
+      #
+      # persist-credentials: false because checkout otherwise leaves the job token in
+      # .git/config, where every later step — and every action they call — can read it.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26"
           cache: true
@@ -28,7 +42,7 @@ jobs:
       # Pinned to the same version developers get from Homebrew, so a clean local run means a
       # clean CI run. Config in .golangci.yml.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9.3.0
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.12.2
       - run: go build ./...
@@ -39,6 +53,24 @@ jobs:
       # for the same reason lint does, so it gates a merge rather than being advisory.
       - name: coverage
         run: ./scripts/coverage.sh
+      # Every gate in scripts/ proves it can still reject before its verdict is believed.
+      # A check that cannot fail is worse than no check, because it reports success — and
+      # both halves rot independently: a self-test nothing invokes, and a CI step that
+      # never runs one. This step is the second half.
+      - name: gate self-tests
+        run: ./scripts/gates.sh
+      # Every version the repo pins is matched by a Renovate manager. Asserted rather than
+      # described: a comment claiming full coverage goes stale silently at the first edit
+      # that adds a pin, while this fails the build.
+      - name: renovate pin coverage
+        run: ./scripts/pins.sh
+      # With no package manifest beyond go.mod, the workflows ARE a dependency surface —
+      # every action runs with the job's token and permissions. --offline so the verdict is
+      # a function of the commit under test rather than of what GitHub's API answers today.
+      - name: zizmor
+        run: |
+          pip install --quiet zizmor==1.16.3
+          zizmor --offline --persona regular .github/workflows/
       # Two-layer supply-chain gate. govulncheck is Go-native and
       # reachability-aware (flags only vulnerabilities reachable in the call
       # graph); osv-scanner is the estate-wide OSV-database gate every JS repo
@@ -47,7 +79,7 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: osv-scanner
-        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
         with:
           scan-args: |-
             --recursive
