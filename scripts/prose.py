@@ -21,9 +21,12 @@ exists to catch, and the clean fixture is asserted to pass first — without tha
 proves nothing, since the gate might have been failing for an unrelated reason all along.
 """
 
+import ast
+import io
 import os
 import re
 import sys
+import tokenize
 
 REPO = os.environ.get("REPO_ROOT", ".")
 
@@ -114,6 +117,34 @@ HASH_COMMENT = re.compile(r"(?:^|\s)#(.*)$")
 GO_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"|`([^`]*)`')
 
 
+def python_prose(text):
+    """Yield (lineno, prose) for Python, via the AST and the tokenizer.
+
+    A DOCSTRING IS A STRING, NOT A COMMENT. Scanning `#` lines alone misses every module,
+    class and function docstring — which in a gate is where most of the prose lives, and
+    where a gate's own documentation quotes the very shapes it rejects. Comment-blanking
+    would not have touched them either: the docstring is exactly where "comments" and
+    "string bodies" stop being separate views of the source.
+
+    So the AST supplies every string constant, including docstrings, and the tokenizer
+    supplies the comments. Both read the file the way Python does rather than the way a
+    regex guesses at it.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield node.lineno, node.value
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT:
+                yield tok.start[0], tok.string.lstrip("#")
+    except (tokenize.TokenError, IndentationError):
+        return
+
+
 def prose_lines(path, text):
     """Yield (lineno, prose) for every human-readable span in a file.
 
@@ -121,6 +152,9 @@ def prose_lines(path, text):
     one that reads only code misses the comment standing where an implementation should be.
     """
     suffix = os.path.splitext(path)[1]
+    if suffix == ".py":
+        yield from python_prose(text)
+        return
     for n, raw in enumerate(text.splitlines(), 1):
         if suffix == ".go":
             m = GO_LINE_COMMENT.search(raw)
@@ -128,7 +162,7 @@ def prose_lines(path, text):
                 yield n, m.group(1)
             for sm in GO_STRING.finditer(raw):
                 yield n, sm.group(1) or sm.group(2) or ""
-        elif suffix in (".yml", ".yaml", ".sh", ".py"):
+        elif suffix in (".yml", ".yaml", ".sh"):
             m = HASH_COMMENT.search(raw)
             if m:
                 yield n, m.group(1)
@@ -202,8 +236,9 @@ def check(root, assert_exemptions=False):
         for n, prose in prose_lines(rel, text):
             examined["prose spans"] += 1
             for rule, pattern, remedy in RULES:
-                m = pattern.search(prose)
-                if m:
+                # finditer, not search: taking the first match reports one violation on a
+                # span carrying several, so clearing it only reveals the next.
+                for m in pattern.finditer(prose):
                     findings.append((rel, n, rule, m.group(0).strip(), remedy))
 
     path_exempt = {r.pattern: 0 for r, _ in NOT_A_REPO_PATH}

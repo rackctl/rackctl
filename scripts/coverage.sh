@@ -77,8 +77,20 @@ check_report() {
     # Match the function by name in its own file, so a same-named function elsewhere
     # cannot stand in for it — a silent substitution would report a pass for a function
     # nobody tested.
-    got="$(printf '%s\n' "$report" \
-      | awk -v f="/$file:" -v n="$func" '$0 ~ f && $(NF-1) == n { gsub(/%/,"",$NF); print $NF; exit }')"
+    #
+    # EVERY match, not the first. A search that takes the first hit and stops cannot tell
+    # one match from several, and if two ever collide the one it happens to reach first
+    # decides the verdict — which is how a dead copy above a live one wins a search. More
+    # than one is itself the finding: the entry no longer names exactly one function.
+    matches="$(printf '%s\n' "$report" \
+      | awk -v f="/$file:" -v n="$func" '$0 ~ f && $(NF-1) == n { gsub(/%/,"",$NF); print $NF }')"
+    count="$(printf '%s' "$matches" | grep -c . || true)"
+    if [ "$count" -gt 1 ]; then
+      echo "coverage: $file:$func matches $count entries in the profile ($(printf '%s' "$matches" | tr '\n' ' ')) — the entry no longer names exactly one function, so which one is measured is arbitrary" >&2
+      status=1
+      continue
+    fi
+    got="$matches"
 
     if [ -z "$got" ]; then
       echo "coverage: $file:$func is on the destructive-path list and the profile does not name it — renamed, moved, or deleted without updating this list" >&2
@@ -181,6 +193,13 @@ self_test() {
 
   expect_reject "a report with no total line" \
     "$(printf '%s\n' "$passing" | grep -v '^total:')"
+
+  # Two entries matching one list item: whichever a first-hit search reached would decide
+  # the verdict, and a dead copy above a live one is exactly how that goes wrong.
+  expect_reject "an entry matching more than one function" \
+    "$(printf '%s\n' "$passing" \
+      | awk '$(NF-1) == "Proves" && !done { print; sub(/100\.0%/, "31.41%"); done=1 } { print }')" \
+    "31.41%"
 
   # A same-named function in another file must not satisfy the entry it is not.
   expect_reject "a same-named function standing in from the wrong file" \
