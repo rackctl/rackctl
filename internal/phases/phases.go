@@ -73,18 +73,16 @@ func CoreComponents(cfg *config.Config) []string {
 	if cfg.FullObservability() {
 		comps = append(comps, "managed-monitoring") // must precede cluster-bootstrap
 	}
-	// observability is NOT conditional, and it is gated on nothing: it publishes the three
+	// observability is NOT conditional and is gated on nothing: it publishes the three
 	// /eks-agent-platform/<cluster>/observability/alerts_{critical,warning,info}_topic_arn
-	// parameters unconditionally, and it is their sole producer. rackctl applied it nowhere at
-	// all until now, so every rackctl-installed cluster had consumers of that contract and no
-	// producer.
+	// parameters unconditionally, and it is their sole producer. Without it a cluster has
+	// consumers of that contract and nothing on the other end.
 	//
-	// Its POSITION here is currently arbitrary — no component rackctl applies reads those
-	// parameters, so only the phase boundary (substrate before gitops) is load-bearing. It is
-	// placed early because the consumer that WILL bind is eks-agent-platform's kill-switch,
+	// Its position here is not load-bearing — no component rackctl applies reads those
+	// parameters, so only the phase boundary (substrate before gitops) constrains it. It is
+	// placed early because the consumer that binds is eks-agent-platform's kill-switch,
 	// whose burn-rate rules resolve both topic ARNs through unguarded `data` blocks at PLAN
-	// time. rackctl does not apply that tree yet; when it does, this ordering stops being
-	// arbitrary and starts being required.
+	// time, and that ordering becomes required the moment rackctl applies that tree.
 	comps = append(comps, "observability")
 	// druid is the per-tenant analytics substrate (Aurora Serverless + optionally MSK), gated
 	// because it is real money and most platforms never need it. Its live leaf is
@@ -768,6 +766,19 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 			"Tempo, grafana-operator and the dashboards, with a telemetry gap while it converges — see "+
 			"eks-gitops/docs/runbooks/observability-tier.md")
 	}
+
+	// The three severity topics exist and nothing routes to them, which is a gap an
+	// operator has to close deliberately rather than discover from a page that never
+	// arrived. observability-slo's fleet-alerting contract is per-cluster composite alarms
+	// notifying one SNS topic per severity; rackctl provisions the topics, and the routing
+	// that would deliver an alert into them is not expressible through any input rackctl
+	// holds. Saying so is the honest half of shipping the producer.
+	note(st, "observability: publishing the three severity SNS topics under "+
+		"/eks-agent-platform/%s/observability/alerts_{critical,warning,info}_topic_arn. "+
+		"NOTHING rackctl applies routes alerts into them — wire a Grafana contact point (or "+
+		"an alertmanager receiver) at those ARNs out of band, or the topics stay silent and "+
+		"a page that never arrives is indistinguishable from a healthy cluster",
+		st.Config.ClusterName())
 
 	// druid is real money and opt-in. landing-zone sets skip_final_snapshot /
 	// final_snapshot_identifier on Aurora and force_destroy on the per-tenant buckets —

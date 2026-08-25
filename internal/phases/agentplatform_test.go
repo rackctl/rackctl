@@ -361,8 +361,9 @@ func TestAgentPlatformTeardown_LeavesTheAccountRootsAndSaysSo(t *testing.T) {
 	}
 }
 
-// And opting in must say what it costs, because the operator is now doing the thing O14 exists
-// to prevent — deliberately, which is fine, and silently, which is not.
+// And opting in must say what it costs. The operator is deliberately removing an
+// account-wide singleton that every other environment shares, which is fine; doing it
+// silently is not.
 func TestAgentPlatformTeardown_OptingInWarnsItIsAccountWide(t *testing.T) {
 	st, out := apState(t)
 	noteAccountScopedTeardown(st, allAPComponents(), AgentPlatformTeardown{AccountScoped: true})

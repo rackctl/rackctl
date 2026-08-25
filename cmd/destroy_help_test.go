@@ -45,7 +45,7 @@ func TestDestroyHelp_DisclosesTheBypassGovernanceRequirement(t *testing.T) {
 	}
 	for _, stale := range []string{"do not\nyet accept", "until that lands upstream"} {
 		if strings.Contains(destroyCmd.Long, stale) {
-			t.Errorf("destroy long help still describes the retired O5 gap: %q", stale)
+			t.Errorf("destroy long help still describes a bucket-teardown gap that no longer exists: %q", stale)
 		}
 	}
 }

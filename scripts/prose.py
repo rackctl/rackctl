@@ -40,6 +40,7 @@ RULES = [
         re.compile(r"""(?xi)
             \bledger\s+O\d+\b            # "ledger O27" — an internal tracker
           | \(\s*O\d{1,2}\s*\)           # "(O24)"
+          | (?-i:\bO\d{1,2}\b)           # a bare "O1", the same id without its prefix
           | \b[a-z][\w-]*\#\d+\b         # "landing-zone#205" — a cross-repo PR
           | (?<![\w/])\#\d{1,5}\b        # "(#16)" — a bare issue number
           | \btarget\s+\d+\b             # "once target 11 lands" — a roadmap item
@@ -255,6 +256,7 @@ package x
 CONTROLS = [
     ("a ledger id", CLEAN + "\n// Settled upstream. Ledger O27.\n"),
     ("a bracketed ledger id", CLEAN + "\n// The Neuron half went first (O24).\n"),
+    ("a bare ledger id with no prefix", CLEAN + "\n// O1 settled the teardown wedge upstream.\n"),
     ("a cross-repo PR reference", CLEAN + "\n// Added by landing-zone#205.\n"),
     ("a bare issue number", CLEAN + "\n// Re-runnable by design (#16).\n"),
     ("a roadmap item", CLEAN + "\n// Available once target 11 lands.\n"),

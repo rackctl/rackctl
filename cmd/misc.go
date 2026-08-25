@@ -54,7 +54,9 @@ var (
 	destroyForceBuckets bool
 	// destroyAccountScoped permits removing the two eks-agent-platform roots under live/org.
 	// Off by default because they are shared by every environment in the account, so a single
-	// environment's teardown removing them is O14's failure arriving through the destroy door.
+	// environment's teardown removing them takes an account-wide singleton from every other
+	// environment — the same failure as creating one per environment, arriving through the
+	// destroy door rather than the apply door.
 	destroyAccountScoped bool
 )
 

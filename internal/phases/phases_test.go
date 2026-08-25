@@ -715,9 +715,9 @@ func TestComponentEnv_AdoptVarsOnlyReachNetwork(t *testing.T) {
 	}
 }
 
-// druid is opt-in real money. O1 settled the teardown wedge upstream; the apply note now
-// names the substrate and points at the two-act force_destroy_buckets path for non-dev,
-// rather than claiming the cluster can never come down.
+// druid is opt-in real money. The apply note names the substrate and points at the two-act
+// force_destroy_buckets path outside development, rather than claiming the cluster can
+// never come down — landing-zone sets skip_final_snapshot and force_destroy, so it can.
 func TestSubstrate_NotesDruidWhenEnabled(t *testing.T) {
 	var out strings.Builder
 	run := exec.New(&out)
@@ -732,7 +732,7 @@ func TestSubstrate_NotesDruidWhenEnabled(t *testing.T) {
 		t.Fatalf("enabling druid must note that the analytics substrate is being applied.\ngot:\n%s", out.String())
 	}
 	if strings.Contains(out.String(), "will not tear down cleanly") {
-		t.Fatalf("O1 settled the teardown wedge — the old permanent-wedge warning must go.\ngot:\n%s", out.String())
+		t.Fatalf("a druid teardown is not a permanent wedge — the note must not say it is.\ngot:\n%s", out.String())
 	}
 }
 
@@ -771,5 +771,26 @@ func TestCoreComponents_FleetHubTracksTheEKSFleetGate(t *testing.T) {
 	// It reads the cluster component's OIDC outputs, so it cannot precede it.
 	if slices.Index(got, "fleet-hub") < slices.Index(got, "cluster") {
 		t.Errorf("fleet-hub depends on the cluster component's OIDC outputs and must follow it:\n%v", got)
+	}
+}
+
+// The three severity SNS topics are provisioned and nothing routes alerts into them.
+//
+// That gap must be stated at apply time, not left to a comment. A topic with no route is
+// indistinguishable from a working one until the page that never arrives is also the
+// evidence it was needed, so the disclosure is the honest half of shipping the producer.
+func TestSubstrate_DisclosesThatNothingRoutesAlertsIntoTheSeverityTopics(t *testing.T) {
+	var out strings.Builder
+	run := exec.New(&out)
+	run.DryRun = true
+	st := &engine.State{Config: baseCfg(), Runner: run, Repos: engine.Repos{LandingZone: t.TempDir()}}
+
+	_ = (substrate{}).Run(context.Background(), st)
+
+	got := out.String()
+	for _, want := range []string{"alerts_{critical,warning,info}_topic_arn", "NOTHING", "out of band"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the operator must be told the topics have no consumer — %q missing:\n%s", want, got)
+		}
 	}
 }
