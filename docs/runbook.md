@@ -130,6 +130,21 @@ aws ec2 delete-volume --volume-id <id>
 own control plane, VPC and NAT gateways, frequently in another account, and this hub is the
 only thing that knows they exist. Tear the spokes down first.
 
+## Where the output went
+
+`rackctl apply --tui` owns the terminal, so subprocess output cannot go to stdout. It is
+written to a transcript instead, and the path is printed when the view exits — on success
+as well as on failure, because a run that worked is also the one you come back to when
+something turns out to be wrong later.
+
+```
+transcript: ~/.rackctl/<org>/logs/apply-1234567890.log
+```
+
+The most recent line is also rendered under the running phase, so a long wait shows what it
+is waiting on. Without `--tui`, output goes to stdout as it happens and no transcript is
+written.
+
 ## Diagnosing after the fact
 
 `rackctl check` runs the pre-spend checks and, when the ambient kubeconfig points at this
