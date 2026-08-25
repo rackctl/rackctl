@@ -1317,7 +1317,7 @@ func (portal) Run(ctx context.Context, st *engine.State) error {
 		sub.DBHost, sub.DBSecretARN)
 
 	args := []string{
-		"upgrade", "--install", "portal", portalChartRef(st),
+		"upgrade", "--install", "portal", portalChartRef(ctx, st),
 		"--namespace", ns, "--create-namespace",
 		"--set", "externalSecret.enabled=true",
 		"--set", "externalSecret.relationalSecretArn=" + sub.DBSecretARN,
@@ -1389,7 +1389,7 @@ var portalTenantValues = []string{"externalSecret", "tenantInfra"}
 // which portal this install is. Reaching past that for whatever GHCR published last
 // defeats the pin exactly the way an ApplicationSet pinning its own revision and letting
 // children track main does — a pinned install that quietly deploys something else.
-func portalChartRef(st *engine.State) string {
+func portalChartRef(ctx context.Context, st *engine.State) string {
 	const published = "oci://ghcr.io/nanohype/portal/charts/portal"
 
 	checkout := func(why string) string {
@@ -1408,7 +1408,7 @@ func portalChartRef(st *engine.State) string {
 				"a portal the pin does not name", ref))
 	}
 
-	out, err := st.Runner.Capture(context.Background(), "helm", "show", "values", published)
+	out, err := st.Runner.Capture(ctx, "helm", "show", "values", published)
 	if err != nil {
 		return checkout(fmt.Sprintf("%s is unreachable", published))
 	}

@@ -61,7 +61,7 @@ database:
 func TestPortalChartRef_PrefersAPublishedChartThatCanCompose(t *testing.T) {
 	st, _ := chartRefState(t, portalWiredValues)
 
-	if got := portalChartRef(st); !strings.HasPrefix(got, "oci://") {
+	if got := portalChartRef(t.Context(), st); !strings.HasPrefix(got, "oci://") {
 		t.Fatalf("a published chart declaring the tenant values is the one to install, got %q", got)
 	}
 }
@@ -73,7 +73,7 @@ func TestPortalChartRef_PrefersAPublishedChartThatCanCompose(t *testing.T) {
 func TestPortalChartRef_RejectsAPublishedChartThatDeclaresNoTenantValues(t *testing.T) {
 	st, checkout := chartRefState(t, portalUnwiredValues)
 
-	got := portalChartRef(st)
+	got := portalChartRef(t.Context(), st)
 	if strings.HasPrefix(got, "oci://") {
 		t.Fatalf("a chart with no externalSecret cannot compose DATABASE_URL — installing it "+
 			"wires portal to nothing, got %q", got)
@@ -90,7 +90,7 @@ func TestPortalChartRef_APinOutranksTheRegistry(t *testing.T) {
 	st, checkout := chartRefState(t, portalWiredValues) // registry is fine, and must lose anyway
 	st.Config.Versions.Portal = "platform-v2026.08.10"
 
-	if got := portalChartRef(st); strings.HasPrefix(got, "oci://") {
+	if got := portalChartRef(t.Context(), st); strings.HasPrefix(got, "oci://") {
 		t.Fatalf("versions.portal pins a ref — the registry must not be consulted, got %q", got)
 	}
 	if st.Runner.Dir != checkout {
@@ -101,7 +101,7 @@ func TestPortalChartRef_APinOutranksTheRegistry(t *testing.T) {
 func TestPortalChartRef_FallsBackWhenTheRegistryIsUnreachable(t *testing.T) {
 	st, checkout := chartRefState(t, "") // helm exits non-zero
 
-	if got := portalChartRef(st); strings.HasPrefix(got, "oci://") {
+	if got := portalChartRef(t.Context(), st); strings.HasPrefix(got, "oci://") {
 		t.Fatalf("an unreachable registry must not stop the install, got %q", got)
 	}
 	if st.Runner.Dir != checkout {

@@ -5,11 +5,33 @@ package exec
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
+)
+
+// Timeout ceilings. Every subprocess runs under one: a tool that has stopped making
+// progress must fail the phase that is waiting on it rather than hold the pipeline open
+// indefinitely, because a hung child is indistinguishable from a slow one to the operator
+// and neither the phase nor the rollback can proceed past it.
+//
+// The two ceilings differ because the two call classes differ by orders of magnitude.
+const (
+	// DefaultRunTimeout bounds one mutating invocation. The longest is a terragrunt
+	// apply of the cluster component, which waits on an EKS control plane; AWS documents
+	// that as up to 15 minutes and the leaf applies more besides. An hour is above any
+	// single component's honest worst case and far below "forever".
+	DefaultRunTimeout = time.Hour
+
+	// DefaultQueryTimeout bounds one read. Every Capture and Query is a list, describe or
+	// get against a cloud API, a local git tree or a kubernetes API server. A read that
+	// has not answered in two minutes is wedged, not slow — kubectl calls in this repo
+	// already carry --request-timeout=30s for the same reason.
+	DefaultQueryTimeout = 2 * time.Minute
 )
 
 // Runner shells out to external tools.
@@ -18,6 +40,12 @@ type Runner struct {
 	Dir    string   // working directory for commands
 	Env    []string // extra environment (appended to os.Environ)
 	Out    io.Writer
+
+	// RunTimeout overrides DefaultRunTimeout for Run. Zero takes the default.
+	RunTimeout time.Duration
+	// QueryTimeout overrides DefaultQueryTimeout for Capture and Query. Zero takes
+	// the default.
+	QueryTimeout time.Duration
 }
 
 // New returns a Runner writing to out.
@@ -28,6 +56,52 @@ func New(out io.Writer) *Runner {
 	return &Runner{Out: out}
 }
 
+func (r *Runner) runTimeout() time.Duration {
+	if r.RunTimeout > 0 {
+		return r.RunTimeout
+	}
+	return DefaultRunTimeout
+}
+
+func (r *Runner) queryTimeout() time.Duration {
+	if r.QueryTimeout > 0 {
+		return r.QueryTimeout
+	}
+	return DefaultQueryTimeout
+}
+
+// fail wraps a subprocess error, naming the tool and — when the deadline is what ended it
+// — saying so. A caller that cannot tell a timeout from a non-zero exit reports "exit
+// status 1" for a tool that never exited at all.
+//
+// parent is the context the caller supplied; child is the deadline-bearing one this
+// package derived from it. Distinguishing them separates "the operator interrupted" from
+// "this call outlived its ceiling", which are different failures with different remedies.
+func fail(parent, child context.Context, name string, timeout time.Duration, stderr string, err error) error {
+	detail := strings.TrimSpace(stderr)
+	if detail != "" {
+		detail = ": " + truncate(detail)
+	}
+	switch {
+	case parent.Err() != nil:
+		return fmt.Errorf("%s: %w%s", name, parent.Err(), detail)
+	case errors.Is(child.Err(), context.DeadlineExceeded):
+		return fmt.Errorf("%s: no output for %s, giving up%s", name, timeout, detail)
+	default:
+		return fmt.Errorf("%s: %w%s", name, err, detail)
+	}
+}
+
+// truncate bounds a subprocess's stderr so one runaway tool cannot flood the terminal.
+// The head is kept: a tool that fails reports why on its first lines and then repeats.
+func truncate(s string) string {
+	const max = 2000
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "… (truncated)"
+}
+
 // Run executes name+args, streaming output. In dry-run it prints the command.
 func (r *Runner) Run(ctx context.Context, name string, args ...string) error {
 	line := name + " " + strings.Join(args, " ")
@@ -36,15 +110,19 @@ func (r *Runner) Run(ctx context.Context, name string, args ...string) error {
 		return nil
 	}
 	fmt.Fprintf(r.Out, "    → %s\n", line)
-	cmd := exec.CommandContext(ctx, name, args...)
+	timeout := r.runTimeout()
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(child, name, args...)
 	cmd.Dir = r.Dir
 	if len(r.Env) > 0 {
 		cmd.Env = append(os.Environ(), r.Env...)
 	}
+	// Both streams already reach the operator, so the error carries no duplicate of them.
 	cmd.Stdout = r.Out
 	cmd.Stderr = r.Out
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %w", name, err)
+		return fail(ctx, child, name, timeout, "", err)
 	}
 	return nil
 }
@@ -54,16 +132,23 @@ func (r *Runner) Capture(ctx context.Context, name string, args ...string) (stri
 	if r.DryRun {
 		return "", nil
 	}
-	cmd := exec.CommandContext(ctx, name, args...)
+	timeout := r.queryTimeout()
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(child, name, args...)
 	cmd.Dir = r.Dir
 	if len(r.Env) > 0 {
 		cmd.Env = append(os.Environ(), r.Env...)
 	}
-	var out bytes.Buffer
+	// stderr is captured separately rather than discarded, and separately rather than
+	// merged: it is the only place aws, kubectl and git say WHY a call failed, and every
+	// caller here parses stdout, so merging the two would corrupt the value on the path
+	// where nothing went wrong. It reaches the operator through the returned error only.
+	var out, errb bytes.Buffer
 	cmd.Stdout = &out
-	cmd.Stderr = io.Discard
+	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%s: %w", name, err)
+		return "", fail(ctx, child, name, timeout, errb.String(), err)
 	}
 	return strings.TrimSpace(out.String()), nil
 }
@@ -103,15 +188,21 @@ func (r *Runner) Capture(ctx context.Context, name string, args ...string) (stri
 // never ran. Not inheriting Dir means the enumeration works wherever it is called from, which
 // for a cloud API is the only correct behaviour.
 func (r *Runner) Query(ctx context.Context, name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	timeout := r.queryTimeout()
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(child, name, args...)
 	if len(r.Env) > 0 {
 		cmd.Env = append(os.Environ(), r.Env...)
 	}
-	var out bytes.Buffer
+	// Captured, not discarded — the same reason Capture gives. An enumeration that fails
+	// on AccessDenied and one that fails because the account is empty are the same exit
+	// status, and a sweep that cannot tell them apart cannot report honestly.
+	var out, errb bytes.Buffer
 	cmd.Stdout = &out
-	cmd.Stderr = io.Discard
+	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%s: %w", name, err)
+		return "", fail(ctx, child, name, timeout, errb.String(), err)
 	}
 	return strings.TrimSpace(out.String()), nil
 }

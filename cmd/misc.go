@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -100,7 +99,7 @@ the object rather than at the flag.`,
 		}
 		// --force-buckets needs no dry-run guard: PermitBucketTeardown prints both acts
 		// and refuses where it must, so a dry-run is informative rather than dangerous.
-		ctx := context.Background()
+		ctx := cmd.Context()
 		run := exec.New(os.Stdout)
 		run.DryRun = destroyDryRun
 		// Same resolution as apply: with cloud.assumeRole set, a destroy runs as the

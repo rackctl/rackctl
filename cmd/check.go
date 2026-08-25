@@ -59,7 +59,7 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		if err != nil {
 			return err
 		}
-		ctx := context.Background()
+		ctx := cmd.Context()
 
 		if err := exec.RequireTools("tofu", "terragrunt", "kubectl", "helm", "aws", "git", "gh"); err != nil {
 			fmt.Println(ui.Fail(err.Error()))

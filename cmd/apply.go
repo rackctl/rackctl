@@ -47,7 +47,7 @@ It does make read-only AWS calls, and that is the point rather than a side effec
 sweeps that delete resources outside Terraform's state — operator-minted IAM roles,
 Karpenter's instances, orphaned EBS volumes — enumerate for real and print what they
 would select. A plan that queried nothing could only ever restate its own filters back.`,
-	RunE: func(cmd *cobra.Command, args []string) error { return runPipeline(false) },
+	RunE: func(cmd *cobra.Command, args []string) error { return runPipeline(cmd.Context(), false) },
 }
 
 var applyCmd = &cobra.Command{
@@ -65,10 +65,10 @@ only ever safe when this run built the thing it is about to destroy.
 
 Preflight runs first and refuses to spend when it fails. A preflight you have to remember
 to run is documentation, not a gate.`,
-	RunE: func(cmd *cobra.Command, args []string) error { return runPipeline(true) },
+	RunE: func(cmd *cobra.Command, args []string) error { return runPipeline(cmd.Context(), true) },
 }
 
-func runPipeline(write bool) error {
+func runPipeline(ctx context.Context, write bool) error {
 	cfg, err := config.Load(applyConfigPath)
 	if err != nil {
 		return err
@@ -81,7 +81,7 @@ func runPipeline(write bool) error {
 	// this performs the assume, so a role that cannot be assumed fails here — before
 	// preflight, before any spend — rather than as a permissions error somewhere in
 	// the middle of a phase.
-	base, err := resolveEnv(context.Background(), cfg, run)
+	base, err := resolveEnv(ctx, cfg, run)
 	if err != nil {
 		return err
 	}
@@ -97,7 +97,7 @@ func runPipeline(write bool) error {
 	// --skip-preflight exists because a check can be wrong and must never be the thing that
 	// stands between an operator and their own cloud — but it has to be asked for.
 	if write && !applySkipPreflight {
-		if err := runPreflightGate(context.Background(), cfg, base); err != nil {
+		if err := runPreflightGate(ctx, cfg, base); err != nil {
 			return err
 		}
 	}
@@ -112,7 +112,7 @@ func runPipeline(write bool) error {
 	if applyTUI {
 		// CleanOnFail must match the non-TUI construction below — hardcoding it here
 		// meant --no-clean-on-failure was silently ignored under --tui.
-		return tui.RunInit(context.Background(), title, st, phases.All(), !applyNoClean)
+		return tui.RunInit(ctx, title, st, phases.All(), !applyNoClean)
 	}
 
 	fmt.Println(ui.Title(title))
@@ -120,7 +120,7 @@ func runPipeline(write bool) error {
 		fmt.Println(ui.Warn("plan — nothing is created or changed. `rackctl apply` provisions for real"))
 	}
 	eng := &engine.Engine{Phases: phases.All(), Out: os.Stdout, CleanOnFail: !applyNoClean}
-	return eng.Run(context.Background(), st)
+	return eng.Run(ctx, st)
 }
 
 // runPreflightGate asserts the install can succeed before it starts spending. It is
