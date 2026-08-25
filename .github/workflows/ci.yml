@@ -21,10 +21,10 @@ jobs:
       #
       # persist-credentials: false because checkout otherwise leaves the job token in
       # .git/config, where every later step — and every action they call — can read it.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26"
           cache: true
@@ -63,7 +63,7 @@ jobs:
       # described: a comment claiming full coverage goes stale silently at the first edit
       # that adds a pin, while this fails the build.
       - name: renovate pin coverage
-        run: ./scripts/pins.sh
+        run: python3 ./scripts/pins.py
       # With no package manifest beyond go.mod, the workflows ARE a dependency surface —
       # every action runs with the job's token and permissions. --offline so the verdict is
       # a function of the commit under test rather than of what GitHub's API answers today.
@@ -79,7 +79,7 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: osv-scanner
-        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+        uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
         with:
           scan-args: |-
             --recursive

@@ -13,9 +13,11 @@
 #             cannot see, where overall coverage stays healthy while a sweep that issues
 #             terminate-instances or delete-role loses its last test.
 #
-# `--self-test` proves the comparisons can still reject, without running the suite. That
-# is not ceremony: the verdict here is four awk expressions, and an awk expression that
-# stops comparing reports a clean pass forever.
+# The positive controls run on EVERY invocation, ahead of the real check — not behind a
+# flag. There is then no CI step to forget and no flag a caller can silently omit, so the
+# gate cannot drift from the workflow that calls it. That is not ceremony: the verdict here
+# is four awk expressions, and an awk expression that stops comparing reports a clean pass
+# forever.
 set -e
 
 PROFILE="${PROFILE:-coverage.out}"
@@ -87,13 +89,20 @@ check_report() {
   return "$status"
 }
 
-# ── self-test ───────────────────────────────────────────────────────────────
+# ── positive controls ───────────────────────────────────────────────────────
 #
-# Each case is a synthetic report that MUST be rejected, plus one that must pass. A gate
-# whose rejections are never exercised is indistinguishable from a gate that has stopped
-# rejecting, and the second reports success.
+# Each control introduces the exact violation a check exists to catch, and the gate must
+# reject it. The clean fixture is asserted to PASS first: without that, a rejection proves
+# nothing, because the gate might have been failing for an unrelated reason all along.
+#
+# A gate whose rejections are never exercised is indistinguishable from one that has
+# stopped rejecting, and the second reports success.
 self_test() {
   ok=0
+  [ -n "$CRITICAL_FUNCS" ] || {
+    echo "self-test: the destructive-path list is empty — this gate would pass anything" >&2
+    return 1
+  }
 
   passing="$(
     for entry in $CRITICAL_FUNCS; do
@@ -104,17 +113,17 @@ self_test() {
 
   expect_reject() {
     if printf '%s\n' "$2" | check_report >/dev/null 2>&1; then
-      echo "self-test: $1 was ACCEPTED — this gate cannot reject" >&2
+      echo "control: $1 was ACCEPTED — this gate cannot reject" >&2
       ok=1
     else
-      echo "self-test: $1 rejected"
+      echo "control: $1 rejected"
     fi
   }
 
   if printf '%s\n' "$passing" | check_report >/dev/null 2>&1; then
-    echo "self-test: a clean report passes"
+    echo "control: a clean report passes"
   else
-    echo "self-test: a clean report was rejected — the gate fails everything, which is the same as failing nothing" >&2
+    echo "control: a clean report was rejected — the gate fails everything, which is the same as failing nothing" >&2
     ok=1
   fi
 
@@ -138,14 +147,14 @@ self_test() {
     "$(printf '%s\n' "$passing" \
       | sed 's|rackctl/internal/reap/own.go:1:\tProves|rackctl/internal/elsewhere/other.go:1:\tProves|')"
 
-  [ "$ok" -eq 0 ] && echo "self-test: coverage gate can reject"
+  [ "$ok" -eq 0 ] && echo "control: coverage gate can reject"
   return "$ok"
 }
 
-if [ "${1:-}" = "--self-test" ]; then
-  self_test
-  exit $?
-fi
+# Controls first, always. --controls-only exists for the gate suite, which asserts every
+# gate has them; it is not how the gate is normally run.
+self_test || exit 1
+[ "${1:-}" = "--controls-only" ] && exit 0
 
 go test -coverprofile="$PROFILE" -covermode=set ./... >/dev/null
 go tool cover -func="$PROFILE" | check_report
