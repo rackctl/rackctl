@@ -18,11 +18,17 @@ on:
     - cron: "17 6 * * *"
   workflow_dispatch:
 
+# A scheduled scan that overlaps a manual dispatch tells you the same thing twice.
+concurrency:
+  group: vulnerabilities
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 jobs:
   scan:
+    name: scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

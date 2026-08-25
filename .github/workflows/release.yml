@@ -4,12 +4,24 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+# A tag build must not be cancelled by a later tag: both releases have to publish, and a
+# half-uploaded release is worse than a queued one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# No workflow-level permissions. A grant here is inherited by every job added later, and
+# nothing in that new job's diff would look like a permission change. The one job that needs
+# to write holds the grant itself.
+permissions: {}
 
 jobs:
   goreleaser:
+    name: goreleaser
     runs-on: ubuntu-latest
+    permissions:
+      # creates the GitHub release and uploads the binaries operators install
+      contents: write # goreleaser publishes the release for this tag
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,4 +42,10 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # zizmor: ignore[secrets-outside-env]
+          # HOMEBREW_TAP_TOKEN writes to another repository, so it warrants a GitHub
+          # Environment with required reviewers. Declaring `environment:` here without
+          # configuring those rules in repository settings would silence this audit while
+          # adding no control, which is worse than the open finding: the gate would then
+          # report a protection that does not exist.
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

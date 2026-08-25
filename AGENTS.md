@@ -106,17 +106,34 @@ gates.
 | `scripts/prose.py` | the enforceable subset of `documentation-voice` |
 | `scripts/floor.py` | the anti-vacuity floor: it FEEDS each gate above a known-bad input and reads the exit status, consulting nothing the gate prints about itself |
 
-`make gates` also runs `shellcheck -s sh` over `scripts/*.sh`. It is a tool, not a
-floor-paired gate — the floor discovers scripts in `scripts/`, so a tool invocation in the
-Makefile is outside its reach. The severity flag is load-bearing: the bash-ism diagnostics
-are warnings, and a default-severity run would report them and exit 0.
+`make gates` also runs `shellcheck` over `scripts/*.sh`. It is a tool, not a floor-paired
+gate — the floor discovers scripts in `scripts/`, so a tool invocation in the Makefile is
+outside its reach.
 
-Shellcheck parses; it does not run. CI also executes both scripts under the runner's
-`/bin/sh`, which is `dash` — asserted in the step rather than assumed, since an image that
+No `--severity`. shellcheck's default is `style`, the most inclusive tier, so a severity
+flag can only make the check less sensitive. What decides whether the portability checks run
+at all is the DIALECT, and the dialect comes from the shebang: `#!/bin/sh` gets the SC3xxx
+diagnostics, `#!/bin/bash` does not. shellcheck has no model of bash VERSIONS — `mapfile`,
+`declare -A` and `${x^^}` are legal bash-4 and draw no diagnostic at all under a bash
+shebang, on a script macOS bash 3.2 cannot run past its first line. Every script here
+declares `#!/bin/sh`, and a CI step asserts that rather than trusting it.
+
+Shellcheck parses; it does not run, and `sh -n` does not either — dash accepts `[[ ]]`,
+`mapfile`, `declare -A` and case-modification expansion under `-n`, rejecting all four only
+when the line executes. So CI RUNS the scripts under the runner's `/bin/sh`, which is
+`dash`: `scripts/install_test.sh` drives `scripts/install.sh` end to end against a local fake
+release, including the checksum path, which is the part an operator's security rests on.
+The runner's shell is asserted by path AND by an unset `BASH_VERSION`, since an image that
 shipped bash as `/bin/sh` would turn the step into a bash run and stop testing what it
 exists to test. Locally the two disagree: `/bin/sh` on macOS is bash in POSIX mode and
 ACCEPTS bash-isms, so a script that works on a developer's machine can still break on
 Debian.
+
+Zizmor runs `--persona auditor`. The persona gate is a different axis from severity: under
+the default `regular` persona the excessive-permissions audit is not executed at all, so a
+workflow-level `contents: write` or `id-token: write` reports "No findings to report" while
+every job added later silently inherits the grant — with no diff that looks like a
+permission change.
 
 If you add a gate, it needs a known-good and known-bad fixture pair registered in
 `scripts/floor.py`. A gate with no pair fails the floor — a gate is proven by being fed a

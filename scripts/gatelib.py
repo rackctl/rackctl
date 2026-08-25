@@ -27,25 +27,37 @@ def blank_comment_body(line):
     The body is blanked rather than the line deleted so the '#' survives and offsets stay
     put, which keeps reported line numbers true. Naive splitting on '#' would also cut a
     URL fragment or a quoted value in half, so quotes are respected.
+
+    Scanned TWICE. An apostrophe inside a word — "don't", "doesn't" — opens a single quote
+    that never closes, and a scanner treating it as a quote reads the rest of the line as
+    quoted, so a trailing comment is not seen as a comment and its body survives into the
+    blanked view. That is a fail-open in the exact direction the blanked view exists to
+    prevent: a comment satisfying a check that looks for content. When the first pass
+    reaches end of line with a quote still open, the quote was an apostrophe, and the
+    second pass ignores quoting entirely.
     """
-    out, quote = [], None
-    i = 0
-    while i < len(line):
-        c = line[i]
-        if quote:
-            out.append(c)
-            if c == "\\" and i + 1 < len(line):
-                out.append(line[i + 1])
-                i += 2
-                continue
-            if c == quote:
-                quote = None
-        elif c in "\"'":
-            quote = c
-            out.append(c)
-        elif c == "#" and (i == 0 or line[i - 1] in " \t"):
+    for treat_quotes in (True, False):
+        out, quote, cut = [], None, None
+        i = 0
+        while i < len(line):
+            c = line[i]
+            if quote:
+                out.append(c)
+                if c == "\\" and i + 1 < len(line):
+                    out.append(line[i + 1])
+                    i += 2
+                    continue
+                if c == quote:
+                    quote = None
+            elif treat_quotes and c in "\"'":
+                quote = c
+                out.append(c)
+            elif c == "#" and (i == 0 or line[i - 1] in " \t"):
+                cut = i
+                break
+            else:
+                out.append(c)
+            i += 1
+        if quote is None:
             break
-        else:
-            out.append(c)
-        i += 1
-    return "".join(out) + ("#" if quote is None and "#" in line[len("".join(out)):] else "")
+    return line[:cut] + "#" if cut is not None else line

@@ -30,7 +30,11 @@ workflow that calls it.
 import json
 import os
 import re
+import pathlib
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from gatelib import blank_comment_body  # noqa: E402
 import tempfile
 
 REPO = os.environ.get("REPO_ROOT", ".")
@@ -53,46 +57,6 @@ NOT_A_PIN = [
 def die(msg):
     print(f"pins: {msg}", file=sys.stderr)
     sys.exit(1)
-
-
-def blank_comment_body(line):
-    """Blank a trailing YAML comment's BODY, respecting quotes, keeping the '#'.
-
-    One stripper, two views, chosen per check — reading one view for two purposes is how a
-    gate goes blind:
-
-      raw       when the thing being looked for IS an annotation. The `# v7.0.1` beside a
-                SHA is not decoration, it is what Renovate rewrites, so the version-comment
-                check reads the raw line.
-      blanked   when a comment must not be able to satisfy a check looking for content. A
-                commented-out `uses:` is not an action reference, and a customManager's
-                regex must match a real pin rather than prose mentioning one.
-
-    The body is blanked rather than the line deleted so the '#' survives and offsets stay
-    put, which keeps reported line numbers true. Naive splitting on '#' would also cut a
-    URL fragment or a quoted value in half, so quotes are respected.
-    """
-    out, quote = [], None
-    i = 0
-    while i < len(line):
-        c = line[i]
-        if quote:
-            out.append(c)
-            if c == "\\" and i + 1 < len(line):
-                out.append(line[i + 1])
-                i += 2
-                continue
-            if c == quote:
-                quote = None
-        elif c in "\"'":
-            quote = c
-            out.append(c)
-        elif c == "#" and (i == 0 or line[i - 1] in " \t"):
-            break
-        else:
-            out.append(c)
-        i += 1
-    return "".join(out) + ("#" if quote is None and "#" in line[len("".join(out)):] else "")
 
 
 def to_python_re(pattern):

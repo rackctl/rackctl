@@ -8,11 +8,20 @@ on:
 # The default GITHUB_TOKEN is read-write on a push to main. Nothing in this workflow
 # writes anything, so the token it runs with should not be able to — an action compromised
 # anywhere in the graph inherits whatever the job holds.
+# A superseded push to the same ref has nothing left to prove; the newer commit's run is
+# the one the merge decision reads.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   build:
+    # The job id is the check name branch protection matches. Setting `name` to the same
+    # string keeps that string stable.
+    name: build
     runs-on: ubuntu-latest
     steps:
       # Actions are pinned to a commit SHA, not a tag. A tag is mutable: whoever can move
@@ -71,16 +80,37 @@ jobs:
       # --severity=warning because the bash-ism diagnostics (SC3044 and friends) are
       # warnings, and a gate that only fails on errors would pass every one of them.
       - name: shellcheck
-        run: shellcheck -s sh --severity=warning scripts/*.sh
-      # The runtime half. install.sh fetches and installs, so it is parsed rather than run;
-      # coverage.sh's controls are self-contained and are executed under a real POSIX shell.
+        # No --severity. shellcheck's default is `style`, the MOST inclusive tier, so a
+        # severity flag here can only make this less sensitive. These scripts are clean at
+        # `style`, so the strictest setting is free.
+        #
+        # The dialect is what matters, and it comes from the shebang: `#!/bin/sh` gets the
+        # SC3xxx portability checks, `#!/bin/bash` does not. shellcheck has no model of
+        # bash VERSIONS — mapfile, `declare -A` and `${x^^}` are legal bash-4 and draw no
+        # diagnostic under a bash shebang, while macOS bash 3.2 fails on the first of them.
+        # The bash-version guard below is what covers that, and only for bash scripts.
+        run: shellcheck scripts/*.sh
+      - name: bash version floor
+        # Asserted rather than assumed: every script here declares #!/bin/sh, so nothing is
+        # entitled to a bash-4 builtin. A #!/bin/bash script added later would need its own
+        # check against the oldest bash it must run on — macOS ships 3.2.
+        run: |
+          if grep -lE '^#!.*\bbash\b' scripts/*.sh; then
+            echo "a bash script was added; shellcheck does not check bash VERSIONS" >&2
+            exit 1
+          fi
       - name: posix shell
         run: |
           # /bin/sh on ubuntu-latest IS dash. Asserted rather than assumed: if the runner
           # image ever ships bash as /bin/sh, this step would silently become a bash run and
-          # stop testing what it exists to test.
+          # stop testing what it exists to test. Both the path and the absence of
+          # BASH_VERSION are checked — a shell named dash that is really bash would pass the
+          # first test alone.
           readlink -f /bin/sh | grep -q dash
-          /bin/sh -n ./scripts/install.sh
+          [ -z "$(/bin/sh -c 'echo ${BASH_VERSION-}')" ]
+          # RUN, do not parse. `sh -n` is a syntax check: dash -n accepts [[ ]], mapfile,
+          # `declare -A` and case-modification expansion. Only executing rejects them.
+          /bin/sh ./scripts/install_test.sh
           /bin/sh ./scripts/coverage.sh --controls-only
       - name: gate floor
         run: python3 ./scripts/floor.py
@@ -109,8 +139,13 @@ jobs:
       # a function of the commit under test rather than of what GitHub's API answers today.
       - name: zizmor
         run: |
-          pip install --quiet zizmor==1.16.3
-          zizmor --offline --persona regular .github/workflows/
+          pip install --quiet zizmor==1.29.0
+          # --persona auditor, not the default. The persona gate is a DIFFERENT axis from
+          # severity: under `regular` the excessive-permissions audit is not executed at
+          # all, so a workflow-level `contents: write` or `id-token: write` reports "No
+          # findings to report" while every job added later silently inherits the grant,
+          # with no diff that looks like a permission change.
+          zizmor --offline --persona auditor .github/workflows/
       # The vulnerability scanners are NOT here. Their verdict changes when a CVE is
       # published, which is not something the commit under test caused — blocking a merge
       # on the world changing is how a gate teaches people to bypass it. They run on a

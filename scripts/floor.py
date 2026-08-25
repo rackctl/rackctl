@@ -33,6 +33,7 @@ discovering gates in a way its own checks do not cover. That is its standing bli
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,10 +48,18 @@ SCRIPTS = os.path.join(REPO, "scripts")
 # Scripts in scripts/ that are not gates. Each needs a reason, and the list is asserted:
 # an entry naming a file that no longer exists fails the run, so it cannot outlive what it
 # excused.
+# The status check the default-branch ruleset requires, by name. Recorded here because the
+# ruleset lives on the forge rather than in the tree: a check name that drifts from it stops
+# being consulted at the merge decision, in whichever direction it drifts. A required check
+# with no matching job blocks every merge; a job with no matching requirement blocks none.
+REQUIRED_CHECK = "build"
+
 NOT_A_GATE = {
     "crasher.py": "the floor's own control: a deliberately crashing gate, used to prove the "
                   "crash check below can still fire",
     "install.sh": "shipped to operators, not a gate",
+    "install_test.sh": "the harness that RUNS install.sh; it supplies its own fixtures and "
+                       "makes no verdict about the repo",
     "floor.py": "this file — the floor cannot probe itself, which is its own blind spot",
     "gatelib.py": "helpers the gates import; it makes no verdict of its own",
 }
@@ -344,6 +353,35 @@ def main():
                     break
     if wfs and status == 0:
         print(f"floor: {len(wfs)} workflow(s) scanned, no step soft-fails")
+
+    # ── every blocking check must live inside the ONE required job ──────────
+    #
+    # The ruleset on the default branch requires a single status check by name. A SECOND
+    # job in the pull-request workflow would run, could go red, and would not block the
+    # merge — and at the point of decision a red job that blocks nothing looks exactly like
+    # a passing one. New checks therefore go in as STEPS of the required job. A genuinely
+    # separate job has to be added to the ruleset at the same time, which is a change
+    # outside this repository, so the gate names it rather than assuming it.
+    ci = os.path.join(wf_dir, "ci.yml")
+    if os.path.exists(ci):
+        jobs, in_jobs = [], False
+        for raw in open(ci):
+            line = blank_comment_body(raw).rstrip()
+            if line == "jobs:":
+                in_jobs = True
+                continue
+            if in_jobs and line and not line[0].isspace():
+                break
+            if in_jobs and re.match(r"^  [\w-]+:$", line):
+                jobs.append(line.strip().rstrip(":"))
+        if jobs != [REQUIRED_CHECK]:
+            print(f"floor: {os.path.basename(ci)} declares jobs {jobs}, but the default-branch "
+                  f"ruleset requires exactly [{REQUIRED_CHECK!r}]. A job outside that set can "
+                  f"fail without blocking a merge — add the check as a step of "
+                  f"{REQUIRED_CHECK!r}, or add the new job to the ruleset.", file=sys.stderr)
+            status = 1
+        else:
+            print(f"floor: every blocking check runs inside the required {REQUIRED_CHECK!r} job")
 
     shutil.rmtree(d, ignore_errors=True)
     sys.exit(status)
