@@ -170,6 +170,8 @@ jobs:
           /bin/sh ./scripts/install_test.sh
           /bin/sh ./scripts/coverage.sh --controls-only
       - name: release config
+        env:
+          NO_COLOR: "1"
         # The release path was config-read-only: nothing ever ran goreleaser, so a config
         # that had stopped producing binaries would surface at tag time.
         #
@@ -188,7 +190,13 @@ jobs:
           if goreleaser check > check.out 2>&1; then
             echo "goreleaser check exited 0; the deprecation set below decides this step"
           fi
-          got=$(grep -oE 'DEPRECATED:[[:space:]]+[a-z_]+' check.out | awk '{print $2}' | sort -u | tr '\n' ' ')
+          # ANSI stripped before matching. goreleaser colours its output on a runner even
+          # though it is not a terminal, so the word this looks for arrives wrapped in escape
+          # sequences and a pattern anchored on DEPRECATED: followed by a letter matches
+          # nothing. NO_COLOR is set as well; the strip is what makes this independent of
+          # whether the tool honours it.
+          got=$(tr -d '\033' < check.out | sed 's/\[[0-9;]*m//g' \
+                | grep -oE 'DEPRECATED:[[:space:]]+[a-z_]+' | awk '{print $2}' | sort -u | tr '\n' ' ')
           if [ "$got" != "brews " ]; then
             echo "goreleaser check reported deprecations [$got], expected [brews ]" >&2
             cat check.out >&2
