@@ -1,0 +1,33 @@
+# Root directories the eks-agent-platform tree authors, one per line.
+#
+# A SNAPSHOT of another repository, committed here so the check that reads it runs
+# everywhere rather than only where a checkout happens to exist. A test that skips when
+# its authority is unresolvable prints its skip into a green job, and nobody reads a
+# green job — so on a runner, which never has a checkout, it asserted nothing at all.
+#
+# Not a second source of truth: TestAgentPlatformRoots_SnapshotMatchesARealCheckout
+# compares this file against a real tree wherever one resolves, so the cache cannot
+# drift unnoticed. Regenerate with:
+#
+#   go test ./internal/phases -run SnapshotMatchesARealCheckout -update \
+#     -args -checkout=/path/to/eks-agent-platform
+#
+# Every entry holds a terragrunt.hcl. A name rackctl applies with no root here aborts
+# the phase before it applies ANYTHING, and a dry run still looks fine.
+terraform/live/development-platform/agent-egress
+terraform/live/development-platform/bedrock
+terraform/live/development-platform/cost-access
+terraform/live/development-platform/eval-runtime
+terraform/live/development-platform/kill-switch
+terraform/live/org/bedrock-account
+terraform/live/org/cost-pipeline
+terraform/live/production-platform/agent-egress
+terraform/live/production-platform/bedrock
+terraform/live/production-platform/cost-access
+terraform/live/production-platform/eval-runtime
+terraform/live/production-platform/kill-switch
+terraform/live/staging-platform/agent-egress
+terraform/live/staging-platform/bedrock
+terraform/live/staging-platform/cost-access
+terraform/live/staging-platform/eval-runtime
+terraform/live/staging-platform/kill-switch
