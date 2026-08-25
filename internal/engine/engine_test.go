@@ -549,3 +549,93 @@ func TestDefaultPlatformExistsReportsUnknownWhenTheCallFails(t *testing.T) {
 		t.Error("an Unknown platform state must block rollback")
 	}
 }
+
+// ctxPhase records whether the context its Teardown was handed was still live, and can
+// cancel the run's context from inside Run to reproduce an operator interrupt.
+type ctxPhase struct {
+	id            string
+	fail          bool
+	cancelOnRun   context.CancelFunc
+	teardownErr   error
+	teardownAlive *bool
+	teardownRan   *bool
+}
+
+func (p ctxPhase) ID() string          { return p.id }
+func (p ctxPhase) Title() string       { return p.id }
+func (p ctxPhase) Optional() bool      { return false }
+func (p ctxPhase) Enabled(*State) bool { return true }
+func (p ctxPhase) Run(context.Context, *State) error {
+	if p.cancelOnRun != nil {
+		p.cancelOnRun()
+	}
+	if p.fail {
+		return errors.New("boom")
+	}
+	return nil
+}
+func (p ctxPhase) Teardown(ctx context.Context, _ *State) error {
+	if p.teardownRan != nil {
+		*p.teardownRan = true
+	}
+	if p.teardownAlive != nil {
+		*p.teardownAlive = ctx.Err() == nil
+	}
+	return p.teardownErr
+}
+
+// A rollback must still be able to run when the interrupt is what caused the failure.
+//
+// The TUI's abort path cancels the run's context, which kills the in-flight child and
+// fails the phase. Handing that same cancelled context to the teardown makes every
+// exec.CommandContext below it return instantly, so the rollback reports having run and
+// destroys nothing — while the abort's grace period makes it look like it was given time.
+func TestTeardownRunsOnALiveContextAfterAnInterrupt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	alive, ran := false, false
+	built := ctxPhase{id: "built", teardownAlive: &alive, teardownRan: &ran}
+	// Cancelling from inside Run is the interrupt: the context dies while the engine is
+	// still inside the phase, exactly as a Ctrl-C during a terragrunt apply does.
+	boom := ctxPhase{id: "boom", fail: true, cancelOnRun: cancel}
+
+	PlatformExists = func(context.Context, *State) PlatformState { return PlatformAbsent }
+	e := &Engine{Phases: []Phase{built, boom}, Out: io.Discard, CleanOnFail: true}
+	if err := e.Run(ctx, &State{Config: &config.Config{}, Runner: exec.New(io.Discard)}); err == nil {
+		t.Fatal("a failed required phase must return an error")
+	}
+
+	if !ran {
+		t.Fatal("the completed phase was never torn down")
+	}
+	if !alive {
+		t.Fatal("Teardown was handed a cancelled context — every destroy command under it " +
+			"returns instantly, so the rollback is a no-op that reports as having run")
+	}
+}
+
+// A rollback that could not finish leaves billable resources standing, which is the exact
+// outcome it exists to prevent. Under a Hook nothing is printed at all, so the failure has
+// to travel in the returned error or the operator never learns of it.
+func TestTeardownFailureReachesTheCallerUnderAHook(t *testing.T) {
+	built := ctxPhase{id: "built", teardownErr: errors.New("DependencyViolation")}
+	boom := ctxPhase{id: "boom", fail: true}
+
+	PlatformExists = func(context.Context, *State) PlatformState { return PlatformAbsent }
+	e := &Engine{
+		Phases: []Phase{built, boom}, Out: io.Discard, CleanOnFail: true,
+		Hook: func(Event) {},
+	}
+	err := e.Run(context.Background(), &State{Config: &config.Config{}, Runner: exec.New(io.Discard)})
+	if err == nil {
+		t.Fatal("a failed required phase must return an error")
+	}
+	if !strings.Contains(err.Error(), "DependencyViolation") {
+		t.Errorf("the teardown failure must reach the caller — under a Hook it is printed "+
+			"nowhere, so this error is the only channel.\ngot: %v", err)
+	}
+	if !strings.Contains(err.Error(), "rollback did not complete") {
+		t.Errorf("the error must say the rollback is incomplete, not only that a phase failed.\ngot: %v", err)
+	}
+}

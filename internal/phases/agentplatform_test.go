@@ -850,3 +850,33 @@ func TestDestroyAgentPlatform_SkipsWhenTheTreeWasNeverApplied(t *testing.T) {
 			"and its error is what used to abort the whole teardown before the EKS cluster")
 	}
 }
+
+// S3 rejects a CreateBucketConfiguration naming us-east-1, and requires one everywhere else.
+//
+// The agent-platform state bucket is minted in phase 6, so getting this wrong fails the
+// install after the VPC, the EKS control plane and the whole substrate are already
+// provisioned and billing — and it fails only in us-east-1, which is the region a
+// deployment is most likely to pick.
+func TestCreateBucketArgs_OmitsLocationConstraintInUSEast1(t *testing.T) {
+	got := createBucketArgs("acct-us-east-1-agent-platform-tfstate", "us-east-1")
+	if slices.Contains(got, "--create-bucket-configuration") {
+		t.Fatalf("us-east-1 must carry no CreateBucketConfiguration — S3 answers "+
+			"InvalidLocationConstraint and the phase dies with the substrate already paid for.\ngot: %v", got)
+	}
+	if !slices.Contains(got, "--region") {
+		t.Errorf("--region is still required; only the configuration block is dropped.\ngot: %v", got)
+	}
+}
+
+// The other half of the same rule: every region that is not us-east-1 requires the block,
+// so dropping it unconditionally would break every one of them instead.
+func TestCreateBucketArgs_CarriesLocationConstraintElsewhere(t *testing.T) {
+	got := createBucketArgs("acct-eu-west-1-agent-platform-tfstate", "eu-west-1")
+	if !slices.Contains(got, "--create-bucket-configuration") {
+		t.Fatalf("a non-us-east-1 bucket needs LocationConstraint or it is created in the "+
+			"wrong region.\ngot: %v", got)
+	}
+	if !slices.Contains(got, "LocationConstraint=eu-west-1") {
+		t.Errorf("the constraint must name the target region.\ngot: %v", got)
+	}
+}

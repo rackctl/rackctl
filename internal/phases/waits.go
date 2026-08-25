@@ -35,6 +35,21 @@ import (
 func waitCatalogConverged(ctx context.Context, st *engine.State, timeout time.Duration) error {
 	const settle = 2 // consecutive clean samples at an unchanged count
 
+	// A dry-run has no catalog to converge, and polling for one cannot end well: Capture
+	// returns an empty string with a nil error under DryRun, which this loop reads as a
+	// catalog that exists and has generated nothing. `clean` never increments, so the
+	// poll runs to the full deadline and then reports a convergence failure — turning
+	// `rackctl plan`, whose whole contract is a fast read-only rehearsal, into a
+	// thirty-minute wait ending in a false negative.
+	//
+	// Say what the wait would do instead. The sibling poll in portal_substrate.go guards
+	// itself the same way.
+	if st.Runner.DryRun {
+		note(st, "would wait up to %s for every ArgoCD Application to report Healthy, requiring "+
+			"%d consecutive samples at an unchanged count", timeout, settle)
+		return nil
+	}
+
 	deadline := time.Now().Add(timeout)
 	var lastCount, clean int
 	var nextReport time.Time

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/ui"
@@ -231,7 +232,15 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				// exactly those orphaned: a failed cluster-addons left seven IAM roles
 				// behind, because its Teardown (which destroys the component) was
 				// never called.
-				e.teardown(ctx, st, append(completed, p))
+				if tf := e.teardown(ctx, st, append(completed, p)); len(tf) > 0 {
+					// A teardown that could not finish leaves billable resources standing,
+					// which is the outcome the rollback exists to prevent — so it travels
+					// with the phase failure rather than only being printed. Under a Hook
+					// nothing is printed at all, so returning it is the only way the
+					// operator hears about it.
+					return fmt.Errorf("phase %q failed: %w (and the rollback did not complete: %w)",
+						p.ID(), err, errors.Join(tf...))
+				}
 			}
 			return fmt.Errorf("phase %q failed: %w", p.ID(), err)
 		}
@@ -263,7 +272,28 @@ func (e *Engine) report(ev Event, line string) {
 	fmt.Fprintln(e.Out, line)
 }
 
-func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
+// teardownBudget bounds a whole rollback. It is a reverse walk of the completed phases,
+// each destroying one terragrunt component, plus the reap sweeps ahead of them. Half an
+// hour is above that walk's honest worst case and below leaving the operator with no
+// process and no answer.
+const teardownBudget = 30 * time.Minute
+
+// teardown reverses the completed phases and returns whatever could not be undone.
+//
+// It runs on a context detached from the caller's cancellation, and that is the whole
+// point rather than a convenience. A rollback is reached precisely when something went
+// wrong, and one of the ways things go wrong is the operator interrupting: the TUI's
+// abort path cancels the context, the in-flight phase's child dies, and this function is
+// then handed the same cancelled context. Every command below is an exec.CommandContext
+// on it, so each would return instantly — a rollback that reports having run and destroys
+// nothing, while the abort's grace period makes it look like it was given time.
+//
+// Detaching keeps a ceiling rather than removing one. An operator who wants out during a
+// rollback interrupts a second time, which takes the default signal disposition.
+func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) []error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), teardownBudget)
+	defer cancel()
+
 	if e.Hook == nil {
 		fmt.Fprintln(e.Out, ui.Warn("failure detected — rolling back provisioned resources"))
 	}
@@ -319,13 +349,21 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 			reap.OrphanedNodes(ctx, st.Runner, e.Out, st.Config.ClusterName(), st.Config.Cloud.Region)
 		}
 	}
+	// Every phase is attempted even after one fails: a component that cannot be destroyed
+	// says nothing about the ones behind it, and stopping at the first would strand them.
+	// Same posture as `rackctl destroy`.
+	var failed []error
 	for i := len(completed) - 1; i >= 0; i-- {
 		p := completed[i]
 		if e.Hook == nil {
 			fmt.Fprintln(e.Out, ui.Step("teardown: "+p.Title()))
 		}
-		if err := p.Teardown(ctx, st); err != nil && e.Hook == nil {
-			fmt.Fprintln(e.Out, ui.Fail("teardown "+p.ID()+": "+err.Error()))
+		if err := p.Teardown(ctx, st); err != nil {
+			failed = append(failed, fmt.Errorf("teardown %s: %w", p.ID(), err))
+			if e.Hook == nil {
+				fmt.Fprintln(e.Out, ui.Fail("teardown "+p.ID()+": "+err.Error()))
+			}
 		}
 	}
+	return failed
 }

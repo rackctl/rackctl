@@ -29,9 +29,19 @@ var rootCmd = &cobra.Command{
 // by terraform and unreachable by a rollback that no longer has a process to run in.
 //
 // Commands reach it through cobra's cmd.Context(); none constructs its own root.
+// A second interrupt must still be able to end the process. While NotifyContext's
+// registration stands, further signals are absorbed rather than delivered, so an operator
+// who interrupts during a rollback — which runs detached from this cancellation, by
+// design — would otherwise have no way out short of another terminal. Unregistering as
+// soon as the context is cancelled restores the default disposition: the first interrupt
+// unwinds, the second kills.
 func Execute() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	return rootCmd.ExecuteContext(ctx)
 }
 

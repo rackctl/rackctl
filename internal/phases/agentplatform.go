@@ -388,6 +388,24 @@ func agentPlatformStateBucket(st *engine.State) string {
 	return fmt.Sprintf("eks-agent-platform-tfstate-%s-%s", st.Config.Cloud.AccountID, st.Config.Cloud.Region)
 }
 
+// createBucketArgs builds the `aws s3api create-bucket` argv for a bucket in region.
+//
+// us-east-1 is the one region CreateBucket must NOT be told about. It is the API's own
+// default location, and naming it in a CreateBucketConfiguration is rejected with
+// InvalidLocationConstraint; every other region requires exactly that block. Sending it
+// unconditionally therefore fails in us-east-1 alone, and it fails from the agent-platform
+// phase — with the VPC, the EKS control plane and the whole substrate already provisioned
+// and billing.
+//
+// Split out from the caller so the branch is reachable without a live S3.
+func createBucketArgs(bucket, region string) []string {
+	args := []string{"s3api", "create-bucket", "--bucket", bucket, "--region", region}
+	if region != "us-east-1" {
+		args = append(args, "--create-bucket-configuration", "LocationConstraint="+region)
+	}
+	return args
+}
+
 func ensureAgentPlatformBackend(ctx context.Context, st *engine.State) error {
 	bucket := agentPlatformStateBucket(st)
 	region := st.Config.Cloud.Region
@@ -405,8 +423,7 @@ func ensureAgentPlatformBackend(ctx context.Context, st *engine.State) error {
 	}
 
 	note(st, "agent-platform state backend: creating s3://%s", bucket)
-	if err := st.Runner.Run(ctx, "aws", "s3api", "create-bucket", "--bucket", bucket,
-		"--region", region, "--create-bucket-configuration", "LocationConstraint="+region); err != nil {
+	if err := st.Runner.Run(ctx, "aws", createBucketArgs(bucket, region)...); err != nil {
 		return fmt.Errorf("creating the agent-platform state bucket %s: %w", bucket, err)
 	}
 	if err := st.Runner.Run(ctx, "aws", "s3api", "put-bucket-versioning", "--bucket", bucket,
