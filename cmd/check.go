@@ -67,13 +67,21 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 			return withExit(ExitConfig, err)
 		}
 		ctx := cmd.Context()
-		// Under --output json the prose goes to stderr and stdout carries the document
+		// Under --output json the prose goes to STDERR and stdout carries the document
 		// alone, so `rackctl check --output json | jq` works without the caller having to
 		// filter a banner out of its own input.
+		//
+		// Redirected, not suppressed. An operator who asks for JSON is still watching a
+		// terminal, and a command that prints nothing at all while it works looks hung —
+		// the machine-readable half is a second consumer, not a reason to stop talking to
+		// the first. The per-check results are the exception: they are IN the document, so
+		// echoing them to stderr would be the same content twice.
 		say := func(a ...any) {
 			if checkOutput == "text" {
 				fmt.Println(a...)
+				return
 			}
+			fmt.Fprintln(os.Stderr, a...)
 		}
 
 		if err := exec.RequireTools("tofu", "terragrunt", "kubectl", "helm", "aws", "git", "gh"); err != nil {
@@ -97,7 +105,11 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		}
 		failed := preflight.Failed(results)
 		var health []doctor.Result
-		clusterState := "not-asserted"
+		// Assigned by every arm of the switch below, which is exhaustive. Left undeclared
+		// rather than seeded with a default, so a future arm that forgets to set it shows
+		// up as an empty string in the report rather than silently claiming the state the
+		// seed happened to name.
+		var clusterState string
 
 		// The health set, only where it can mean anything. The probe reads the kubeconfig
 		// rather than calling `describe-cluster`, because the question is whether THIS shell

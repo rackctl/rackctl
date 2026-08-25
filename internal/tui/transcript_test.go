@@ -8,6 +8,18 @@ import (
 	"unicode/utf8"
 )
 
+// mustWrite records output and fails the test if the write itself did.
+//
+// Not `_ =`: a test that ignores an error is how a test passes while the thing it names is
+// broken, which is why .golangci.yml deliberately does not exclude test files from
+// errcheck.
+func mustWrite(t *testing.T, tr *transcript, s string) {
+	t.Helper()
+	if _, err := tr.Write([]byte(s)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
 // Subprocess output must reach a file. Discarding it leaves a failed forty-minute install
 // with a cross beside a phase name and nothing else — and that output is the diagnosis.
 func TestTranscript_RecordsWhatWasWritten(t *testing.T) {
@@ -42,8 +54,8 @@ func TestTranscript_TailIsTheLastNonEmptyLine(t *testing.T) {
 	tr := newTranscript(t.TempDir(), "apply")
 	defer tr.Close()
 
-	tr.Write([]byte("first\n"))
-	tr.Write([]byte("waiting for the EKS control plane\n\n"))
+	mustWrite(t, tr, "first\n")
+	mustWrite(t, tr, "waiting for the EKS control plane\n\n")
 
 	if got := tr.Tail(0); got != "waiting for the EKS control plane" {
 		t.Fatalf("tail = %q", got)
@@ -57,7 +69,7 @@ func TestTranscript_TailIsTruncatedToWidth(t *testing.T) {
 	defer tr.Close()
 	// Multi-byte on purpose: a byte-sliced truncation cuts one of these in half and the
 	// result is not valid UTF-8, which the terminal renders as a replacement character.
-	tr.Write([]byte(strings.Repeat("é", 200) + "\n"))
+	mustWrite(t, tr, strings.Repeat("é", 200)+"\n")
 
 	// Measured in runes, because that is what a terminal column is. A byte length would
 	// pass here for an ASCII line and hide the overshoot on any line that is not.

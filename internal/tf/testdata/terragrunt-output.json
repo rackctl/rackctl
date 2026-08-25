@@ -1,0 +1,47 @@
+{
+  "cluster_endpoint": {
+    "sensitive": false,
+    "type": "string",
+    "value": "https://ABCDEF0123456789.gr7.us-east-1.eks.amazonaws.com"
+  },
+  "cluster_name": {
+    "sensitive": false,
+    "type": "string",
+    "value": "development-platform"
+  },
+  "kms_key_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+  },
+  "private_subnet_ids": {
+    "sensitive": false,
+    "type": ["tuple", ["string", "string", "string"]],
+    "value": ["subnet-0a1b2c3d", "subnet-1b2c3d4e", "subnet-2c3d4e5f"]
+  },
+  "route_table_ids": {
+    "sensitive": false,
+    "type": ["tuple", ["string"]],
+    "value": ["rtb-0a1b2c3d4e5f"]
+  },
+  "node_security_group": {
+    "sensitive": false,
+    "type": "object",
+    "value": {"id": "sg-0a1b2c3d", "name": "development-platform-node"}
+  },
+  "nat_gateway_count": {
+    "sensitive": false,
+    "type": "number",
+    "value": 1
+  },
+  "flow_logs_enabled": {
+    "sensitive": false,
+    "type": "bool",
+    "value": false
+  },
+  "database_password": {
+    "sensitive": true,
+    "type": "string",
+    "value": "redacted-in-fixture"
+  }
+}
