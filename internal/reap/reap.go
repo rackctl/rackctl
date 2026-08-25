@@ -20,9 +20,9 @@
 //     nothing, billing.
 //
 // This lives in its own package because BOTH paths that tear a platform down need it:
-// `rackctl destroy`, and the engine's rollback when an init fails partway. The
-// rollback did not have it, and a failed install left three unattached gp3 volumes
-// behind.
+// `rackctl destroy`, and the engine's rollback when an init fails partway. A rollback is
+// the harder case of the two — it runs against a half-built cluster where the controllers
+// were very likely never healthy, which is exactly when their finalizers have not run.
 package reap
 
 import (
@@ -750,10 +750,10 @@ func fleetSpokes(ctx context.Context, run execer) []string {
 // the reap is deleting.
 //
 // Every Application in the catalog carries automated.selfHeal. A Platform CR is
-// catalog-managed, so deleting it is drift — and ArgoCD corrects drift. Observed on a live
-// teardown: the reap deleted Platform/ops, its finalizer ran and removed the tenant's IAM
-// roles, and ArgoCD recreated the Platform seconds later. The operator then minted the
-// roles again, against a cluster on its way out.
+// catalog-managed, so deleting it is drift — and ArgoCD corrects drift within seconds.
+// Reaping without disarming therefore runs a loop: the finalizer removes the tenant's IAM
+// roles, ArgoCD recreates the Platform, and the operator mints the roles again against a
+// cluster on its way out.
 //
 // What that costs is not the CR. It is that `agent-iam` owns a managed policy those roles
 // attach to, and a managed policy cannot be deleted while any role holds it — so the

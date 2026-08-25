@@ -42,7 +42,10 @@ func TestLoad_RefusesARetiredField(t *testing.T) {
 		t.Fatal("a config asking for a deleted feature loaded clean. The decoder ignores unknown " +
 			"keys, so removing the field without refusing it turns the request into silence")
 	}
-	for _, want := range []string{"addons.accelerators", "O27", "Bedrock"} {
+	// The refusal has to say what happened to the key and where the capability went, not
+	// merely that the key is gone: an operator who set it wanted a GPU path, and the
+	// answer they need is which path replaced it.
+	for _, want := range []string{"addons.accelerators", "does not exist upstream", "Bedrock"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal must name %q — it has to say what happened to the key, not just "+
 				"that it is gone:\n%v", want, err)

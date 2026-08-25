@@ -19,6 +19,7 @@ cover:
 gates:
 	./scripts/gates.sh
 	python3 ./scripts/pins.py
+	python3 ./scripts/prose.py
 
 vet:
 	go vet ./...

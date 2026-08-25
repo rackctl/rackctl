@@ -248,11 +248,11 @@ func TestCoreComponents_NetworkFirst(t *testing.T) {
 // PHASE STRUCTURE — a substrate phase and a gitops phase — not in a component's index in a
 // shared list.
 //
-// That distinction is the whole lesson of #26/#29. #26 "fixed" this by reordering
-// CoreComponents and asserting that list; it did nothing, because the apply order is driven
-// by which phase owns a component. The invariant only became real when cluster-addons and
-// cluster-bootstrap were split across two phases whose order the engine executes literally.
-// So this test asserts the phase order and the ownership, which together ARE the guarantee.
+// That distinction is the whole point. Reordering CoreComponents and asserting that list
+// guards nothing, because the apply order is driven by which phase owns a component, not by a
+// component's index in a shared slice. The invariant is real only because cluster-addons and
+// cluster-bootstrap sit in two phases whose order the engine executes literally — so this test
+// asserts the phase order and the ownership, which together ARE the guarantee.
 func TestPhases_SubstrateBeforeGitOps(t *testing.T) {
 	ids := make([]string, 0)
 	for _, p := range All() {

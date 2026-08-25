@@ -220,10 +220,9 @@ const accountScopeToken = "org"
 
 // CheckBucketNames asserts every bucket this run would create can actually be created.
 //
-// This package's own header opens with the failure it was written for — "BucketAlreadyExists on
-// a bucket name that is globally unique across every AWS account on earth. Unrecoverable by
-// retry. Discovered 6 minutes in." — and until now nothing here checked a single bucket name.
-// The motivating example was the one gap.
+// An S3 bucket name is globally unique across every AWS account, so a collision is
+// unrecoverable by retry and is knowable before a single resource is created. Left to the
+// apply, it surfaces minutes in, against a name that was decidable at plan time.
 //
 // Three outcomes, and conflating them would waste the check:
 //
@@ -465,11 +464,11 @@ func ownedZoneIDs(ctx context.Context, env *Env) map[string]bool {
 // components/bedrock-account/main.tf) has no name and no identifier: the Bedrock API holds
 // EXACTLY ONE configuration per account per region.
 //
-// It used to be applied per environment, which made this check's warning the whole story —
-// applying development overwrote production's logging destination and tearing development down
-// deleted the singleton outright, both applies green, with invocation logging being the signal
-// every budget decision reads. That was ledger O14, and upstream fixed the shape rather than the
-// symptom: the configuration and the two buckets it points at moved to an account-scoped root,
+// Applied per environment it could not be safe: one environment's apply would overwrite
+// another's logging destination and one environment's teardown would delete the singleton
+// outright, both green, with invocation logging being the signal every budget decision reads.
+// The shape rather than the symptom is what fixes that, and upstream fixed it: the
+// configuration and the two buckets it points at live in an account-scoped root,
 // terraform/live/org/bedrock-account, whose names carry no cluster and no environment token
 // because there is exactly one of the thing they name.
 //

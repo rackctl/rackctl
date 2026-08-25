@@ -16,10 +16,10 @@ import (
 //
 // FIRST: `--all` matching NOTHING is a SUCCESS. kubectl prints "error: no matching
 // resources found" to stderr and exits 0. cluster-bootstrap returns the moment ArgoCD's
-// Deployment is up, which is before app-of-apps has generated a single child — so the wait
-// looked at zero Applications and reported the catalog converged, instantly, every time.
-// Observed on the first live install: the gate went green while the catalog stood at 3
-// Healthy, 7 Missing, 4 Progressing.
+// Deployment is up, which is before app-of-apps has generated a single child — so such a
+// wait looks at zero Applications and reports the catalog converged, instantly, on a
+// catalog that has not begun. A gate that is green because it never ran is the failure
+// this function exists to remove.
 //
 // SECOND, and it survives fixing the first: `kubectl wait` resolves its resource set ONCE,
 // at the start. The catalog does not exist all at once — app-of-apps generates children,

@@ -57,8 +57,9 @@ than it saves:
   nothing before it depended on the optional phase
 - **ArgoCD failing to install or converge** in phase 5 — the cloud is built and the cluster
   is the only surface the failure can be diagnosed on
-- a **refusal issued before anything ran**, such as `--force-buckets` against druid outside
-  development
+- a **refusal issued before anything was applied** — the acquire phase stating that a
+  component this config will apply has no live root in this environment, or the fleet phase
+  refusing to install a Crossplane provider whose account-id placeholder did not substitute
 
 Each prints why it stopped and leaves `rackctl destroy` as the explicit next step. A phase
 that returns `engine.NoRollbackError` is opting into this; anything else rolls back.
@@ -90,7 +91,7 @@ make vet fmt
 Layout:
 
 ```
-cmd/            root · init · preflight · doctor · upgrade · destroy · version
+cmd/            root · plan · apply · check · destroy · version
 internal/
   config/       rackctl.yaml schema + load/default/validate
   exec/         dry-run-aware tool runner (tofu/terragrunt/kubectl/helm/aws/gh)

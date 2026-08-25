@@ -12,11 +12,11 @@ import (
 
 // ─────────────────────────── bucket names ───────────────────────────
 //
-// The package header opens with the failure it exists for — "BucketAlreadyExists on a bucket
-// name that is globally unique across every AWS account on earth. Unrecoverable by retry.
-// Discovered 6 minutes in." — and nothing checked a bucket name until now. These pin the three
-// outcomes apart, because collapsing them wastes the check: one is recoverable by a destroy,
-// one is recoverable only by renaming the cluster, and one is not a problem at all.
+// An S3 bucket name is globally unique across every AWS account, so a collision is
+// unrecoverable by retry and knowable before anything is created. These pin the three
+// outcomes apart, because collapsing them wastes the check: one is recoverable by a
+// destroy, one is recoverable only by renaming the cluster, and one is not a problem
+// at all.
 
 // A state backend that already exists is the STEADY STATE, not wreckage. Getting this wrong
 // made the check fail against the account it was written for, and it would have failed on every

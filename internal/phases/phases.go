@@ -90,8 +90,8 @@ func CoreComponents(cfg *config.Config) []string {
 	// because it is real money and most platforms never need it. Its live leaf is
 	// self-sufficient — it carries its own `tenants` sizing map — and it depends on network and
 	// cluster, both of which the cluster phase applied before this one. Live roots exist under
-	// every workload environment. Teardown: development always; elsewhere via
-	// force_destroy_buckets (O1 settled upstream; target 11 wires the two-act apply).
+	// every workload environment. Teardown: development always; elsewhere the two-act apply
+	// behind --force-buckets, which lands force_destroy in state before the destroy runs.
 	if cfg.Addons.Druid {
 		comps = append(comps, "druid")
 	}
@@ -554,9 +554,8 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir, ref string) 
 // is no better: GitHub refuses to fork a repo into the account that owns it.
 //
 // Neither is fatal, which is exactly why it is worth naming. The run continues against a
-// catalog that is correct, having just told the operator it is diverged — and "the tool
-// says something alarming that turns out to mean nothing" is how a real divergence
-// warning stops being read.
+// catalog that is correct, having just told the operator it is diverged. An alarming
+// message that reliably means nothing is how a real divergence warning stops being read.
 func forkOrSync(ctx context.Context, st *engine.State, org string) error {
 	// A pinned catalog must not be fast-forwarded. `gh repo sync` moves the fork's main
 	// to upstream's, and the local checkout is then rewound to the pin — so the fork
@@ -770,15 +769,14 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 			"eks-gitops/docs/runbooks/observability-tier.md")
 	}
 
-	// druid is real money and opt-in. landing-zone now sets skip_final_snapshot /
-	// final_snapshot_identifier on Aurora and force_destroy on the per-tenant buckets
-	// (development always; elsewhere via force_destroy_buckets — the two-act contract
-	// target 11 wires). Development tears down cleanly; staging/production need that
-	// flag applied before destroy.
+	// druid is real money and opt-in. landing-zone sets skip_final_snapshot /
+	// final_snapshot_identifier on Aurora and force_destroy on the per-tenant buckets —
+	// unconditionally in development, elsewhere behind force_destroy_buckets. Development
+	// therefore tears down cleanly; staging and production need that flag applied first.
 	if st.Config.Addons.Druid {
 		note(st, "addons.druid: true — applying the per-tenant analytics substrate (Aurora Serverless, "+
 			"optionally MSK). Development tears down cleanly; outside development a destroy needs "+
-			"force_destroy_buckets applied first (rackctl destroy --force-buckets once target 11 lands)")
+			"force_destroy_buckets applied first — pass `rackctl destroy --force-buckets`")
 	}
 
 	// Say exactly what model-import provisions, and — more importantly — what it does

@@ -134,8 +134,8 @@ func tgEnvWith(base []string, cfg *config.Config) []string {
 		// enable_accelerators is deliberately absent. It labelled the cluster
 		// eks-agent-platform/accelerators=true so the accelerators ApplicationSet targeted it,
 		// and the whole GPU path — that ApplicationSet, the accelerator-pools component, and
-		// landing-zone's variable and label — was deleted upstream (ledger O27). The variable is
-		// now undeclared, so injecting it would be inert rather than wrong; it is gone anyway,
+		// landing-zone's variable and label — no longer exists upstream. The variable is
+		// undeclared, so injecting it would be inert rather than wrong; it is absent anyway,
 		// because a knob whose documentation promises an effect it no longer has is worse than
 		// no knob. addons.accelerators is refused at config load, not ignored — see
 		// internal/config/retired.go.

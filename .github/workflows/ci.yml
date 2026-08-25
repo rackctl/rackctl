@@ -36,8 +36,8 @@ jobs:
       # be advisory until somebody remembered to add it to the ruleset, and an advisory gate on a
       # repo with a no-bypass ruleset is just a slower way of not having one.
       #
-      # It runs before build and test because its most valuable linter is `unused`, and dead code
-      # compiles and passes tests by definition — this repo shipped two such symbols.
+      # It runs before build and test because its most valuable linter is `unused`, and dead
+      # code compiles and passes tests by definition — so no amount of testing can find it.
       #
       # Pinned to the same version developers get from Homebrew, so a clean local run means a
       # clean CI run. Config in .golangci.yml.
@@ -64,6 +64,12 @@ jobs:
       # that adds a pin, while this fails the build.
       - name: renovate pin coverage
         run: python3 ./scripts/pins.py
+      # The enforceable subset of documentation-voice: verification tallies, internal
+      # issue/PR/ledger references, prose addressed to an agent, and unowned markers.
+      # The rest of that standard is review — a gate claiming coverage it does not have is
+      # itself the failure mode, so this one states its subset and holds only that.
+      - name: prose
+        run: python3 ./scripts/prose.py
       # With no package manifest beyond go.mod, the workflows ARE a dependency surface —
       # every action runs with the job's token and permissions. --offline so the verdict is
       # a function of the commit under test rather than of what GitHub's API answers today.

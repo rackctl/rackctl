@@ -77,9 +77,9 @@ that queried nothing could only ever restate its own filter back.
 Outside development, several S3 buckets (agent-iam artifacts, cluster-addons
 velero/loki/tempo, model-import staging, druid deepstorage) refuse a destroy
 when non-empty unless force_destroy has been applied into state first. Pass
---force-buckets with --apply to do that two-act sequence: apply the owning
-components with TF_VAR_force_destroy_buckets=true, then destroy. Development
-always allows teardown without the flag.
+--force-buckets to do that two-act sequence: apply the owning components with
+TF_VAR_force_destroy_buckets=true, then destroy. Development always allows
+teardown without the flag.
 
 druid is covered: the permitting apply clears its Aurora deletion_protection in
 the same act that lands force_destroy, so act 2 reaches both the per-tenant

@@ -196,9 +196,9 @@ func TestEngineDoesNotRollBackOnNoRollbackError(t *testing.T) {
 // teardown destroys the EKS cluster and the VPC. A re-apply that tripped on a config error
 // would demolish a healthy, running platform.
 //
-// Not hypothetical: a re-apply failed on a ClusterRoleBinding conflict, the engine began
-// rolling back, and the only reason a 44/44-healthy cluster survived is that the process
-// happened to be killed mid-teardown.
+// The path is the ordinary one, not an exotic one: re-applying is how an operator retries
+// after a failure, so any later phase failing on a re-apply reaches the teardown with
+// phases 1-4 recorded as completed and a healthy platform underneath them.
 //
 // NoRollbackError guards a convergence timeout. This guards the more dangerous case: the
 // operator does not lose a wait, they lose the platform.

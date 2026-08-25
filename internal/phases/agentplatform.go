@@ -74,7 +74,7 @@ type apComponent struct {
 // upstream — the component and its three live leaves with it — after three layers of it turned
 // out to be inert: a DRA chart pinned to a name published by no registry, values describing an
 // AcceleratorPool CRD that exists nowhere, and a driver mutually exclusive with the gpu-operator
-// sitting beside it at an adjacent sync wave. The model path is Bedrock. Ledger O27.
+// sitting beside it at an adjacent sync wave. The model path is Bedrock.
 //
 // The two cost roots are gated by agentPlatform.costPipeline, and gated TOGETHER, because
 // half of the pair is worse than neither. cost-access exists only to read what cost-pipeline
@@ -164,11 +164,11 @@ func agentPlatformEnv(st *engine.State) ([]string, error) {
 	// sets TERRAGRUNT_ACCOUNT_ID for landing-zone, and this tree does not read that name.
 	env = append(env, "AWS_ACCOUNT_ID="+st.Config.Cloud.AccountID)
 
-	// Two variables, two outputs — one each. This used to read a single output and assign it
-	// twice, on the reasoning that there was no separate "logs" and "data" CMK to read. That was
-	// true when it was written and stopped being true with landing-zone#205.
+	// Two variables, two outputs — one each, read separately rather than one output assigned
+	// twice. The two CMKs are distinct whenever the operator asks for them to be, and an
+	// installer that cannot express the difference cannot honour that request.
 	//
-	// The secrets component now takes `separate_logs_key`. It defaults to false, which mints one
+	// The secrets component takes `separate_logs_key`. It defaults to false, which mints one
 	// key and publishes it as BOTH kms_key_arn and logs_kms_key_arn — so reading the log-path
 	// output changes nothing today. Set it true and the log-path grants (logs.<region>
 	// .amazonaws.com and bedrock.amazonaws.com) MOVE to a second key rather than being copied,
@@ -179,7 +179,7 @@ func agentPlatformEnv(st *engine.State) ([]string, error) {
 	// passing the data key as logs_kms_key_arn does not silently encrypt logs under the wrong
 	// key — it fails at CreateLogGroup with a KMS error. Fail-closed and loud, but still a
 	// failed install rather than a caught misconfiguration, and reading the right output avoids
-	// it entirely. Ledger O25.
+	// it entirely.
 	dataKMS, err := needOutput(st, "kms_key_arn", "secrets")
 	if err != nil {
 		return nil, err
@@ -224,9 +224,8 @@ func agentPlatformEnv(st *engine.State) ([]string, error) {
 	//
 	// The only component that ever took it was accelerator-pools, which attached an inline
 	// ec2:Describe* policy to the Karpenter node role for the AWS Neuron device plugin's topology
-	// discovery. The Neuron half went first (O24), taking `var.node_role_name` with it; the whole
-	// component went shortly after, when the GPU path was deleted (O27). So there is now no root
-	// in this tree that declares the variable at all.
+	// discovery. That component no longer exists, and neither does `var.node_role_name`, so no
+	// root in this tree declares the variable at all.
 	//
 	// tofu ignores a TF_VAR_ naming a variable no root declares, so the export was inert rather
 	// than broken. What was not inert was the `needOutput(st, "karpenter_node_role_name",
@@ -293,7 +292,8 @@ func agentPlatformAccountEnv(st *engine.State) ([]string, error) {
 //
 // It earns its place on the DESTROY path. `rackctl destroy` starts cold and reads these outputs
 // back out of a state nothing has re-applied, so a hard needOutput here would refuse to tear
-// down any platform installed before landing-zone#205 — and it would refuse at the point where
+// down any platform whose secrets state predates the second key output — and it would refuse
+// at the point where
 // the operator has already decided to spend nothing more. A teardown that cannot run is the
 // exact failure this is meant to prevent, not an acceptable price for strictness.
 func logsKMSKey(st *engine.State, dataKMS string) string {
@@ -601,8 +601,7 @@ func assertAgentPlatformRoots(st *engine.State) error {
 // plan as well as an apply. So destroying landing-zone's agent-iam or observability first
 // leaves most of these leaves unable to plan their own destroy at all: they fail at parameter
 // resolution, before deleting anything. eval-runtime adds a second constraint — it owns EKS Pod
-// Identity associations, so it must go before the cluster. accelerator-pools was the other half
-// of that constraint until the GPU path was deleted upstream (ledger O27).
+// Identity associations, so it must go before the cluster.
 //
 // Exported for `rackctl destroy`, which walks the teardown outside the phase engine.
 func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatformTeardown) error {
@@ -721,8 +720,9 @@ type AgentPlatformTeardown struct {
 	// shared by every environment installed here. Tearing down development with this on, while
 	// production is live, deletes production's invocation logging outright — no name to scope
 	// it by, nothing red, and invocation logging is the signal every budget decision reads.
-	// That is ledger O14's failure returning through the teardown door rather than the apply
-	// door, and an installer does not get to make that call implicitly.
+	// An account-wide singleton removed as a side effect of one environment's teardown is the
+	// same failure as one created by it, arriving through the other door — and an installer
+	// does not get to make that call implicitly.
 	//
 	// Leaving them standing costs a Bedrock logging configuration, a CUR and five buckets in an
 	// account with nothing left to use them, which is disclosed by name rather than left to a
@@ -740,9 +740,9 @@ type AgentPlatformTeardown struct {
 // noteAccountScopedTeardown says exactly what a teardown is about to leave behind, or about to
 // take from everyone else.
 //
-// Naming the survivors matters more here than in the usual disclosure, because target 5 verifies
-// a teardown as a set difference against a baseline: anything left standing shows up as an
-// unexplained resource unless it was declared in advance.
+// Naming the survivors matters more here than in the usual disclosure. A teardown is verified
+// as a set difference against a baseline, so anything left standing reads as an unexplained
+// resource unless it was declared in advance.
 func noteAccountScopedTeardown(st *engine.State, comps []apComponent, opts AgentPlatformTeardown) {
 	var account []string
 	for _, c := range comps {

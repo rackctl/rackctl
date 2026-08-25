@@ -641,11 +641,11 @@ func TestOperatorRoles_DryRunEnumeratesSoItCanBeNegativeTested(t *testing.T) {
 // The reap must disarm ArgoCD before deleting anything a controller owns.
 //
 // Every catalog Application carries automated.selfHeal, and a Platform CR is
-// catalog-managed — so deleting one is drift, and ArgoCD corrects drift. Observed on a
-// live teardown: the reap deleted Platform/ops, its finalizer removed the tenant's IAM
-// roles, and ArgoCD recreated the Platform seconds later, which made the operator mint
-// the roles again. agent-iam then fails on DeleteConflict several components later,
-// naming a managed policy rather than the race that repopulated it.
+// catalog-managed — so deleting one is drift, and ArgoCD corrects drift within seconds.
+// Reaping without disarming therefore loops: the finalizer removes the tenant's IAM roles,
+// ArgoCD recreates the Platform, the operator mints the roles again. agent-iam then fails
+// on DeleteConflict several components later, naming a managed policy rather than the race
+// that repopulated it.
 //
 // The assertion is on ORDER, not merely on presence: patching after the deletes would be
 // a no-op with a reassuring log line.

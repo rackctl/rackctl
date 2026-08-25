@@ -99,20 +99,16 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 
 	// Rollback is only ever safe when this run BUILT the thing it is about to destroy.
 	//
-	// `rackctl apply` is re-runnable by design (#16): it is how an operator retries after a
+	// `rackctl apply` is re-runnable by design: it is how an operator retries after a
 	// failure, and how they re-apply a config change to a platform that is already up.
 	// Against an existing cluster, phases 1-4 all "succeed" as no-ops — the network is
-	// there, the cluster is there, nothing is created. They are recorded as `completed`
+	// there, the cluster is there, nothing is created — and are recorded as `completed`
 	// all the same.
 	//
-	// So a failure in ANY later phase used to tear those phases down — and phase 4's
-	// teardown destroys the EKS cluster and the VPC. A re-apply that tripped on a config
-	// error would demolish a healthy, running platform that the run had not created and
-	// was never asked to remove.
-	//
-	// That is not hypothetical. A re-apply failed on a ClusterRoleBinding conflict, the
-	// engine began rolling back, and the only reason a 44/44-healthy cluster survived is
-	// that the process happened to be killed mid-teardown.
+	// A failure in any later phase would therefore tear those phases down, and phase 4's
+	// teardown destroys the EKS cluster and the VPC. The blast radius is a healthy,
+	// running platform this run did not create and was never asked to remove, reached
+	// through the ordinary retry path rather than through anything exotic.
 	//
 	// NoRollbackError guards one case — a convergence timeout must not destroy the cloud.
 	// This guards the other, and it is the more dangerous one: the operator did not lose a
@@ -301,8 +297,8 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) 
 	// Let the controllers delete what they — not Terraform — created, while they are
 	// still alive to do it. Without this a rollback tears the cluster down on top of
 	// live PVCs and Platform CRs, orphaning EBS volumes and IAM roles that nothing
-	// will ever clean up. `rackctl destroy` already did this; the rollback did not,
-	// and a failed install left three unattached volumes behind.
+	// will ever clean up — they are invisible to terraform state and bill indefinitely.
+	// Both teardown paths need it, which is why it lives in its own package.
 	//
 	// But ONLY once this run actually built the cluster, and that condition is the whole
 	// point rather than a tidy-up. Every call below acts on ambient state: reap.All and

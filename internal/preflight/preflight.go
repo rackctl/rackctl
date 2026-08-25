@@ -8,7 +8,8 @@
 // first four provisioning runs was knowable in advance and cost a full run to find:
 //
 //   - `BucketAlreadyExists` on a bucket name that is globally unique across every AWS
-//     account on earth. Unrecoverable by retry. Discovered 6 minutes in.
+//     account on earth. Unrecoverable by retry, and surfaced only once the apply reaches
+//     the bucket — minutes of provisioning after the name became knowable.
 //   - `ResourceInUseException` — two components claiming Pod Identity for one service
 //     account. A service account can hold exactly one association.
 //   - A `gh repo fork` 403 that made `init` permanently un-rerunnable.

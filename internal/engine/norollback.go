@@ -12,11 +12,11 @@ package engine
 // still crashlooping, the infrastructure is not what is broken, and destroying it
 // removes the only surface on which the problem can be diagnosed.
 //
-// Observed: a fresh install provisioned cleanly, ArgoCD generated all 44 Applications,
-// 42 of them went Healthy, and opencost was still crashlooping (it fails until metrics
-// reach AMP, which takes minutes). The 30-minute convergence wait expired, the phase
-// failed, and the engine destroyed a working EKS cluster — losing the evidence and
-// forty minutes of provisioning, because one workload needed five more.
+// The catalog contains workloads that cannot converge until something outside the wait
+// completes: opencost crashloops until its metrics reach AMP, which takes minutes of
+// scraping. A convergence deadline can therefore expire over a correctly provisioned
+// cloud with one workload still settling — and a rollback there destroys the cluster,
+// the evidence, and the whole provisioning run to remedy nothing.
 //
 // A phase returning this says: the cloud is provisioned, something on it has not
 // settled, leave it standing and let `rackctl check` say what.

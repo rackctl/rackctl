@@ -37,7 +37,7 @@ type retiredField struct {
 var retiredFields = []retiredField{
 	{
 		path: "addons.accelerators",
-		gone: "the GPU/accelerator stack was deleted upstream (ledger O27) — the addons-accelerators " +
+		gone: "the GPU/accelerator stack does not exist upstream — the addons-accelerators " +
 			"ApplicationSet in eks-gitops, the accelerator-pools component and its live roots in " +
 			"eks-agent-platform, and landing-zone's enable_accelerators variable and cluster label. " +
 			"Three layers of it were inert: the DRA chart named a release published by no registry, " +
