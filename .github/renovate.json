@@ -127,6 +127,18 @@
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "opentofu/opentofu",
       "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "goreleaser, installed in CI so the release config is built rather than only read. An env: value in a workflow, which no native manager reads.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "GORELEASER_VERSION:\\s*(?<currentValue>v[\\d.]+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "goreleaser/goreleaser"
     }
   ]
 }

@@ -55,7 +55,7 @@ jobs:
         with:
           version: v2.13.1
       - run: go build ./...
-      - name: terragrunt and opentofu
+      - name: terragrunt, opentofu and goreleaser
         # Installed so the argv contract test RUNS here. Without them it skips, and a skip
         # prints into a green job: every other terragrunt assertion in this repo checks the
         # argv rackctl produces against a fake on PATH, which proves rackctl agrees with
@@ -64,6 +64,7 @@ jobs:
         env:
           TERRAGRUNT_VERSION: v1.1.3
           TOFU_VERSION: 1.12.6
+          GORELEASER_VERSION: v2.18.0
         run: |
           # Verified against the publishers' own SHA256SUMS, not merely pinned by version.
           # These write executables onto PATH, and a tag can be moved. Read from the
@@ -88,9 +89,22 @@ jobs:
           unzip -q "$tofu_zip" tofu
           sudo install -m 0755 tofu /usr/local/bin/tofu
 
-          rm -f "$tg" tg.sums tofu "$tofu_zip" tofu.sums
+          # goreleaser the same way, and NOT via its action: the action publishes runtime
+          # artifacts, which makes the module cache this job restores a poisoning path into
+          # a release. `go install` is not open either — that module needs a newer Go than
+          # this job pins, and the toolchain pin is deliberate.
+          gr=goreleaser_Linux_x86_64.tar.gz
+          base=https://github.com/goreleaser/goreleaser/releases/download/$GORELEASER_VERSION
+          curl -fsSL -o "$gr" "$base/$gr"
+          curl -fsSL -o gr.sums "$base/checksums.txt"
+          grep " $gr\$" gr.sums | sha256sum -c -
+          tar -xzf "$gr" goreleaser
+          sudo install -m 0755 goreleaser /usr/local/bin/goreleaser
+
+          rm -f "$tg" tg.sums tofu "$tofu_zip" tofu.sums "$gr" gr.sums goreleaser
           terragrunt --version
           tofu version
+          goreleaser --version
       - name: test
         env:
           # A tool-contract test may not SKIP here. Skipping prints into a green job, and
@@ -155,17 +169,6 @@ jobs:
           # `declare -A` and case-modification expansion. Only executing rejects them.
           /bin/sh ./scripts/install_test.sh
           /bin/sh ./scripts/coverage.sh --controls-only
-      # zizmor: ignore[cache-poisoning]
-      # The audit's shape is real and this job is not it: `install-only` plus
-      # `build --snapshot` publishes nothing, so a poisoned module cache has no artifact to
-      # reach. The job that DOES publish is release.yml, and it runs setup-go with
-      # `cache: false` for exactly this reason.
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
-        with:
-          install-only: true
-          # The same constraint the release job resolves, so this step checks the config
-          # against the goreleaser that will actually publish it.
-          version: "~> v2"
       - name: release config
         # The release path was config-read-only: nothing ever ran goreleaser, so a config
         # that had stopped producing binaries would surface at tag time.
