@@ -124,6 +124,11 @@ EXEMPT = [
         "the floor, whose known-bad fixtures are by construction the violations the gates "
         "it probes exist to reject",
     ),
+    (
+        re.compile(r"scripts/crasher\.py$"),
+        "the floor's crash control, which must name a planted violation in its exception "
+        "for that control to test what it was built to test",
+    ),
 ]
 
 
@@ -275,6 +280,10 @@ NOT_A_REPO_PATH = [
     (re.compile(r"^[\d./]+$"), "a CIDR or a numeric literal, not a path"),
     (re.compile(r"^rackctl\.yaml$"),
      "the operator's own config, which they write and .gitignore keeps out of the tree"),
+    (re.compile(r"^(os|path|encoding|math|net|text|crypto|go|internal/poll|database|"
+                r"container|compress|debug|hash|image|index|log|mime|regexp|runtime|"
+                r"sync|testing|unicode|archive)/"),
+     "a Go standard-library import path, which names a package rather than a file here"),
     (re.compile(r"^(terraform|live|components|modules|charts|config|deploy)/"),
      "a path inside a repo rackctl drives"),
 ]

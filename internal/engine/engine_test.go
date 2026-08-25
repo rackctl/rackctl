@@ -600,6 +600,11 @@ func TestTeardownRunsOnALiveContextAfterAnInterrupt(t *testing.T) {
 	// still inside the phase, exactly as a Ctrl-C during a terragrunt apply does.
 	boom := ctxPhase{id: "boom", fail: true, cancelOnRun: cancel}
 
+	// Restored, like every other override in this file. PlatformExists is a package
+	// global, so leaving it set leaks into whichever test the runner reaches next — and a
+	// suite that passes alone and fails beside its sibling is the hardest kind to read.
+	orig := PlatformExists
+	defer func() { PlatformExists = orig }()
 	PlatformExists = func(context.Context, *State) PlatformState { return PlatformAbsent }
 	e := &Engine{Phases: []Phase{built, boom}, Out: io.Discard, CleanOnFail: true}
 	if err := e.Run(ctx, &State{Config: &config.Config{}, Runner: exec.New(io.Discard)}); err == nil {
@@ -622,6 +627,8 @@ func TestTeardownFailureReachesTheCallerUnderAHook(t *testing.T) {
 	built := ctxPhase{id: "built", teardownErr: errors.New("DependencyViolation")}
 	boom := ctxPhase{id: "boom", fail: true}
 
+	orig := PlatformExists
+	defer func() { PlatformExists = orig }()
 	PlatformExists = func(context.Context, *State) PlatformState { return PlatformAbsent }
 	e := &Engine{
 		Phases: []Phase{built, boom}, Out: io.Discard, CleanOnFail: true,

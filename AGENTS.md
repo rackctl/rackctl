@@ -58,8 +58,14 @@ scripts/        the gate suite (see below) and the installer
 docs/           runbook, exit codes
 ```
 
-Every subprocess in the repo goes through `internal/exec` — `grep -rn '"os/exec"'` returns
-that package and nothing else. If you are adding a call to an external tool, it goes there.
+Every subprocess in **production** code goes through `internal/exec`, which is the only
+place that carries the timeout ceilings, the per-invocation identity and the dry-run split.
+If you are adding a call to an external tool, it goes there.
+
+Tests are the exception and import `os/exec` directly, because what they spawn is not a
+tool rackctl orchestrates: `cmd/e2e_test.go` builds the binary and runs it, and
+`internal/phases/checkout_test.go` drives a real `git` to set up a fixture. Neither should
+inherit a Runner's ceilings.
 
 ## Adding a phase
 

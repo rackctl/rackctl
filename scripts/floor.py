@@ -18,6 +18,17 @@ good fixture, and one that accepts everything fails the bad one.
 
 FIXTURES ARE OWNED HERE. A gate does not supply the input that tests it, for the same
 reason it does not supply the verdict.
+
+WHICH TREE THIS GRADES: the WORKING tree. Fixtures are built from literals in this file,
+and each gate is invoked by path out of scripts/ as it exists on disk — nothing is
+materialised from the git index. So an uncommitted edit to a gate is seen here, which is
+the direction wanted while editing, and it means a green floor is a statement about the
+working tree rather than about HEAD. Checking the committed tree is a separate act:
+`git archive HEAD | tar -x -C <dir>` and run the gates there.
+
+WHAT THIS CANNOT DO: probe itself. The rules below are exercised — the crash rule has a
+control built to defeat the other two — but nothing here would notice if this file stopped
+discovering gates in a way its own checks do not cover. That is its standing blind spot.
 """
 
 import json
@@ -37,6 +48,8 @@ SCRIPTS = os.path.join(REPO, "scripts")
 # an entry naming a file that no longer exists fails the run, so it cannot outlive what it
 # excused.
 NOT_A_GATE = {
+    "crasher.py": "the floor's own control: a deliberately crashing gate, used to prove the "
+                  "crash check below can still fire",
     "install.sh": "shipped to operators, not a gate",
     "floor.py": "this file — the floor cannot probe itself, which is its own blind spot",
     "gatelib.py": "helpers the gates import; it makes no verdict of its own",
@@ -54,6 +67,26 @@ SOFT_FAIL = (
     "|| exit 0",
     "set +e",
 )
+
+
+# A CRASH IS NOT A REJECTION. A gate that raises exits non-zero and prints a traceback, and
+# a floor reading only the status records that as a successful catch — exit-code-conflates-
+# causes occurring inside the thing built to check for it.
+#
+# Worse together with the marker rule than either alone: a gate that crashes ONLY on the bad
+# fixture, with an exception naming the planted file, satisfies BOTH. scripts/crasher.py is
+# exactly that gate, kept as this check's control.
+CRASH_MARKERS = (
+    "Traceback (most recent call last)",
+    "SyntaxError", "IndentationError", "ImportError", "ModuleNotFoundError",
+    "panic:", "fatal error:", "Segmentation fault",
+    "command not found", "No such file or directory",
+    ": line ",          # a shell script dying mid-statement
+)
+
+
+def crashed(out):
+    return any(m in out for m in CRASH_MARKERS)
 
 
 def run(cmd, cwd=None, env=None):
@@ -185,9 +218,43 @@ FIXTURES = {
 }
 
 
+def self_check(d):
+    """Prove the crash rule can still fire, using a gate built to defeat the other two.
+
+    The floor cannot probe itself as a whole — that is its standing blind spot — but a rule
+    it can exercise is a rule that has been shown to work rather than read.
+    """
+    crasher = os.path.join(SCRIPTS, "crasher.py")
+    if not os.path.exists(crasher):
+        print(f"floor: {crasher} is missing — the crash rule has no control, so nothing "
+              "shows it can still fire", file=sys.stderr)
+        return 1
+    good = os.path.join(d, "sc-good"); os.makedirs(good, exist_ok=True)
+    bad = os.path.join(d, "sc-bad"); os.makedirs(bad, exist_ok=True)
+    open(os.path.join(bad, "BAD"), "w").write("x")
+
+    rc_good, out_good = run(["python3", crasher], None, {"REPO_ROOT": good})
+    rc_bad, out_bad = run(["python3", crasher], None, {"REPO_ROOT": bad})
+
+    if crashed(out_good) or rc_good != 0:
+        print("floor: the crash control does not pass its own good fixture", file=sys.stderr)
+        return 1
+    if not crashed(out_bad):
+        print("floor: the crash control crashed and this floor did not notice — the crash "
+              "rule has stopped firing", file=sys.stderr)
+        return 1
+    if rc_bad == 0 or "Ledger O27" not in out_bad:
+        print("floor: the crash control no longer defeats the status and marker rules, so "
+              "it is not testing what it was built to test", file=sys.stderr)
+        return 1
+    print("floor: crash rule fires on a gate built to defeat the status and marker rules")
+    return 0
+
+
 def main():
     status = 0
     d = tempfile.mkdtemp()
+    status |= self_check(d)
 
     # ── every gate is discovered, and every one must have a fixture pair ─────
     discovered = sorted(
@@ -215,7 +282,12 @@ def main():
 
         (good_cmd, good_cwd, good_env), (bad_cmd, bad_cwd, bad_env), marker = FIXTURES[name](d)
 
-        rc, _ = run(good_cmd, good_cwd, good_env)
+        rc, good_out = run(good_cmd, good_cwd, good_env)
+        if crashed(good_out):
+            print(f"floor: {name} CRASHED on a known-good input — a gate that cannot run is "
+                  "not a gate that passes", file=sys.stderr)
+            status = 1
+            continue
         if rc != 0:
             print(f"floor: {name} REJECTED a known-good input — a gate that fails everything "
                   "fails nothing", file=sys.stderr)
@@ -223,6 +295,13 @@ def main():
             continue
 
         rc, out = run(bad_cmd, bad_cwd, bad_env)
+        if crashed(out):
+            print(f"floor: {name} CRASHED on the known-bad input rather than rejecting it. A "
+                  "crash exits non-zero and can even name the planted violation in its "
+                  "exception, so it satisfies both the status and the marker check while "
+                  "performing no check at all.", file=sys.stderr)
+            status = 1
+            continue
         if rc == 0:
             print(f"floor: {name} ACCEPTED a known-bad input — it cannot reject", file=sys.stderr)
             status = 1
