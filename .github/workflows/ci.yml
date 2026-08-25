@@ -53,9 +53,46 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.12.2
+          version: v2.13.1
       - run: go build ./...
-      - run: go test -race ./...
+      - name: terragrunt and opentofu
+        # Installed so the argv contract test RUNS here. Without them it skips, and a skip
+        # prints into a green job: every other terragrunt assertion in this repo checks the
+        # argv rackctl produces against a fake on PATH, which proves rackctl agrees with
+        # itself and nothing more. RACKCTL_REQUIRE_TOOL_CONTRACTS on the test step
+        # turns that skip into a failure, so this step cannot quietly stop covering it.
+        env:
+          TERRAGRUNT_VERSION: v1.1.3
+          TOFU_VERSION: 1.12.6
+        run: |
+          # Verified against the publishers' own SHA256SUMS, not merely pinned by version.
+          # These write executables onto PATH, and a tag can be moved. Read from the
+          # published sums file rather than a hash committed here, so a Renovate bump does
+          # not have to carry a hash it cannot compute.
+          base=https://github.com/gruntwork-io/terragrunt/releases/download/$TERRAGRUNT_VERSION
+          curl -fsSL -o terragrunt "$base/terragrunt_linux_amd64"
+          curl -fsSL -o tg.sums "$base/SHA256SUMS"
+          grep ' terragrunt_linux_amd64$' tg.sums | sha256sum -c -
+          sudo install -m 0755 terragrunt /usr/local/bin/terragrunt
+
+          base=https://github.com/opentofu/opentofu/releases/download/v$TOFU_VERSION
+          curl -fsSL -o tofu.zip "$base/tofu_${TOFU_VERSION}_linux_amd64.zip"
+          curl -fsSL -o tofu.sums "$base/tofu_${TOFU_VERSION}_SHA256SUMS"
+          grep " tofu_${TOFU_VERSION}_linux_amd64.zip$" tofu.sums | sha256sum -c -
+          unzip -q tofu.zip tofu
+          sudo install -m 0755 tofu /usr/local/bin/tofu
+
+          rm -f terragrunt tg.sums tofu tofu.zip tofu.sums
+          terragrunt --version
+          tofu version
+      - name: test
+        env:
+          # A tool-contract test may not SKIP here. Skipping prints into a green job, and
+          # the terragrunt contract test is the only one in this repo that reaches the real
+          # tool — every other terragrunt assertion checks rackctl against a fake on PATH,
+          # which proves rackctl agrees with itself. See terragrunt_contract_test.go.
+          RACKCTL_REQUIRE_TOOL_CONTRACTS: "1"
+        run: go test -race ./...
       # A coverage floor that nothing gates on is a number, not a guarantee: it falls
       # silently, and it falls fastest in the code least pleasant to test — which here is
       # the code that terminates instances and deletes roles. Runs as a step of `build`
