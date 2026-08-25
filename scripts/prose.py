@@ -85,7 +85,7 @@ RULES = [
     ),
     (
         "unowned-todo",
-        re.compile(r"(?i)\b(?:TODO|FIXME|XXX|HACK)\b(?!\s*\([^)]+\))"),
+        re.compile(r"(?i)\b(?:TODO|FIXME|XXX|HACK)\b(?![ \t]*\([^)]+\))"),
         "a marker with no owner. Either do it, or state the constraint that makes the "
         "current shape correct",
     ),
@@ -187,11 +187,17 @@ def path_claims(root, rel, text):
 
 def check(root, assert_exemptions=False):
     findings, scanned = [], 0
+    # Counted per rule and printed. A gate that passes over zero targets is sometimes
+    # legitimately correct — empty is not always wrong — but INVISIBLE-empty never is: a
+    # rule matching nothing because nothing of its shape exists and a rule matching nothing
+    # because it is broken produce the same silent pass.
+    examined = {"prose spans": 0, "path claims": 0}
     exempt_hits = {r.pattern: 0 for r, _ in EXEMPT}
 
     for rel, text in walk(root):
         scanned += 1
         for n, prose in prose_lines(rel, text):
+            examined["prose spans"] += 1
             for rule, pattern, remedy in RULES:
                 m = pattern.search(prose)
                 if m:
@@ -200,6 +206,7 @@ def check(root, assert_exemptions=False):
     path_exempt = {r.pattern: 0 for r, _ in NOT_A_REPO_PATH}
     for rel, text in walk(root):
         for n, cand in path_claims(root, rel, text):
+            examined["path claims"] += 1
             skip = False
             for r, _ in NOT_A_REPO_PATH:
                 if r.search(cand):
@@ -241,7 +248,7 @@ def check(root, assert_exemptions=False):
                                  f"this exemption ({why}) matches nothing — an exemption that "
                                  "outlives what it exempted hides the next violation of that shape"))
 
-    return scanned, findings
+    return scanned, findings, examined
 
 
 # ── positive controls ────────────────────────────────────────────────────────
@@ -295,7 +302,7 @@ def run_controls():
         open(os.path.join(root, "x.go"), "w").write(body)
 
     lay(CLEAN)
-    scanned, findings = check(root)
+    scanned, findings, _ = check(root)
     if findings:
         print("prose: the clean control fixture does not pass, so no rejection below proves "
               "anything:", file=sys.stderr)
@@ -307,7 +314,7 @@ def run_controls():
     failed = False
     for name, body in CONTROLS:
         lay(body)
-        _, findings = check(root)
+        _, findings, _ = check(root)
         if findings:
             print(f"control: {name} rejected")
         else:
@@ -318,7 +325,7 @@ def run_controls():
     md = os.path.join(root, "doc.md")
     for name, body, want in PATH_CONTROLS:
         open(md, "w").write(body)
-        _, findings = check(root)
+        _, findings, _ = check(root)
         hit = [f for f in findings if f[2] == "unresolved-path"]
         if want == "accept":
             if hit:
@@ -335,7 +342,7 @@ def run_controls():
 
     # The enumeration must fail on empty, not pass.
     empty = tempfile.mkdtemp()
-    _, findings = check(empty)
+    _, findings, _ = check(empty)
     if findings:
         print("control: an empty enumeration rejected")
     else:
@@ -351,7 +358,7 @@ def main():
     if "--controls-only" in sys.argv:
         return
 
-    scanned, findings = check(REPO, assert_exemptions=True)
+    scanned, findings, examined = check(REPO, assert_exemptions=True)
     if findings:
         print(f"prose: {len(findings)} violation(s) of the enforceable subset of "
               f"documentation-voice:", file=sys.stderr)
@@ -363,6 +370,11 @@ def main():
 
     print(f"prose: {scanned} file(s) scanned, no tallies, internal references, "
           f"agent-addressed prose or unowned markers")
+    for what, n in examined.items():
+        if n == 0:
+            print(f"  {what}: 0 examined — this rule asserted NOTHING on this tree")
+        else:
+            print(f"  {what}: {n} examined")
 
 
 if __name__ == "__main__":

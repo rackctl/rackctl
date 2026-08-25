@@ -152,7 +152,7 @@ VERSION_SHAPED = re.compile(r"(@v?\d+(\.\d+)*|==\d+(\.\d+)*|[\"']?~>\s*v\d+|:\s*
 # would make it live, so it is written the safe way.
 USES = re.compile(r"^[ \t]*-?[ \t]*uses:[ \t]*(\S+)")
 SHA_PIN = re.compile(r"@[0-9a-f]{40}(\s|$)")
-VERSION_COMMENT = re.compile(r"#\s*v?\d+(\.\d+)*\s*$")
+VERSION_COMMENT = re.compile(r"#[ \t]*v?\d+(\.\d+)*[ \t]*$")
 
 
 def discover(root):
@@ -222,8 +222,11 @@ def check(root, renovate_path, assert_exemptions=False):
                                 "(# vN.N.N) — Renovate cannot tell what version the SHA currently is")
             continue
 
-        # A value pin is watched only when a real customManager regex matches THIS line.
-        if not any(m.claims(path, line) for m in managers):
+        # RAW, not blanked. The question here is "would Renovate match this line", and
+        # Renovate reads the whole file — so a manager whose regex legitimately matches
+        # inside a comment is LIVE, and asking the blanked view would declare it dead. The
+        # view has to be the consumer's, not the one that is convenient here.
+        if not any(m.claims(path, raw.rstrip()) for m in managers):
             problems.append(f"{path}:{n}: no customManager in {renovate_path} matches this pin:\n"
                             f"      {raw.strip()}")
 
@@ -237,7 +240,7 @@ def check(root, renovate_path, assert_exemptions=False):
             problems.append(f"the NOT_A_PIN exemption {pat!r} ({why}) matches nothing — "
                             "an exemption that outlives what it exempted hides the next pin of that shape")
 
-    return counts, problems
+    return counts, problems, managers
 
 
 # ── positive controls ────────────────────────────────────────────────────────
@@ -333,7 +336,7 @@ def run_controls():
 
     # Anti-vacuity: the clean fixture must PASS before any mutation is believed.
     rn = lay(CLEAN_WORKFLOW, CLEAN_RENOVATE)
-    _, problems = check(root, rn)
+    _, problems, _ = check(root, rn)
     if problems:
         die("the clean control fixture does not pass, so no rejection below proves anything:\n  "
             + "\n  ".join(problems))
@@ -345,7 +348,7 @@ def run_controls():
         want = entry[2] if len(entry) > 2 else "reject"
         wf, rnj = mutate(CLEAN_WORKFLOW, CLEAN_RENOVATE)
         rn = lay(wf, rnj)
-        _, problems = check(root, rn)
+        _, problems, _ = check(root, rn)
         if want == "accept":
             if problems:
                 print(f"control: {name} — the gate reported a finding it should not have:", file=sys.stderr)
@@ -359,10 +362,21 @@ def run_controls():
         else:
             print(f"control: {name} was ACCEPTED — this gate cannot catch it", file=sys.stderr)
             failed = True
+    # The stripper must preserve the line COUNT, not merely the numbers of the lines this
+    # fixture happens to check. A refactor from blanking a comment's body to deleting the
+    # line passes an off-by-one assertion on a fixture with one comment and fails here.
+    joined = "\n".join(blank_comment_body(l) for l in LINE_FIDELITY.splitlines())
+    if len(joined.splitlines()) != len(LINE_FIDELITY.splitlines()):
+        print("control: the stripper does not preserve the line count — every citation "
+              "below a comment is shifted", file=sys.stderr)
+        failed = True
+    else:
+        print("control: the stripper preserves the line count")
+
     # Line fidelity, checked against a fixture whose violation sits at a line number no
     # off-by-N could reach by accident.
     lay(LINE_FIDELITY, CLEAN_RENOVATE)
-    _, problems = check(root, os.path.join(root, "renovate.json"))
+    _, problems, _ = check(root, os.path.join(root, "renovate.json"))
     mutable = [p for p in problems if "mutable tag" in p]
     if len(mutable) != 1:
         print(f"control: line fidelity — expected exactly one mutable-tag finding, got {mutable}", file=sys.stderr)
@@ -383,8 +397,8 @@ def main():
     if "--controls-only" in sys.argv:
         return
 
-    counts, problems = check(REPO, os.path.join(REPO, ".github", "renovate.json"),
-                             assert_exemptions=True)
+    counts, problems, managers = check(REPO, os.path.join(REPO, ".github", "renovate.json"),
+                                       assert_exemptions=True)
     if problems:
         print("pins: unwatched or unverifiable version pins:", file=sys.stderr)
         for p in problems:
@@ -393,6 +407,8 @@ def main():
 
     print(f"pins: {counts['action']} action ref(s), {counts['value']} value pin(s), "
           f"{counts['gomod']} module(s) — all watched")
+    for m in managers:
+        print(f"  {m.dep}: {m.hits} pin(s) matched")
 
 
 if __name__ == "__main__":

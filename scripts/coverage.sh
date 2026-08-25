@@ -68,7 +68,9 @@ check_report() {
     status=1
   fi
 
+  checked=0
   for entry in $CRITICAL_FUNCS; do
+    checked=$((checked + 1))
     file="${entry%%:*}"
     func="${entry##*:}"
 
@@ -91,6 +93,10 @@ check_report() {
     fi
   done
 
+  # The denominator. A pass over zero critical functions and a pass over all of them read
+  # identically without it, and the first means the list emptied rather than the tree
+  # improved.
+  echo "coverage: $checked destructive-path function(s) checked"
   return "$status"
 }
 
