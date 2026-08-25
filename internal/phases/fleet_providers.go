@@ -11,7 +11,18 @@ import (
 )
 
 // fleetRoleARNLine matches the ServiceAccount annotation eks-fleet ships as a placeholder.
-var fleetRoleARNLine = regexp.MustCompile(`(?m)^(\s*)eks\.amazonaws\.com/role-arn:.*$`)
+//
+// [ \t]* rather than \s*: under (?m), `^` matches at every line start and \s matches a
+// newline, so `^(\s*)` starts the match on a blank line ABOVE the annotation and reports a
+// position that is not the annotation's. The rewrite happens to survive that because ${1}
+// re-emits the whitespace it swallowed — so this is a locator defect with no output
+// corruption today, and exactly the shape that becomes one the moment a caller reports the
+// position or the replacement stops re-emitting the capture.
+//
+// The anchor also keeps a COMMENTED annotation out: `# eks.amazonaws.com/role-arn:` has a
+// '#' where the pattern requires the key, so a superseded line above the live one cannot
+// win the match.
+var fleetRoleARNLine = regexp.MustCompile(`(?m)^([ \t]*)eks\.amazonaws\.com/role-arn:.*$`)
 
 // renderFleetProviders writes a copy of eks-fleet's config/bootstrap/providers.yaml with
 // the real hub role ARN substituted, and returns the path to apply.

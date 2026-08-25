@@ -96,3 +96,36 @@ func TestRenderFleetProviders_DryRunTouchesNothing(t *testing.T) {
 		t.Fatal("a dry-run must not write a rendered file into the checkout")
 	}
 }
+
+// The locator for a WRITE path, controlled in both directions and for its position.
+//
+// Three properties, each of which a plausible pattern gets wrong: a commented annotation
+// above the live one must not win the match; the match must start at the annotation's own
+// line rather than on a blank line above it; and the live annotation must be rewritten.
+func TestFleetRoleARNLine_LocatesTheLiveAnnotationAndOnlyThat(t *testing.T) {
+	body := "  annotations:\n" +
+		"    # superseded: eks.amazonaws.com/role-arn: arn:aws:iam::<FLEET_ACCOUNT_ID>:role/old\n" +
+		"\n" +
+		"    eks.amazonaws.com/role-arn: arn:aws:iam::<FLEET_ACCOUNT_ID>:role/live\n"
+
+	if got := len(fleetRoleARNLine.FindAllString(body, -1)); got != 1 {
+		t.Fatalf("matched %d lines, want 1 — a commented annotation above the live one must "+
+			"not win the match", got)
+	}
+
+	// The match must begin at the annotation's own line start. \s* would begin it on the
+	// blank line above and report a position that is not the annotation's.
+	want := strings.Index(body, "    eks.amazonaws.com/role-arn:")
+	if got := fleetRoleARNLine.FindStringIndex(body)[0]; got != want {
+		t.Errorf("match starts at byte %d, want %d — the pattern swallowed the blank line "+
+			"above the annotation, so any position it reports is not the annotation's", got, want)
+	}
+
+	out := fleetRoleARNLine.ReplaceAllString(body, "${1}eks.amazonaws.com/role-arn: NEW")
+	if !strings.Contains(out, "    eks.amazonaws.com/role-arn: NEW") {
+		t.Errorf("the live annotation was not rewritten:\n%s", out)
+	}
+	if !strings.Contains(out, "role/old") {
+		t.Errorf("the commented annotation was rewritten:\n%s", out)
+	}
+}

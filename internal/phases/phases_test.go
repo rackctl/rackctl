@@ -803,7 +803,7 @@ func TestSubstrate_DisclosesThatNothingRoutesAlertsIntoTheSeverityTopics(t *test
 // method each verb reached rather than which one the source appears to name.
 func TestTG_DestroyRetriesATransientFailureAndApplyDoesNot(t *testing.T) {
 	for _, tc := range []struct {
-		verb    string
+		verb     string
 		attempts string
 	}{
 		{"destroy", "3"},

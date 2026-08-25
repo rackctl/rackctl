@@ -24,14 +24,60 @@ import (
 // phase already resolves to this account.
 const Placeholder = "000000000000"
 
-// SubstituteAccountID replaces every Placeholder occurrence with accountID and
+// SubstituteAccountID replaces every Placeholder occurrence in VALUES with accountID and
 // returns the rewritten content plus the number of replacements.
+//
+// Comments are left alone, and this is a write path so that matters twice over.
+//
+// The account id must never be committed to the public catalog — that is the entire reason
+// the placeholder exists. Substituting it inside a comment writes the real id into the
+// operator's fork in a place nothing reads and nobody thinks to look, which is a leak
+// rather than a rewrite. And the count is reported to the operator and decides whether the
+// file is written at all, so counting a comment hit means a file whose only placeholder is
+// commentary is rewritten and reported as substituted while nothing functional changed.
+//
+// Line by line with the comment split found quote-aware, rather than blanking and
+// replacing: the comments have to survive verbatim in the output, so the locator and the
+// writer must agree on the same boundary.
 func SubstituteAccountID(content, accountID string) (string, int) {
-	n := strings.Count(content, Placeholder)
+	if !strings.Contains(content, Placeholder) {
+		return content, 0
+	}
+	lines := strings.Split(content, "\n")
+	var n int
+	for i, line := range lines {
+		value, comment := splitComment(line)
+		c := strings.Count(value, Placeholder)
+		if c == 0 {
+			continue
+		}
+		n += c
+		lines[i] = strings.ReplaceAll(value, Placeholder, accountID) + comment
+	}
 	if n == 0 {
 		return content, 0
 	}
-	return strings.ReplaceAll(content, Placeholder, accountID), n
+	return strings.Join(lines, "\n"), n
+}
+
+// splitComment divides a YAML line into its value and its trailing comment, respecting
+// quotes so a '#' inside a quoted string is not mistaken for one.
+func splitComment(line string) (value, comment string) {
+	var quote byte
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '#' && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t'):
+			return line[:i], line[i:]
+		}
+	}
+	return line, ""
 }
 
 // WriteBack rewrites every values-<env>.yaml under <gitopsDir>/addons/**,
