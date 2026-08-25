@@ -517,12 +517,14 @@ type dashboardList struct {
 //
 // Two distinct failures, both silent — the CRs exist, so nothing looks wrong:
 //
-//   - InvalidSpec: the dashboard's grafana.com id no longer exists upstream and the
-//     operator 404s fetching it. Dashboard ids die; three had.
+//   - InvalidSpec: the dashboard's grafana.com id is absent upstream and the operator
+//     404s fetching it. A grafana.com id is somebody else's mutable identifier, so a
+//     catalog pinning one inherits its removal.
 //   - ApplyFailed: the dashboard resolved but Grafana refused to save it. Amazon
 //     Managed Grafana runs unified alerting and rejects any dashboard still carrying
-//     a legacy panel `alert` block with a 500. One such dashboard held an entire
-//     Application — and app-of-apps above it — Degraded.
+//     a legacy panel `alert` block with a 500. One such dashboard holds its whole
+//     Application — and app-of-apps above it — Degraded, which is why a dashboard
+//     failure is a platform failure rather than a cosmetic one.
 func CheckDashboards(ctx context.Context, env *Env) Result {
 	const name = "dashboards"
 

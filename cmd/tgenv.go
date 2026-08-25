@@ -71,11 +71,11 @@ func bindIdentity(ctx context.Context, cfg *config.Config, run *exec.Runner) ([]
 // account.hcl is a placeholder) and the tfstate bucket is
 // {account}-{region}-tfstate, so terragrunt must see the real account.
 //
-// TF_VAR_gitops_repo_url is the one that matters most, and its absence was a real
-// bug: cluster-bootstrap's gitops_repo_url used to default to the UPSTREAM catalog
-// (nanohype/eks-gitops), and rackctl never passed a value — it only printed the
-// fork's name in a log line. So every install wired its app-of-apps to upstream
-// main, unpinned, while the fork rackctl had just created for the org sat unread.
+// TF_VAR_gitops_repo_url is the one that matters most, and its ABSENCE is the bug it
+// prevents: cluster-bootstrap's gitops_repo_url defaults to the upstream catalog, so an
+// installer that prints the fork's name in a log line and passes no value wires every
+// install's app-of-apps to upstream main, unpinned, while the fork it just created for the
+// org sits unread.
 // A cluster vended into another org was found syncing from nanohype/eks-gitops@main.
 //
 // landing-zone now declares gitops_repo_url with NO default, so a missing value

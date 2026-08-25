@@ -195,10 +195,9 @@ func (r *Runner) Capture(ctx context.Context, name string, args ...string) (stri
 // wrong for the enumeration half of a destructive sweep, and wrong in a way that hides the
 // only question a dry-run of a sweep is asked: what would this select?
 //
-// Every sweep in internal/reap used to answer that with a sentence. `rackctl destroy`
-// without --apply printed "force-delete operator-minted IAM roles under
-// /eks-agent-platform/tenants/ named <cluster>-*" and queried nothing, so it could describe
-// its own filter and never demonstrate it. In an account holding one estate that is a
+// A sweep that answers it with a sentence — "force-delete operator-minted IAM roles under
+// /eks-agent-platform/tenants/ named <cluster>-*" — queries nothing, so it describes its
+// own filter and never demonstrates it. In an account holding one estate that is a
 // cosmetic gap. In an account holding three it is the difference between a checkable claim
 // and a promise — the sweep cannot be shown to select zero pre-existing resources, because
 // in dry-run it selects nothing at all, for the wrong reason.
@@ -209,7 +208,7 @@ func (r *Runner) Capture(ctx context.Context, name string, args ...string) (stri
 // Callers must only pass list/describe/get verbs. Nothing here enforces that, and nothing
 // can — it is a contract, and the reason this is a separate method rather than a flag on
 // Capture is so the contract is visible at every call site.
-// Query deliberately does NOT inherit Runner.Dir, and that is not a shortcut.
+// Query does NOT inherit Runner.Dir.
 //
 // Runner.Dir is a repo checkout — `rackctl destroy` sets it to
 // ~/.rackctl/<org>/landing-zone so terragrunt runs in the right tree. A cloud API query's

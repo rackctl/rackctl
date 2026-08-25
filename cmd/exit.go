@@ -9,10 +9,10 @@ import (
 	"github.com/rackctl/rackctl/internal/tui"
 )
 
-// Exit statuses. Every failure mode used to collapse to 1, which meant an agent — or a CI
-// step, or a retry loop — could not tell "this config is invalid" from "the platform is
-// half-built and billing". They are the same signal only if nothing downstream ever has to
-// decide what to do next.
+// Exit statuses. Collapsing every failure mode to 1 leaves an agent — or a CI step, or a
+// retry loop — unable to tell "this config is invalid" from "the platform is half-built and
+// billing". They are the same signal only if nothing downstream ever has to decide what to
+// do next.
 //
 // The numbers are a contract: they are documented in docs/exit-codes.md, asserted by
 // TestExitCodes_AreStableAndDistinct, and must not be renumbered.

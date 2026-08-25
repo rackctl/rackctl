@@ -149,10 +149,10 @@ type plannedBucket struct {
 //	                                     org-<account>-<region>-cost-{access-logs,estimates,athena}-<account>
 //	backends         init-backend-aws.sh / agentplatform.go
 //
-// The last two used to be composed as <cluster>-bedrock-* and <cluster>-cost-*, which is the
-// shape eks-agent-platform had before it account-scoped both components. Those names are not
-// stale in the harmless sense — nothing creates them now, so the check was looking for names
-// that cannot exist while missing the ones that do, which reads as a clean preflight over an
+// The last two are account-scoped, not cluster-scoped: <account>-<region>-bedrock-* and
+// org-<account>-<region>-cost-*. Composing them as <cluster>-bedrock-* and <cluster>-cost-*
+// is the trap — nothing creates those names, so a check looking for them cannot collide
+// while missing the ones that can, which reads as a clean preflight over an
 // unchecked estate.
 //
 // The account id appears twice in the cost names and once in the bedrock ones. That asymmetry
@@ -533,8 +533,8 @@ func CheckBedrockLogging(ctx context.Context, env *Env) doctor.Result {
 //
 // # Two halves of one bill, and they are attributed by different mechanisms
 //
-// The check used to look for a bare `PlatformId` and report healthy when it found one. That
-// covers the tenant's DATASTORES and nothing else, because attribution by resource tag requires
+// Looking for a bare `PlatformId` and reporting healthy on finding one covers the tenant's
+// DATASTORES and nothing else, because attribution by resource tag requires
 // a resource that can carry a tag — and a Bedrock model invocation is not one. No `resourceTags/`
 // key is ever populated on an invocation line.
 //
@@ -590,7 +590,7 @@ func CheckCostAllocationTags(ctx context.Context, env *Env) doctor.Result {
 	}
 
 	// The model-spend half. Reported whether or not the resource-tag half is healthy, because
-	// "PlatformId is active" is precisely the observation that used to hide it.
+	// "PlatformId is active" is precisely the observation that hides it.
 	modelSpend := ""
 	if !iamPrincipal["PlatformId"] && !active["iamPrincipal/PlatformId"] {
 		modelSpend = "No iamPrincipal/PlatformId is active, so MODEL spend is unattributed — and " +

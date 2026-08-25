@@ -7,8 +7,8 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// A retired field is one rackctl used to honour and no longer does, usually because the thing it
-// switched on was deleted upstream.
+// A retired field is one rackctl does not honour, named here so a config still setting it is
+// refused rather than ignored. They are usually fields whose upstream feature is gone.
 //
 // Deleting the Go field is the whole fix in a strict decoder. It is not the whole fix here:
 // Load uses sigs.k8s.io/yaml, which routes through encoding/json and IGNORES keys with no

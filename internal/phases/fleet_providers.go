@@ -27,9 +27,9 @@ var fleetRoleARNLine = regexp.MustCompile(`(?m)^(\s*)eks\.amazonaws\.com/role-ar
 // so the phase declares success and every spoke vend fails later with no obvious cause.
 //
 // It is also actively destructive of a correct setup. kubectl apply is declarative, so an
-// operator who had put the real ARN on the ServiceAccount gets it reverted to the
-// placeholder — which is what rackctl used to do immediately after printing a note telling
-// them to make sure that annotation was right.
+// operator who has put the real ARN on the ServiceAccount gets it reverted to the
+// placeholder — and a note telling them to check that annotation, printed immediately
+// before reverting it, is worse than saying nothing.
 //
 // rackctl supplies fragile per-run inputs; this is one. The ARN is normally COMPUTED
 // rather than configured: the substrate phase applies landing-zone's fleet-hub into this

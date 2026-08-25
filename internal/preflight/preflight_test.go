@@ -108,7 +108,7 @@ func TestCheckGitHubToken_FailsWhenTheConfigNeedsATokenAndNoneExists(t *testing.
 }
 
 // `gh auth login` stores the credential in gh's keyring and exports nothing. rackctl
-// bridges it, so this is a healthy state rather than the failure it used to be.
+// bridges it, so this is a healthy state rather than a failure.
 func TestCheckGitHubToken_OKWhenGhHoldsOne(t *testing.T) {
 	fakeBin(t, "gh", `[ "$1 $2" = "auth token" ] && echo ghs_x; exit 0`)
 

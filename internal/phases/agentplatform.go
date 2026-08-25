@@ -53,10 +53,9 @@ type apComponent struct {
 // (/eks-agent-platform/org/bedrock-account/invocation_log_group) and subscribes to the log group
 // bedrock-account owns.
 //
-// That ordering used to be expressed as a terragrunt `dependency "bedrock"` block, and the
-// comment here still said so long after it stopped being true. The dependency is real; the
-// mechanism is SSM now, which means terragrunt will NOT enforce it — a wrong order fails at
-// apply against a parameter that does not exist yet, rather than being reordered for us. So the
+// The dependency is real and terragrunt does NOT enforce it: the mechanism is SSM, not a
+// `dependency` block, so a wrong order fails at apply against a parameter that does not
+// exist yet rather than being reordered. So the
 // order in this slice is load-bearing in a way it was not before.
 //
 // cost-access goes last in the cluster chain because it is the join: it reads the account
@@ -628,10 +627,10 @@ func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatf
 		}
 	}
 
-	// A missing landing-zone output on the DESTROY path is not an error, and the message it
-	// used to produce said so itself: "Nothing in eks-agent-platform/terraform has been
-	// applied yet, so nothing needs unwinding" — and then returned that as a failure, which
-	// the destroy counted and exited non-zero on.
+	// A missing landing-zone output on the DESTROY path is not an error. "Nothing in
+	// eks-agent-platform/terraform has been applied yet, so nothing needs unwinding" is a
+	// statement that the teardown has nothing to do, and returning it as a failure would
+	// have the destroy count it and exit non-zero over an empty tree.
 	//
 	// The state bucket check above is necessary and not sufficient: rackctl creates that
 	// bucket outside terraform, so it outlives the tree it holds state for. A second

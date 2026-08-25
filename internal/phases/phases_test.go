@@ -21,8 +21,8 @@ import (
 // every AWS dependency the addons need. ArgoCD failing to install — a GitHub 401 on the
 // tenants-repo deploy key, a chart that will not render — is not a reason to demolish any
 // of it. The convergence wait further down this same phase already says exactly that; the
-// apply above it used to return BARE, so the sweep ran and destroyed the cluster and the
-// VPC over a credential fixable in ten seconds.
+// apply above it must not return BARE, or the sweep runs and destroys the cluster and the
+// VPC over a credential fixable in seconds.
 func TestGitopsPhase_AFailedInstallDoesNotDestroyTheProvisionedCloud(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {

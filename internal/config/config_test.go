@@ -407,11 +407,11 @@ func TestFleetHubRoleARN_ExplicitOverridesTheDerivedOne(t *testing.T) {
 	}
 }
 
-// eksFleet with no fleetHubRoleArn is now the NORMAL configuration, and must validate.
+// eksFleet with no fleetHubRoleArn is the NORMAL configuration and must validate.
 //
-// It used to be an error whose remedy was `terragrunt output -raw hub_role_arn` against a
-// root rackctl does not apply — against a tree whose cluster dependency has no state, so
-// the command could not run either.
+// Requiring one would send the operator to `terragrunt output -raw hub_role_arn` against a
+// root rackctl does not apply, in a tree whose cluster dependency has no state — a remedy
+// that cannot be followed.
 func TestValidate_EKSFleetDoesNotRequireAPastedHubRole(t *testing.T) {
 	c := Default()
 	c.Org.Name = "acme"

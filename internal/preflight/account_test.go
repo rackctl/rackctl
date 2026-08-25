@@ -276,9 +276,9 @@ func TestSessionLifetime_NoExpiryIsNotAFailure(t *testing.T) {
 
 // ─────────────────────────── cost allocation ───────────────────────────
 //
-// Two halves of one bill, attributed by different mechanisms, activated separately. The check
-// used to look only at the bare key — which reports healthy on an account whose model spend,
-// the dominant cost, is entirely unattributed.
+// Two halves of one bill, attributed by different mechanisms, activated separately. Looking
+// only at the bare key reports healthy on an account whose model spend — the dominant cost —
+// is entirely unattributed.
 
 // Both keys active covers the tenant's DATASTORES and says nothing about model spend. A
 // Bedrock invocation is not a taggable resource, so no resourceTags/ key is ever populated on

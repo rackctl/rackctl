@@ -14,10 +14,10 @@ import (
 )
 
 // Update has a VALUE receiver, so everything it records lands on the model it
-// returns and never on the receiver. RunInit used to read the outcome off its own
-// local copy, which those assignments could not reach, so every failed run exited
-// 0. Assert both halves: the returned model carries the error, and the receiver
-// does not — the second is the part that made the bug invisible.
+// returns and never on the receiver. Reading the outcome off a local copy instead
+// misses every assignment Update made, so a failed run exits 0. Assert both halves:
+// the returned model carries the error, and the receiver does not — the second is
+// what makes the mistake invisible.
 func TestUpdateRecordsErrorOnReturnedModelNotReceiver(t *testing.T) {
 	boom := errors.New("phase 3 exploded")
 	m := model{rows: []phaseRow{{title: "one"}}, events: make(chan engine.Event, 1)}
@@ -47,10 +47,10 @@ func (failingPhase) Enabled(*engine.State) bool                    { return true
 func (p failingPhase) Run(context.Context, *engine.State) error    { return p.err }
 func (failingPhase) Teardown(context.Context, *engine.State) error { return nil }
 
-// THE regression test. RunInit used to return the error off its own local model,
-// which Update's value receiver could never write to — so `rackctl apply --tui`
-// exited 0 on a genuine phase failure, in the invocation the quickstart, runbook
-// and README all recommend. This fails against that version and passes now.
+// THE regression test. Returning the error off RunInit's own local model — which
+// Update's value receiver can never write to — makes `rackctl apply --tui` exit 0
+// on a genuine phase failure, in the invocation the quickstart, runbook and README
+// all recommend. This fails against that shape.
 func TestRunInitReturnsPhaseFailure(t *testing.T) {
 	boom := errors.New("the cluster phase failed")
 	st := &engine.State{Runner: exec.New(io.Discard)}

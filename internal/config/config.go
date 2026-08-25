@@ -132,9 +132,9 @@ type OrgGitOps struct {
 // This is the value cluster-bootstrap hands to the app-of-apps Application and
 // publishes on the ArgoCD cluster Secret, from which every ApplicationSet in the
 // catalog templates its own source. It must therefore point at the ORG'S FORK, not
-// at the upstream catalog: landing-zone's gitops_repo_url used to default to
-// nanohype/eks-gitops, and because nothing passed a value, every install silently
-// synced from upstream main while the org's fork sat unread.
+// at the upstream catalog. cluster-bootstrap's own default is the upstream repo, so an
+// installer that passes no value wires every install to upstream main while the org's fork
+// sits unread — silently, because the app-of-apps is healthy either way.
 //
 // Returns "" for an empty repo so callers can detect the unset case rather than
 // emit a URL like "https://.git".
@@ -631,9 +631,9 @@ func Default() *Config {
 			EndpointPublicAccess: true,
 			// Matches landing-zone's system_node_instance_types default, for the same reason
 			// Version does. No leaf pins the variable, and a value equal to Default() is never
-			// injected — so the single-type list rackctl used to show was not merely wrong, it
-			// was UNREACHABLE: an operator who deliberately wanted Graviton3 only wrote exactly
-			// that, nothing was injected, and m6g nodes joined the group anyway.
+			// injected — so a single-type list here would not merely be wrong, it would be
+			// UNREACHABLE: an operator deliberately wanting Graviton3 only would write exactly
+			// that, nothing would be injected, and m6g nodes would join the group anyway.
 			SystemNodes: NodeGroup{InstanceTypes: []string{"m7g.xlarge", "m6g.xlarge"}, MinSize: 2, MaxSize: 6, DesiredSize: 2},
 			Network:     ClusterNet{VPCCIDR: defaultVPCCIDR, NATGateways: 1},
 		},

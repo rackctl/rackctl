@@ -60,9 +60,9 @@ func (s PlatformState) rollbackBlocked() bool { return s != PlatformAbsent }
 // PlatformExists reports whether the platform was ALREADY provisioned when this run
 // started. It is the difference between a rollback and a demolition.
 //
-// It FAILS CLOSED. This used to be `return err == nil` over a describe-cluster,
-// which collapsed "there is no platform" and "I could not find out" into the same
-// answer — and picked the one that ARMS the rollback. Expired credentials midway
+// It FAILS CLOSED. A `return err == nil` over a describe-cluster collapses "there is no
+// platform" and "I could not find out" into the same answer — and picks the one that ARMS
+// the rollback. Expired credentials midway
 // through a long run, a throttle, or a transient network fault was enough to make a
 // re-apply against a healthy platform look like a fresh install, and the teardown
 // below destroys the EKS cluster and the VPC. The failure mode the whole rollback
@@ -159,10 +159,11 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 			// see NoRollbackError. A workload that has not converged is not a reason to
 			// destroy the cloud it is running on.
 			var noRollback *NoRollbackError
-			// Optionality is decided FIRST. `case preexisting:` used to come first and
-			// shadowed this arm entirely: on a re-apply — which is when preexisting is
-			// true, and the ordinary way an operator retries — a failing optional phase
-			// took the preexisting branch, fell out of the switch and returned. The
+			// Optionality is decided FIRST, and the order is load-bearing. With
+			// `case preexisting:` ahead of it this arm is shadowed entirely: on a re-apply
+			// — which is when preexisting is true, and the ordinary way an operator retries
+			// — a failing optional phase takes the preexisting branch, falls out of the
+			// switch and returns. The
 			// `continue` below was unreachable in exactly the situation it was written
 			// for, so one optional phase failing still cancelled every optional phase
 			// after it. Neither arm rolls back; only this one lets the run go on.
@@ -186,10 +187,9 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				// optional phase inherits it instead of having to remember.
 				//
 				// And the run CONTINUES. The reasoning above — that nothing an optional
-				// phase installs is a prerequisite for anything else — cuts both ways, and
-				// the loop used to honour only half of it: it declined to roll back, then
-				// returned, so a failure in one optional phase cancelled every optional
-				// phase after it.
+				// phase installs is a prerequisite for anything else — cuts both ways.
+				// Honouring only half of it, declining to roll back and then returning,
+				// cancels every optional phase after the one that failed.
 				//
 				// What that cost is specific. portal is the day-2 UI and smoke is the
 				// first-tenant vend, they share nothing, and portal is ordered first — so
@@ -306,10 +306,10 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) 
 	// -A` and patch finalizers off CRs against WHATEVER the kubeconfig currently points
 	// at, and the cluster phase is the only place rackctl ever repoints it. So a failure
 	// in preflight, acquire or identity — none of which create a cluster, and identity is
-	// not wrapped in NoRollbackError — used to reach this code with the kubeconfig still
-	// aimed at the operator's previous context. Bootstrapping staging from a laptop
-	// pointed at a healthy development cluster meant a failed `scripts/init-backend-aws.sh`
-	// deleted every Platform and PVC in development.
+	// not wrapped in NoRollbackError — would otherwise reach this code with the kubeconfig
+	// still aimed at the operator's previous context. Bootstrapping staging from a laptop
+	// pointed at a healthy development cluster would then let a failed
+	// `scripts/init-backend-aws.sh` delete every Platform and PVC in development.
 	//
 	// This is the same invariant assertComponentRoots holds with NoRollbackError, and the
 	// reason it cannot be left to callers to remember: a precondition failure must never

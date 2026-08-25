@@ -219,10 +219,10 @@ func destroy(ctx context.Context, st *engine.State, component string) error {
 // Destroy runs one component's teardown with its scoped env. Exported for `rackctl destroy`,
 // which walks CoreComponents in reverse outside the phase engine.
 //
-// It exists so that path cannot drift from this one. It used to restate the init+destroy
-// sequence itself and build its env from tgEnv alone — so a standalone `rackctl destroy`
-// passed none of the per-component variables the apply had, and the cluster component fell
-// back to its own default name. Restating what a shared helper already does is the mistake
+// It exists so that path cannot drift from this one. A destroy that restated the
+// init+destroy sequence itself and built its env from tgEnv alone would pass none of the
+// per-component variables the apply passed, and the cluster component would fall back to
+// its own default name. Restating what a shared helper already does is the mistake
 // substrateComponents was written to prevent; this is the same mistake one layer down.
 func Destroy(ctx context.Context, st *engine.State, component string) error {
 	return destroy(ctx, st, component)
@@ -231,9 +231,9 @@ func Destroy(ctx context.Context, st *engine.State, component string) error {
 // componentEnv returns the TF_VARs a single landing-zone component declares. Components not
 // named here take nothing beyond the globals in tgEnv.
 //
-// Every entry must correspond to a variable that component actually declares. TF_VAR_cluster_name
-// used to be injected into `network` as well, on the stated grounds that "network and cluster
-// must agree on it or Karpenter/ELB discovery breaks" — but components/aws/network declares no
+// Every entry must correspond to a variable that component actually declares.
+// TF_VAR_cluster_name does NOT go to `network`, however plausible "network and cluster must
+// agree on it or Karpenter/ELB discovery breaks" sounds: components/aws/network declares no
 // cluster_name variable at all, and its own comment says the cluster-ownership and
 // Karpenter-discovery tags are per-cluster and applied by the CLUSTER component via
 // aws_ec2_tag, precisely because the VPC is shared per environment and cluster-agnostic.
@@ -415,10 +415,10 @@ type acquire struct{ base }
 //
 // Two things this must get right, and the naive version gets neither.
 //
-// `git clone` fails outright if the target exists, so a rerun of init used to die
-// before doing anything. Reruns are the NORMAL case: the engine's rollback destroys
-// cloud resources but deliberately does not delete the operator's repos or working
-// copies, so the second invocation always finds them.
+// `git clone` fails outright if the target exists, so a bare clone cannot survive a
+// rerun — and reruns are the NORMAL case: the engine's rollback destroys cloud resources
+// but deliberately does not delete the operator's repos or working copies, so the second
+// invocation always finds them.
 //
 // But merely REUSING what is there is worse than failing. These checkouts are the
 // infrastructure code — landing-zone is what terragrunt applies. A stale clone means a
@@ -447,12 +447,12 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir, ref string) 
 		if fresh {
 			return nil
 		}
-		// Removing a pin has to actually unpin. A previous pinned run left this
-		// checkout on a detached HEAD, and `git pull --ff-only` cannot fast-forward
-		// one — so dropping the entry from `versions` used to leave the repo sitting
-		// on the old commit forever, while the note blamed a divergence that had not
-		// happened. The config said latest, the disk said the old tag, and the
-		// diagnosis pointed somewhere else entirely.
+		// Removing a pin has to actually unpin. A previous pinned run leaves this
+		// checkout on a detached HEAD, and `git pull --ff-only` cannot fast-forward one —
+		// so dropping the entry from `versions` without reattaching leaves the repo on the
+		// old commit forever, while the note blames a divergence that has not happened.
+		// The config says latest, the disk says the old tag, and the diagnosis points
+		// somewhere else entirely.
 		if err := reattachHEAD(ctx, st, name); err != nil {
 			note(st, "%s: unpinned, but could not return to the default branch (%v) — this run "+
 				"will use the code as it stands on disk", name, err)
@@ -662,8 +662,8 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 	// operator's egress IP when the allow-list is empty. Config validation has already
 	// rejected any contradictory network combination.
 	//
-	// This phase deliberately sets nothing on st.Runner.Env. It used to, and those variables
-	// then rode into every phase after it; see the comment on apply().
+	// This phase sets nothing on st.Runner.Env: a variable left there rides into every phase
+	// after it, and an ambient TF_VAR beats whatever a later leaf pinned. See apply().
 	note(st, "provisioning VPC then EKS control plane (network → cluster; strict ordering)")
 	for _, comp := range []string{"network", "cluster"} {
 		if err := apply(ctx, st, comp); err != nil {
@@ -1027,10 +1027,11 @@ var agentPlatformCRDs = []string{
 // on the ArgoCD cluster Secret. The chart carries its own crds/, so the CRDs come
 // with it.
 //
-// This phase used to `helm upgrade --install operator` on top of that — a SECOND,
-// competing Helm release of the same chart, racing ArgoCD for ownership of the same
-// Deployment, ClusterRoles and CRDs. It pulled oci://ghcr.io/nanohype/charts/operator,
-// which does not exist (the release workflow's chart-push-to-OCI step is skipped, and
+// This phase does NOT `helm upgrade --install operator` on top of that. Doing so would be
+// a SECOND, competing Helm release of the same chart, racing ArgoCD for ownership of the
+// same Deployment, ClusterRoles and CRDs — and it would pull
+// oci://ghcr.io/nanohype/charts/operator, which does not exist (the release workflow's
+// chart-push-to-OCI step is skipped, and
 // that path 403s), then silently fell back to a local clone — so the cluster ran an
 // operator installed from a working copy on the machine that happened to run rackctl,
 // while ArgoCD believed it owned one from git.
@@ -1112,10 +1113,9 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 
 // Teardown destroys the agent-platform AWS substrate this phase applied.
 //
-// The operator itself is untouched, for the reason this used to be a no-op entirely: it is an
-// ArgoCD Application, so it goes when the cluster does. Uninstalling a Helm release rackctl
-// no longer creates would fail, and deleting it out from under ArgoCD would just make ArgoCD
-// put it back.
+// The operator itself is untouched: it is an ArgoCD Application, so it goes when the
+// cluster does. Uninstalling a Helm release rackctl does not create would fail, and
+// deleting it out from under ArgoCD would only make ArgoCD put it back.
 //
 // The terraform tree is different — rackctl applies it directly, so rackctl owns unwinding
 // it, and it has to happen HERE rather than later in the rollback. Reverse-phase order puts
@@ -1484,9 +1484,9 @@ const tenantControlPlaneNamespace = "eks-agent-platform"
 // Two traps live in these three lines, and this phase fell into both.
 //
 // The chart's values are nested under `platform.` — platform.name, platform.tenant,
-// platform.persona. rackctl used to pass bare `tenant=` and `persona=`, and never passed
-// platform.name at all. Helm accepts unknown --set paths silently, so those became three
-// orphan values no template reads, and the render died on the chart's own
+// platform.persona. Passing bare `tenant=` and `persona=` — and no platform.name at all —
+// is the shape that fails: Helm accepts unknown --set paths silently, so those become three
+// orphan values no template reads, and the render dies on the chart's own
 // `fail "platform.name is required"` guard before a single object was created. Silence is
 // why it survived: --set on a path nothing reads produces no warning, and the phase is
 // opt-in, so an install that never enabled a firstTenant looked entirely healthy.

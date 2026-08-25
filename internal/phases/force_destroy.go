@@ -86,10 +86,10 @@ func PermitBucketTeardown(ctx context.Context, st *engine.State) error {
 	//	live/aws/../_envcommon/aws/agent-iam.hcl: Unknown variable; There is no
 	//	variable named "dependency".
 	//
-	// That used to abort the whole destroy BEFORE the component loop — the third place a
-	// pre-loop step could strand everything behind it. It is also moot in exactly that
-	// case: the bucket-owning components have usually already been destroyed, so there is
-	// nothing left to permit.
+	// Aborting on it would stop the whole destroy BEFORE the component loop — a pre-loop
+	// step that strands everything behind it. It is also moot in exactly that case: the
+	// bucket-owning components have usually already been destroyed, so there is nothing
+	// left to permit.
 	//
 	// So a permit that fails is a warning, not a verdict. The DESTROY is what has to be
 	// honest, and it is: a bucket that really cannot be emptied fails its own component

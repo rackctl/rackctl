@@ -122,7 +122,7 @@ func TestClusterBootstrapEnv_TenantsRepo(t *testing.T) {
 // ─────────────────────── the github credential ───────────────────────
 //
 // Setting tenants_repo_url arms cluster-bootstrap's `provider "github"`, which reads
-// GITHUB_TOKEN and nothing else. Nothing used to supply it, so the apply 401'd in phase 5
+// GITHUB_TOKEN and nothing else. Without something supplying it the apply 401s in phase 5
 // — with the VPC and the EKS cluster already built.
 
 // tokenState returns a NON-dry-run state (the point is to exec the fake gh) whose notes

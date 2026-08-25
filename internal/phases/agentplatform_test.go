@@ -817,10 +817,10 @@ func TestAgentPlatformComponents_CostRootsAreGatedAsAPair(t *testing.T) {
 // A tree that was never applied must not wedge the teardown.
 //
 // This tree writes to its own state bucket, created by the platform phase and by nothing
-// else. `terragrunt init` against a missing bucket errors, and `rackctl destroy` used to
-// return that error before it reached the landing-zone components — so a run that failed
-// in the cluster or gitops phase left the EKS control plane, the VPC and the NAT gateway
-// billing, and reported a component tree that had never been applied. rackctl points
+// else. `terragrunt init` against a missing bucket errors, and returning that error before
+// reaching the landing-zone components would leave a run that failed in the cluster or
+// gitops phase with the EKS control plane, the VPC and the NAT gateway billing, reporting a
+// component tree that had never been applied. rackctl points
 // operators at `rackctl destroy` from three separate pre-platform failure branches, so
 // this is a designed outcome rather than an edge case.
 func TestDestroyAgentPlatform_SkipsWhenTheTreeWasNeverApplied(t *testing.T) {
@@ -845,7 +845,7 @@ func TestDestroyAgentPlatform_SkipsWhenTheTreeWasNeverApplied(t *testing.T) {
 	}
 	if _, err := os.Stat(logf); err == nil {
 		t.Fatal("terragrunt was invoked against a tree with no state bucket — that init fails, " +
-			"and its error is what used to abort the whole teardown before the EKS cluster")
+			"and its error is what would abort the whole teardown before the EKS cluster")
 	}
 }
 

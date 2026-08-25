@@ -61,6 +61,9 @@ RULES = [
           | \b\d+\s*/\s*\d+-(?:healthy|green|passing)\b   # "a 44/44-healthy cluster"
           | \b(?:all|only)\s+\d+\s+(?:Applications|findings|hits|files|symbols)\b
           | \bstood\s+at\s+\d+\b
+          | \b(?:two|three|four|five|six|seven|eight|nine|ten)\s+
+              (?:had|did|were|have|do)\b                  # "Dashboard ids die; three had."
+          | \b(?:one|two|three|four|five)\s+such\s+\w+\s+(?:held|caused|broke)\b
         """),
         "a measurement stated as documentation. It was true when written and nothing keeps "
         "it true. State the requirement it was evidence for, or the invariant a gate now "
@@ -272,6 +275,7 @@ CONTROLS = [
     ("a session tally", CLEAN + "\n// This session alone turned up two such symbols.\n"),
     ("a leftover-resource tally", CLEAN + "\n// A failed install left three unattached volumes behind.\n"),
     ("a health-ratio tally", CLEAN + "\n// The only reason a 44/44-healthy cluster survived.\n"),
+    ("a bare count with an elided noun", CLEAN + "\n// Dashboard ids die; three had.\n"),
     ("session narration", CLEAN + "\n// As discussed, this is kept here for future Claude.\n"),
     ("an unowned TODO", CLEAN + "\n// TODO: wire this up.\n"),
     ("an in-repo line-number citation", CLEAN + "\n// The guard lives at phases/agentplatform.go:224.\n"),

@@ -26,9 +26,9 @@ import (
 // history, a runbook or a CI file until you read to the end. Naming the intent as the verb puts
 // it first, where it is read.
 //
-// It also removes a genuine confusion. The provisioning verb used to be `init`, which every
-// reader of terraform or git takes to mean the cheap, local, idempotent thing you run without
-// thinking. Here it built a VPC and an EKS control plane and spent real money.
+// It also avoids a genuine confusion. `init` is what every reader of terraform or git takes
+// to mean the cheap, local, idempotent thing you run without thinking — a poor name for the
+// verb that builds a VPC and an EKS control plane and spends real money.
 var (
 	applyConfigPath    string
 	applyNoClean       bool

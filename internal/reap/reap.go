@@ -49,10 +49,10 @@ import (
 // Destroy the cluster and Karpenter dies with it, leaving its nodes running — orphaned,
 // attached to nothing, and billing.
 //
-// That used to be invisible, because Karpenter's nodes sat in the EKS-managed CLUSTER
-// security group, which EKS deletes along with the cluster. Once they were moved into
-// the Terraform-managed NODE security group (which is what lets Cilium's rules cover
-// them), the orphan became load-bearing: Terraform cannot delete a security group that
+// The orphan is load-bearing because Karpenter's nodes sit in the Terraform-managed NODE
+// security group, which is what lets Cilium's rules cover them. In the EKS-managed CLUSTER
+// security group it would be invisible — EKS deletes that one along with the cluster — but
+// here Terraform cannot delete a security group that
 // an instance still holds, so the whole teardown stopped dead —
 //
 //	Error: deleting Security Group (sg-...): DependencyViolation
@@ -262,9 +262,9 @@ func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writ
 	// Enumeration runs in dry-run too, and the line above is why that is an addition rather
 	// than a replacement. Stating the filter is worth doing — it is how an operator checks the
 	// scoping is what they expect. But it is a description of intent, and a description cannot
-	// be wrong in a way anyone notices. The dry-run used to stop there, so the one question a
-	// dry-run of a destructive sweep exists to answer — what would this actually select? — was
-	// answered by restating the filter back.
+	// be wrong in a way anyone notices. A dry-run that stops there answers the one question a
+	// dry-run of a destructive sweep exists for — what would this actually select? — by
+	// restating the filter back.
 	//
 	// Now it says what it will do and then does the read-only half for real, so
 	// `rackctl destroy` without --apply can be pointed at a live account and SHOWN to select
@@ -553,7 +553,7 @@ func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, 
 //
 // # WHAT THIS SWEEP CANNOT SEE, AND WHY IT NOW SAYS SO
 //
-// This function used to assert that "every dynamically provisioned volume is tagged
+// It would be wrong to assert that "every dynamically provisioned volume is tagged
 // kubernetes.io/cluster/<name>=owned by the EBS CSI driver". That is not established. The
 // driver is an EKS MANAGED ADDON declared at landing-zone components/aws/cluster/eks.tf
 // with no configuration_values block at all, so neither extraVolumeTags nor k8sTagClusterId is

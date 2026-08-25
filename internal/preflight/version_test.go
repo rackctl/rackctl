@@ -69,8 +69,8 @@ func TestVersionSkew_NoClusterIsNotAFailure(t *testing.T) {
 
 // An unreadable cluster is NOT an absent one, and the difference is the whole gate.
 //
-// AccessDenied, a throttle and an expired token all used to render as "no live cluster —
-// any supported version is a valid starting point", which passes the one check standing
+// AccessDenied, a throttle and an expired token would each otherwise render as "no live
+// cluster — any supported version is a valid starting point", passing the one check standing
 // between an operator and an irreversible EKS upgrade. Unknown must say unknown.
 func TestVersionSkew_UnreadableClusterIsNotReportedAsAbsent(t *testing.T) {
 	for _, stderr := range []string{

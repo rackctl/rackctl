@@ -192,8 +192,8 @@ func TestEngineDoesNotRollBackOnNoRollbackError(t *testing.T) {
 // existing cluster every earlier phase "succeeds" as a NO-OP — the network is there, the
 // cluster is there, nothing is created — and is recorded as completed all the same.
 //
-// So a failure in any later phase used to tear those phases down, and the cluster phase's
-// teardown destroys the EKS cluster and the VPC. A re-apply that tripped on a config error
+// So a failure in any later phase would tear those phases down, and the cluster phase's
+// teardown destroys the EKS cluster and the VPC. A re-apply tripping on a config error
 // would demolish a healthy, running platform.
 //
 // The path is the ordinary one, not an exotic one: re-applying is how an operator retries
@@ -263,10 +263,10 @@ func TestEngineStillRollsBackWhatItBuilt(t *testing.T) {
 // nodeclaims|pvc --all -A` against whatever context the kubeconfig currently resolves —
 // and rackctl repoints the kubeconfig in exactly one place, the cluster phase.
 //
-// So a failure BEFORE that point used to reach the sweep with the kubeconfig still aimed
-// at whatever the operator was doing beforehand. Bootstrapping staging from a laptop
-// pointed at a healthy development cluster, a failed `scripts/init-backend-aws.sh` in the
-// identity phase deleted every Platform and PVC in development — and identity, unlike
+// So a failure BEFORE that point reaches the sweep with the kubeconfig still aimed at
+// whatever the operator was doing beforehand. Bootstrapping staging from a laptop pointed
+// at a healthy development cluster, a failed `scripts/init-backend-aws.sh` in the identity
+// phase would delete every Platform and PVC in development — and identity, unlike
 // assertComponentRoots, is not wrapped in NoRollbackError, so nothing stopped it.
 //
 // This is the same class as TestEngineNeverRollsBackAPlatformItDidNotBuild, one layer down:
@@ -365,8 +365,8 @@ func TestEngineNamesTheClusterItReaps(t *testing.T) {
 // converged, and all three end in a wait that can expire on a perfectly healthy platform:
 // Crossplane's provider install, a portal chart that is not published yet, and a
 // 15-minute wait on the first tenant reaching Ready. None of them returns
-// NoRollbackError, so with the rollback armed a slow Crossplane image pull used to
-// destroy the EKS cluster, the VPC and the entire agent-platform substrate.
+// NoRollbackError, so with the rollback armed a slow Crossplane image pull would destroy
+// the EKS cluster, the VPC and the entire agent-platform substrate.
 //
 // The smoke case is the sharpest: it exists to PROVE the platform works, so rolling back
 // on its failure means the check destroys the thing it was checking — and the evidence.
@@ -454,10 +454,10 @@ func TestRun_AFailedOptionalPhaseDoesNotCancelTheNextOne(t *testing.T) {
 	}
 }
 
-// The rollback guard must FAIL CLOSED. PlatformExists used to be `err == nil` over a
-// describe-cluster, so expired credentials, a throttle or a dropped network — any
-// error that is not "no such cluster" — read as "no platform here" and ARMED the
-// teardown. The one error path the guard owned led straight to the demolition it
+// The rollback guard must FAIL CLOSED. An `err == nil` over a describe-cluster makes
+// expired credentials, a throttle or a dropped network — any error that is not "no such
+// cluster" — read as "no platform here" and ARM the teardown. The one error path the
+// guard owns would lead straight to the demolition it
 // exists to prevent.
 func TestEngineDoesNotRollBackWhenItCannotTellWhetherAPlatformExists(t *testing.T) {
 	orig := PlatformExists
@@ -487,10 +487,10 @@ func TestEngineDoesNotRollBackWhenItCannotTellWhetherAPlatformExists(t *testing.
 
 // An optional phase failing must not cancel the optional phases after it — including
 // on a RE-APPLY, which is when preexisting is true and is the ordinary way an operator
-// retries. `case preexisting:` used to be evaluated first and shadowed the optional
-// arm, so the `continue` never ran in exactly the case it was written for: a portal
-// that failed to install meant smoke — the tenant vend that proves the platform works
-// — was never attempted.
+// retries. With `case preexisting:` evaluated first it shadows the optional arm, so the
+// `continue` never runs in exactly the case it was written for: a portal that failed to
+// install would mean smoke — the tenant vend that proves the platform works — was never
+// attempted.
 func TestOptionalPhaseFailureDoesNotCancelLaterOptionalPhasesOnReapply(t *testing.T) {
 	orig := PlatformExists
 	PlatformExists = func(context.Context, *State) PlatformState { return PlatformPresent }
