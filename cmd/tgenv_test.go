@@ -115,11 +115,10 @@ func TestTGEnv_PassesTheOrgsForkNotUpstream(t *testing.T) {
 
 // enable_accelerators must NOT be injected, and the assertion is inverted rather than deleted.
 //
-// This test used to require the opposite, for a reason that was true when written: setting
-// addons.accelerators produced a cluster with no accelerator label and no GPU addons, so the
-// injection was what made the knob mean anything. The whole GPU path is deleted now (ledger
-// O27) — the ApplicationSet, the accelerator-pools component, and landing-zone's variable and
-// label — so the variable is undeclared and the injection would be inert.
+// The whole GPU path is absent upstream — the ApplicationSet, the accelerator-pools
+// component, and landing-zone's variable and label — so the variable is undeclared and
+// injecting it would be inert. An installer that sets a TF_VAR no root declares looks like
+// it is configuring something and is not.
 //
 // Keeping a test here at all is the point. tofu ignores a TF_VAR_ for a variable no root
 // declares, so re-adding this injection would break nothing and pass everything; the only thing

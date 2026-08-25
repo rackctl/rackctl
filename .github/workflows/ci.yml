@@ -5,12 +5,35 @@ on:
     branches: [main]
   pull_request:
 
+# The default GITHUB_TOKEN is read-write on a push to main. Nothing in this workflow
+# writes anything, so the token it runs with should not be able to — an action compromised
+# anywhere in the graph inherits whatever the job holds.
+# A superseded push to the same ref has nothing left to prove; the newer commit's run is
+# the one the merge decision reads.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   build:
+    # The job id is the check name branch protection matches. Setting `name` to the same
+    # string keeps that string stable.
+    name: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Actions are pinned to a commit SHA, not a tag. A tag is mutable: whoever can move
+      # it can change what runs here, and the version comment is what Renovate reads to
+      # keep the pin current.
+      #
+      # persist-credentials: false because checkout otherwise leaves the job token in
+      # .git/config, where every later step — and every action they call — can read it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26"
           cache: true
@@ -22,27 +45,112 @@ jobs:
       # be advisory until somebody remembered to add it to the ruleset, and an advisory gate on a
       # repo with a no-bypass ruleset is just a slower way of not having one.
       #
-      # It runs before build and test because its most valuable linter is `unused`, and dead code
-      # compiles and passes tests by definition — this repo shipped two such symbols.
+      # It runs before build and test because its most valuable linter is `unused`, and dead
+      # code compiles and passes tests by definition — so no amount of testing can find it.
       #
       # Pinned to the same version developers get from Homebrew, so a clean local run means a
       # clean CI run. Config in .golangci.yml.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9.3.0
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.12.2
       - run: go build ./...
       - run: go test -race ./...
-      # Two-layer supply-chain gate. govulncheck is Go-native and
-      # reachability-aware (flags only vulnerabilities reachable in the call
-      # graph); osv-scanner is the estate-wide OSV-database gate every JS repo
-      # runs, here broadening coverage to the whole module graph. Both are pinned
-      # for reproducible CI and both fail the build.
-      - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
-      - name: osv-scanner
-        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
-        with:
-          scan-args: |-
-            --recursive
-            ./
+      # A coverage floor that nothing gates on is a number, not a guarantee: it falls
+      # silently, and it falls fastest in the code least pleasant to test — which here is
+      # the code that terminates instances and deletes roles. Runs as a step of `build`
+      # for the same reason lint does, so it gates a merge rather than being advisory.
+      - name: coverage
+        run: ./scripts/coverage.sh
+      # Every gate in scripts/ proves it can still reject before its verdict is believed.
+      # A check that cannot fail is worse than no check, because it reports success — and
+      # both halves rot independently: a self-test nothing invokes, and a CI step that
+      # never runs one. This step is the second half.
+      # The floor SUPPLIES a known-bad input to each gate and observes the exit status.
+      # Nothing a gate prints about itself is consulted: a four-line script that echoed
+      # "control: … rejected" and exited 0 passed the previous version of this step with
+      # zero checks behind it.
+      # SHELLCHECK PARSES; DASH RUNS. Both, because they answer different questions and the
+      # first cannot answer the second: a static parser does not know which interpreter an
+      # operator has. `curl -fsSL rackctl.sh/install | sh` runs scripts/install.sh under
+      # whatever /bin/sh is on that machine, which on Debian is dash and on macOS is bash in
+      # POSIX mode — and bash-in-POSIX-mode ACCEPTS bash-isms, so a developer's local run
+      # cannot surface one.
+      #
+      # --severity=warning because the bash-ism diagnostics (SC3044 and friends) are
+      # warnings, and a gate that only fails on errors would pass every one of them.
+      - name: shellcheck
+        # No --severity. shellcheck's default is `style`, the MOST inclusive tier, so a
+        # severity flag here can only make this less sensitive. These scripts are clean at
+        # `style`, so the strictest setting is free.
+        #
+        # The dialect is what matters, and it comes from the shebang: `#!/bin/sh` gets the
+        # SC3xxx portability checks, `#!/bin/bash` does not. shellcheck has no model of
+        # bash VERSIONS — mapfile, `declare -A` and `${x^^}` are legal bash-4 and draw no
+        # diagnostic under a bash shebang, while macOS bash 3.2 fails on the first of them.
+        # The bash-version guard below is what covers that, and only for bash scripts.
+        run: shellcheck scripts/*.sh
+      - name: bash version floor
+        # Asserted rather than assumed: every script here declares #!/bin/sh, so nothing is
+        # entitled to a bash-4 builtin. A #!/bin/bash script added later would need its own
+        # check against the oldest bash it must run on — macOS ships 3.2.
+        run: |
+          if grep -lE '^#!.*\bbash\b' scripts/*.sh; then
+            echo "a bash script was added; shellcheck does not check bash VERSIONS" >&2
+            exit 1
+          fi
+      - name: posix shell
+        run: |
+          # /bin/sh on ubuntu-latest IS dash. Asserted rather than assumed: if the runner
+          # image ever ships bash as /bin/sh, this step would silently become a bash run and
+          # stop testing what it exists to test. Both the path and the absence of
+          # BASH_VERSION are checked — a shell named dash that is really bash would pass the
+          # first test alone.
+          readlink -f /bin/sh | grep -q dash
+          [ -z "$(/bin/sh -c 'echo ${BASH_VERSION-}')" ]
+          # RUN, do not parse. `sh -n` is a syntax check: dash -n accepts [[ ]], mapfile,
+          # `declare -A` and case-modification expansion. Only executing rejects them.
+          /bin/sh ./scripts/install_test.sh
+          /bin/sh ./scripts/coverage.sh --controls-only
+      - name: gate floor
+        run: python3 ./scripts/floor.py
+      # Every version the repo pins is matched by a Renovate manager. Asserted rather than
+      # described: a comment claiming full coverage goes stale silently at the first edit
+      # that adds a pin, while this fails the build.
+      - name: renovate pin coverage
+        run: python3 ./scripts/pins.py
+      # The config that watching depends on had never been validated. It is a fact about
+      # the commit — a malformed manager watches nothing and says nothing, so pins.py would
+      # report a pin covered by a rule Renovate silently discards.
+      #
+      # Its coverage is partial, and stating that is the point: it rejects an unknown
+      # configuration KEY, verified by planting one, but accepted a datasourceTemplate
+      # naming a datasource that does not exist. Schema validity, not semantic validity.
+      - name: renovate config
+        run: npx --yes --package renovate -- renovate-config-validator .github/renovate.json
+      # The enforceable subset of documentation-voice: verification tallies, internal
+      # issue/PR/ledger references, prose addressed to an agent, and unowned markers.
+      # The rest of that standard is review — a gate claiming coverage it does not have is
+      # itself the failure mode, so this one states its subset and holds only that.
+      - name: prose
+        run: python3 ./scripts/prose.py
+      # With no package manifest beyond go.mod, the workflows ARE a dependency surface —
+      # every action runs with the job's token and permissions. --offline so the verdict is
+      # a function of the commit under test rather than of what GitHub's API answers today.
+      - name: zizmor
+        run: |
+          pip install --quiet zizmor==1.29.0
+          # --persona auditor, not the default. The persona gate is a DIFFERENT axis from
+          # severity: under `regular` the excessive-permissions audit is not executed at
+          # all, so a workflow-level `contents: write` or `id-token: write` reports "No
+          # findings to report" while every job added later silently inherits the grant,
+          # with no diff that looks like a permission change.
+          zizmor --offline --persona auditor .github/workflows/
+      # The vulnerability scanners are NOT here. Their verdict changes when a CVE is
+      # published, which is not something the commit under test caused — blocking a merge
+      # on the world changing is how a gate teaches people to bypass it. They run on a
+      # schedule instead, blocking there, in .github/workflows/vulnerabilities.yml.
+      #
+      # What stays blocking is what the commit controls: formatting, vet, lint, the build,
+      # the tests, the coverage floors, the gate suite, pin coverage, prose, and the
+      # workflow audit — which runs --offline for exactly this reason.

@@ -44,6 +44,29 @@ func CheckSessionLifetime(ctx context.Context, env *Env) doctor.Result {
 	// time it is inconvenient.
 	const needed = time.Hour
 
+	// With cloud.assumeRole set, the session every subprocess of this run actually uses is
+	// the STS session minted from that role — not the source profile's. Its lifetime is
+	// assumeRole.durationSeconds, which Validate accepts anywhere in the 900-43200 AWS
+	// allows, so a 15-minute session would sail past a gate whose entire purpose is
+	// refusing sessions shorter than an hour.
+	//
+	// The source profile still has to outlive the run too, because rackctl re-assumes from
+	// it as the session nears expiry — so both are checked, shortest first.
+	if ar := env.Cfg.Cloud.AssumeRole; ar != nil && ar.RoleARN != "" {
+		d := time.Duration(ar.DurationSeconds) * time.Second
+		if ar.DurationSeconds == 0 {
+			d = time.Hour // the awsid default, and AWS's
+		}
+		if d < needed {
+			return fail(name, fmt.Sprintf(
+				"cloud.assumeRole.durationSeconds is %s, and a full install needs about an hour. "+
+					"Every AWS call this run makes uses the assumed session, not the profile's, so a "+
+					"short one lapses mid-phase and leaves a half-applied run that cannot roll itself "+
+					"back — the rollback needs the same credentials. Raise it (the role's own "+
+					"MaxSessionDuration may cap it, which only sts can tell you)", d))
+		}
+	}
+
 	raw, err := env.Run.Capture(ctx, "aws", "configure", "export-credentials",
 		"--profile", env.Cfg.Cloud.Profile, "--format", "process")
 	if err != nil {
@@ -99,7 +122,7 @@ const (
 	// them, so from the second environment onwards finding them is expected.
 	scopeAccount
 	// scopeBackend: Terraform state. Created idempotently behind a head-bucket guard
-	// (landing-zone scripts/init-backend-aws.sh:12, phases/agentplatform.go:224), never deleted
+	// (landing-zone scripts/init-backend-aws.sh, phases/agentplatform.go), never deleted
 	// by rackctl, and shared across every environment in the account, differing only by key.
 	scopeBackend
 )
@@ -118,23 +141,23 @@ type plannedBucket struct {
 //
 // Composed from the components' own expressions rather than guessed:
 //
-//	agent-iam        artifacts.tf:50-52  <cluster>-<account>-<region>-{model-artifacts,eval-reports,access-logs}
-//	cluster-addons   main.tf:37 + s3.tf  <cluster>-<account>-<region>-{velero,loki,tempo,argo-workflows}
-//	model-import     main.tf:65          <environment>-<account>-<region>-model-import
-//	bedrock-account  main.tf:11,92,152   org-<account>-<region>-bedrock-{access-logs,invocations}
-//	cost-pipeline    main.tf:67,169,237,335
+//	agent-iam        artifacts.tf  <cluster>-<account>-<region>-{model-artifacts,eval-reports,access-logs}
+//	cluster-addons   main.tf + s3.tf  <cluster>-<account>-<region>-{velero,loki,tempo,argo-workflows}
+//	model-import     main.tf          <environment>-<account>-<region>-model-import
+//	bedrock-account  main.tf,92,152   org-<account>-<region>-bedrock-{access-logs,invocations}
+//	cost-pipeline    main.tf,169,237,335
 //	                                     org-<account>-<region>-cost-{access-logs,estimates,athena}-<account>
-//	backends         init-backend-aws.sh:9 / agentplatform.go:214
+//	backends         init-backend-aws.sh / agentplatform.go
 //
-// The last two used to be composed as <cluster>-bedrock-* and <cluster>-cost-*, which is the
-// shape eks-agent-platform had before it account-scoped both components. Those names are not
-// stale in the harmless sense — nothing creates them now, so the check was looking for names
-// that cannot exist while missing the ones that do, which reads as a clean preflight over an
+// The last two are account-scoped, not cluster-scoped: <account>-<region>-bedrock-* and
+// org-<account>-<region>-cost-*. Composing them as <cluster>-bedrock-* and <cluster>-cost-*
+// is the trap — nothing creates those names, so a check looking for them cannot collide
+// while missing the ones that can, which reads as a clean preflight over an
 // unchecked estate.
 //
 // The account id appears twice in the cost names and once in the bedrock ones. That asymmetry
 // is upstream's, not a typo here: cost-pipeline suffixes each bucket with the caller's account
-// on top of a prefix that already carries it (main.tf:169), and bedrock-account does not.
+// on top of a prefix that already carries it (main.tf), and bedrock-account does not.
 //
 // Note what left with the rename: these five no longer contain cluster.name at all, so the
 // 63-character pressure that made cluster.name the fix for a too-long name is now confined to
@@ -197,10 +220,9 @@ const accountScopeToken = "org"
 
 // CheckBucketNames asserts every bucket this run would create can actually be created.
 //
-// This package's own header opens with the failure it was written for — "BucketAlreadyExists on
-// a bucket name that is globally unique across every AWS account on earth. Unrecoverable by
-// retry. Discovered 6 minutes in." — and until now nothing here checked a single bucket name.
-// The motivating example was the one gap.
+// An S3 bucket name is globally unique across every AWS account, so a collision is
+// unrecoverable by retry and is knowable before a single resource is created. Left to the
+// apply, it surfaces minutes in, against a name that was decidable at plan time.
 //
 // Three outcomes, and conflating them would waste the check:
 //
@@ -212,7 +234,7 @@ const accountScopeToken = "org"
 //     cluster.name. This is the unrecoverable one and it must not read like the other two.
 //
 // Length is checked in the same pass. cluster-addons has an upstream precondition for its own
-// four (s3.tf:316) with one character of headroom at the worst case; agent-iam's and the
+// four (s3.tf) with one character of headroom at the worst case; agent-iam's and the
 // agent-platform tree's have none at all, and a 64-character name fails at create with an error
 // about naming rules rather than about cluster.name.
 func CheckBucketNames(ctx context.Context, env *Env) doctor.Result {
@@ -336,7 +358,7 @@ func CheckHostedZone(ctx context.Context, env *Env) doctor.Result {
 	raw, err := env.Run.Capture(ctx, "aws", "route53", "list-hosted-zones",
 		"--query", "HostedZones[].[Name,Id,Config.PrivateZone]", "--output", "text")
 	if err != nil {
-		return warn(name, "could not list hosted zones")
+		return warn(name, "could not list hosted zones ("+truncate(err.Error(), 160)+")")
 	}
 
 	// The zones this run's own dns state already tracks. A zone terraform owns is not a
@@ -442,11 +464,11 @@ func ownedZoneIDs(ctx context.Context, env *Env) map[string]bool {
 // components/bedrock-account/main.tf) has no name and no identifier: the Bedrock API holds
 // EXACTLY ONE configuration per account per region.
 //
-// It used to be applied per environment, which made this check's warning the whole story —
-// applying development overwrote production's logging destination and tearing development down
-// deleted the singleton outright, both applies green, with invocation logging being the signal
-// every budget decision reads. That was ledger O14, and upstream fixed the shape rather than the
-// symptom: the configuration and the two buckets it points at moved to an account-scoped root,
+// Applied per environment it could not be safe: one environment's apply would overwrite
+// another's logging destination and one environment's teardown would delete the singleton
+// outright, both green, with invocation logging being the signal every budget decision reads.
+// The shape rather than the symptom is what fixes that, and upstream fixed it: the
+// configuration and the two buckets it points at live in an account-scoped root,
 // terraform/live/org/bedrock-account, whose names carry no cluster and no environment token
 // because there is exactly one of the thing they name.
 //
@@ -511,8 +533,8 @@ func CheckBedrockLogging(ctx context.Context, env *Env) doctor.Result {
 //
 // # Two halves of one bill, and they are attributed by different mechanisms
 //
-// The check used to look for a bare `PlatformId` and report healthy when it found one. That
-// covers the tenant's DATASTORES and nothing else, because attribution by resource tag requires
+// Looking for a bare `PlatformId` and reporting healthy on finding one covers the tenant's
+// DATASTORES and nothing else, because attribution by resource tag requires
 // a resource that can carry a tag — and a Bedrock model invocation is not one. No `resourceTags/`
 // key is ever populated on an invocation line.
 //
@@ -546,7 +568,7 @@ func CheckCostAllocationTags(ctx context.Context, env *Env) doctor.Result {
 		"--status", "Active", "--query", "CostAllocationTags[].TagKey",
 		"--region", "us-east-1", "--output", "text")
 	if err != nil {
-		return warn(name, "could not read cost allocation tags")
+		return warn(name, "could not read cost allocation tags ("+truncate(err.Error(), 160)+")")
 	}
 	active := map[string]bool{}
 	// A key may come back bare or carrying its CUR column prefix. Both forms are recorded so the
@@ -568,7 +590,7 @@ func CheckCostAllocationTags(ctx context.Context, env *Env) doctor.Result {
 	}
 
 	// The model-spend half. Reported whether or not the resource-tag half is healthy, because
-	// "PlatformId is active" is precisely the observation that used to hide it.
+	// "PlatformId is active" is precisely the observation that hides it.
 	modelSpend := ""
 	if !iamPrincipal["PlatformId"] && !active["iamPrincipal/PlatformId"] {
 		modelSpend = "No iamPrincipal/PlatformId is active, so MODEL spend is unattributed — and " +

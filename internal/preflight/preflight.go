@@ -8,7 +8,8 @@
 // first four provisioning runs was knowable in advance and cost a full run to find:
 //
 //   - `BucketAlreadyExists` on a bucket name that is globally unique across every AWS
-//     account on earth. Unrecoverable by retry. Discovered 6 minutes in.
+//     account on earth. Unrecoverable by retry, and surfaced only once the apply reaches
+//     the bucket — minutes of provisioning after the name became knowable.
 //   - `ResourceInUseException` — two components claiming Pod Identity for one service
 //     account. A service account can hold exactly one association.
 //   - A `gh repo fork` 403 that made `init` permanently un-rerunnable.
@@ -113,7 +114,7 @@ func CheckIdentity(ctx context.Context, env *Env) doctor.Result {
 
 	got, err := env.aws(ctx, "sts", "get-caller-identity", "--query", "Account")
 	if err != nil {
-		return fail(name, "cannot resolve AWS identity — run `aws sso login --profile "+env.Cfg.Cloud.Profile+"`")
+		return fail(name, "cannot resolve AWS identity ("+truncate(err.Error(), 160)+") — run `aws sso login --profile "+env.Cfg.Cloud.Profile+"`")
 	}
 	want := env.Cfg.Cloud.AccountID
 	if got != want {
@@ -136,7 +137,7 @@ func CheckQuota(ctx context.Context, env *Env) doctor.Result {
 	out, err := env.aws(ctx, "service-quotas", "get-service-quota",
 		"--service-code", "ec2", "--quota-code", "L-1216C47A", "--query", "Quota.Value")
 	if err != nil {
-		return warn(name, "could not read the EC2 vCPU quota — provisioning may throttle")
+		return warn(name, "could not read the EC2 vCPU quota ("+truncate(err.Error(), 160)+") — provisioning may throttle")
 	}
 	have, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
 	if err != nil {
@@ -359,7 +360,7 @@ func CheckSoftDeletedSecrets(ctx context.Context, env *Env) doctor.Result {
 		"--region", env.Cfg.Cloud.Region,
 		"--query", "SecretList[?DeletedDate!=null].Name", "--output", "text")
 	if err != nil {
-		return warn(name, "could not list secrets")
+		return warn(name, "could not list secrets ("+truncate(err.Error(), 160)+")")
 	}
 
 	pending := strings.Fields(out)
@@ -415,7 +416,7 @@ func CheckCatalogFork(ctx context.Context, env *Env) doctor.Result {
 		fmt.Sprintf("repos/%s/compare/%s:main...%s:main", fork, env.Cfg.Org.Name, engine.UpstreamCatalogOwner()),
 		"--jq", ".ahead_by")
 	if err != nil {
-		return warn(name, "could not compare "+fork+" with "+upstream)
+		return warn(name, "could not compare "+fork+" with "+upstream+" ("+truncate(err.Error(), 160)+")")
 	}
 	// Do NOT swallow a parse error into a zero. `behind, _ := Atoi(...)` reads an
 	// unparseable response as "0 commits behind" — i.e. as HEALTHY — which is precisely
@@ -445,7 +446,7 @@ func CheckCatalogFork(ctx context.Context, env *Env) doctor.Result {
 // and cluster-bootstrap's own comment states the contract exactly: "the token comes from
 // the GITHUB_TOKEN environment variable. When tenants_repo_url is empty, owner is "" and
 // no github resources are created, so the provider is never called"
-// (components/aws/cluster-bootstrap/main.tf:170-172). Setting the repo is what calls it.
+// (components/aws/cluster-bootstrap/main.tf). Setting the repo is what calls it.
 //
 // Unauthenticated, that provider 401s during PHASE 5 — after the VPC, the EKS cluster and
 // every substrate component are built and billing. Cheap to know now, expensive to learn
@@ -570,7 +571,7 @@ func CheckVendFreshness(ctx context.Context, env *Env) doctor.Result {
 // curExportParams is the contract cost-pipeline resolves the Cost and Usage Report from.
 //
 // Read through unguarded `data "aws_ssm_parameter"` blocks
-// (eks-agent-platform/terraform/components/cost-pipeline/main.tf:53-63), so a missing
+// (eks-agent-platform/terraform/components/cost-pipeline/main.tf), so a missing
 // parameter is not a degraded feature — it is a plan-time failure of the whole root.
 var curExportParams = []string{
 	"/platform/org/cost/cur-export-bucket",

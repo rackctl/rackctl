@@ -9,6 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rackctl/rackctl/internal/engine"
+	"github.com/rackctl/rackctl/internal/exec"
 )
 
 // Every `kubectl wait --for=condition=X` in this package must name a condition something
@@ -127,5 +131,30 @@ func TestKubectlWaits_OnlyNameConditionsSomethingWrites(t *testing.T) {
 	}
 	if scanned == 0 {
 		t.Fatal("scanned no source files — the test is not looking at anything")
+	}
+}
+
+// `rackctl plan` must not block on a catalog that a dry-run never creates.
+//
+// Capture returns an empty string with a nil error under DryRun, which this loop would
+// otherwise read as "the catalog exists and has generated nothing" — a state it never
+// leaves. The poll would then run to the full deadline and report a convergence failure,
+// so the read-only rehearsal would take thirty minutes and end in a false negative.
+func TestWaitCatalogConverged_DryRunReturnsWithoutPolling(t *testing.T) {
+	var out strings.Builder
+	run := exec.New(&out)
+	run.DryRun = true
+	st := &engine.State{Config: baseCfg(), Runner: run}
+
+	start := time.Now()
+	if err := waitCatalogConverged(t.Context(), st, 30*time.Minute); err != nil {
+		t.Fatalf("a dry-run has no catalog to converge and must not fail: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("waitCatalogConverged polled for %s in dry-run — `rackctl plan` is meant to "+
+			"be a fast read-only rehearsal", elapsed)
+	}
+	if !strings.Contains(out.String(), "would wait") {
+		t.Errorf("the dry-run must say what the wait would do rather than silently skipping it.\ngot: %s", out.String())
 	}
 }

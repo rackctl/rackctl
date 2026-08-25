@@ -103,7 +103,7 @@ func agentIAMEnv(st *engine.State) []string {
 // Setting it is also what ARMS cluster-bootstrap's `provider "github"`, whose owner is
 // parsed from this very URL. The component says so itself: "the token comes from the
 // GITHUB_TOKEN environment variable. When tenants_repo_url is empty, owner is "" and no
-// github resources are created, so the provider is never called" (main.tf:170-172). So
+// github resources are created, so the provider is never called" (main.tf). So
 // this variable and that credential are one decision, which is why they are built here
 // together rather than left to be discovered a phase later as a 401.
 func clusterBootstrapEnv(ctx context.Context, st *engine.State) ([]string, error) {
@@ -142,7 +142,7 @@ func clusterBootstrapEnv(ctx context.Context, st *engine.State) ([]string, error
 // documented path into a working one.
 //
 // The token is never returned through a note or an error string. exec.Runner echoes argv
-// but never env (tools.go:41), so passing it as env is precisely what keeps it out of the
+// but never env (tools.go), so passing it as env is precisely what keeps it out of the
 // transcript — do not "improve" this by moving it to a -var flag.
 func githubToken(ctx context.Context, st *engine.State) (token, source string, err error) {
 	if os.Getenv("GITHUB_TOKEN") != "" {

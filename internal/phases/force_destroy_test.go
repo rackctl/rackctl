@@ -154,9 +154,9 @@ func druidCfg(t *testing.T, env config.Environment) *config.Config {
 // 94dff69 closed it, as the class rather than the instance: every teardown gate in a component
 // declaring force_destroy_buckets now resolves permissively on the lever-true branch and keeps
 // the leaf's pin otherwise. Verified end-to-end before this refusal was retired —
-// components/aws/druid/variables.tf:86 declares it, main.tf:24 passes it to the tenant module,
-// modules/tenant/variables.tf:58 receives it, and aurora.tf:20 folds it into
-// local.allow_teardown, which aurora.tf:105 uses for deletion_protection.
+// components/aws/druid/variables.tf declares it, main.tf passes it to the tenant module,
+// modules/tenant/variables.tf receives it, and aurora.tf folds it into
+// local.allow_teardown, which aurora.tf uses for deletion_protection.
 //
 // So the permitting apply now clears protection via ModifyDBCluster in the same act that lands
 // force_destroy, and act 2 reaches the buckets and the DB cluster together. This test is what
@@ -183,13 +183,11 @@ func TestPermitBucketTeardown_CoversDruidInEveryEnvironment(t *testing.T) {
 
 // The flag must reach the terragrunt PROCESS, not just the log.
 //
-// The previous version of this test asserted
-// strings.Contains(out, "TF_VAR_force_destroy_buckets=true") against the dry-run
-// transcript. exec.Runner echoes argv and never env, so that assertion was satisfied
-// entirely by PermitBucketTeardown's own notes: deleting `extraEnv` from applyWith
-// altogether left every force-buckets test green, leaving the one behaviour target 11
-// exists for completely unguarded. That is the same "string whitelist stayed green when
-// the guarded call moved" class an earlier pass on this branch found five of.
+// Asserting on the dry-run transcript cannot guard this. exec.Runner echoes argv and never
+// env, so a strings.Contains for TF_VAR_force_destroy_buckets=true is satisfied by
+// PermitBucketTeardown's own notes rather than by the variable reaching terragrunt — and
+// removing `extraEnv` from applyWith entirely would leave such a test green, with the one
+// behaviour the flag exists for unguarded.
 //
 // So this runs for real against a fake terragrunt on $PATH that records its own
 // environment — the only way to observe what the child process was actually handed.

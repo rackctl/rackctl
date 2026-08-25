@@ -16,10 +16,10 @@ import (
 //
 // FIRST: `--all` matching NOTHING is a SUCCESS. kubectl prints "error: no matching
 // resources found" to stderr and exits 0. cluster-bootstrap returns the moment ArgoCD's
-// Deployment is up, which is before app-of-apps has generated a single child — so the wait
-// looked at zero Applications and reported the catalog converged, instantly, every time.
-// Observed on the first live install: the gate went green while the catalog stood at 3
-// Healthy, 7 Missing, 4 Progressing.
+// Deployment is up, which is before app-of-apps has generated a single child — so such a
+// wait looks at zero Applications and reports the catalog converged, instantly, on a
+// catalog that has not begun. A gate that is green because it never ran is the failure
+// this function exists to remove.
 //
 // SECOND, and it survives fixing the first: `kubectl wait` resolves its resource set ONCE,
 // at the start. The catalog does not exist all at once — app-of-apps generates children,
@@ -34,6 +34,21 @@ import (
 // has not been generated yet — which is the first defect wearing a different hat.
 func waitCatalogConverged(ctx context.Context, st *engine.State, timeout time.Duration) error {
 	const settle = 2 // consecutive clean samples at an unchanged count
+
+	// A dry-run has no catalog to converge, and polling for one cannot end well: Capture
+	// returns an empty string with a nil error under DryRun, which this loop reads as a
+	// catalog that exists and has generated nothing. `clean` never increments, so the
+	// poll runs to the full deadline and then reports a convergence failure — turning
+	// `rackctl plan`, whose whole contract is a fast read-only rehearsal, into a
+	// thirty-minute wait ending in a false negative.
+	//
+	// Say what the wait would do instead. The sibling poll in portal_substrate.go guards
+	// itself the same way.
+	if st.Runner.DryRun {
+		note(st, "would wait up to %s for every ArgoCD Application to report Healthy, requiring "+
+			"%d consecutive samples at an unchanged count", timeout, settle)
+		return nil
+	}
 
 	deadline := time.Now().Add(timeout)
 	var lastCount, clean int

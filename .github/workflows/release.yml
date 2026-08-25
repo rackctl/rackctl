@@ -4,23 +4,48 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+# A tag build must not be cancelled by a later tag: both releases have to publish, and a
+# half-uploaded release is worse than a queued one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# No workflow-level permissions. A grant here is inherited by every job added later, and
+# nothing in that new job's diff would look like a permission change. The one job that needs
+# to write holds the grant itself.
+permissions: {}
 
 jobs:
   goreleaser:
+    name: goreleaser
     runs-on: ubuntu-latest
+    permissions:
+      # creates the GitHub release and uploads the binaries operators install
+      contents: write # goreleaser publishes the release for this tag
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+          # goreleaser authenticates with the tokens in env below, not with the one
+          # checkout would leave in .git/config for every subsequent step to read.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26"
-      - uses: goreleaser/goreleaser-action@v6
+          # No module cache on the release path. This job publishes the binaries operators
+          # install, and a poisoned cache entry restored from another workflow would reach
+          # the artifact rather than just a test run. A cold build costs a minute.
+          cache: false
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # zizmor: ignore[secrets-outside-env]
+          # HOMEBREW_TAP_TOKEN writes to another repository, so it warrants a GitHub
+          # Environment with required reviewers. Declaring `environment:` here without
+          # configuring those rules in repository settings would silence this audit while
+          # adding no control, which is worse than the open finding: the gate would then
+          # report a protection that does not exist.
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

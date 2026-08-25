@@ -3,6 +3,8 @@
 /dist/
 *.exe
 *.test
+# The coverage profile scripts/coverage.sh writes on every `make cover` and CI run.
+coverage.out
 .env
 # The operator's own live config at the repo root — NOT the committed examples/ template.
 /rackctl.yaml

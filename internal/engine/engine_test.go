@@ -192,13 +192,13 @@ func TestEngineDoesNotRollBackOnNoRollbackError(t *testing.T) {
 // existing cluster every earlier phase "succeeds" as a NO-OP — the network is there, the
 // cluster is there, nothing is created — and is recorded as completed all the same.
 //
-// So a failure in any later phase used to tear those phases down, and the cluster phase's
-// teardown destroys the EKS cluster and the VPC. A re-apply that tripped on a config error
+// So a failure in any later phase would tear those phases down, and the cluster phase's
+// teardown destroys the EKS cluster and the VPC. A re-apply tripping on a config error
 // would demolish a healthy, running platform.
 //
-// Not hypothetical: a re-apply failed on a ClusterRoleBinding conflict, the engine began
-// rolling back, and the only reason a 44/44-healthy cluster survived is that the process
-// happened to be killed mid-teardown.
+// The path is the ordinary one, not an exotic one: re-applying is how an operator retries
+// after a failure, so any later phase failing on a re-apply reaches the teardown with
+// phases 1-4 recorded as completed and a healthy platform underneath them.
 //
 // NoRollbackError guards a convergence timeout. This guards the more dangerous case: the
 // operator does not lose a wait, they lose the platform.
@@ -263,10 +263,10 @@ func TestEngineStillRollsBackWhatItBuilt(t *testing.T) {
 // nodeclaims|pvc --all -A` against whatever context the kubeconfig currently resolves —
 // and rackctl repoints the kubeconfig in exactly one place, the cluster phase.
 //
-// So a failure BEFORE that point used to reach the sweep with the kubeconfig still aimed
-// at whatever the operator was doing beforehand. Bootstrapping staging from a laptop
-// pointed at a healthy development cluster, a failed `scripts/init-backend-aws.sh` in the
-// identity phase deleted every Platform and PVC in development — and identity, unlike
+// So a failure BEFORE that point reaches the sweep with the kubeconfig still aimed at
+// whatever the operator was doing beforehand. Bootstrapping staging from a laptop pointed
+// at a healthy development cluster, a failed `scripts/init-backend-aws.sh` in the identity
+// phase would delete every Platform and PVC in development — and identity, unlike
 // assertComponentRoots, is not wrapped in NoRollbackError, so nothing stopped it.
 //
 // This is the same class as TestEngineNeverRollsBackAPlatformItDidNotBuild, one layer down:
@@ -365,8 +365,8 @@ func TestEngineNamesTheClusterItReaps(t *testing.T) {
 // converged, and all three end in a wait that can expire on a perfectly healthy platform:
 // Crossplane's provider install, a portal chart that is not published yet, and a
 // 15-minute wait on the first tenant reaching Ready. None of them returns
-// NoRollbackError, so with the rollback armed a slow Crossplane image pull used to
-// destroy the EKS cluster, the VPC and the entire agent-platform substrate.
+// NoRollbackError, so with the rollback armed a slow Crossplane image pull would destroy
+// the EKS cluster, the VPC and the entire agent-platform substrate.
 //
 // The smoke case is the sharpest: it exists to PROVE the platform works, so rolling back
 // on its failure means the check destroys the thing it was checking — and the evidence.
@@ -454,10 +454,10 @@ func TestRun_AFailedOptionalPhaseDoesNotCancelTheNextOne(t *testing.T) {
 	}
 }
 
-// The rollback guard must FAIL CLOSED. PlatformExists used to be `err == nil` over a
-// describe-cluster, so expired credentials, a throttle or a dropped network — any
-// error that is not "no such cluster" — read as "no platform here" and ARMED the
-// teardown. The one error path the guard owned led straight to the demolition it
+// The rollback guard must FAIL CLOSED. An `err == nil` over a describe-cluster makes
+// expired credentials, a throttle or a dropped network — any error that is not "no such
+// cluster" — read as "no platform here" and ARM the teardown. The one error path the
+// guard owns would lead straight to the demolition it
 // exists to prevent.
 func TestEngineDoesNotRollBackWhenItCannotTellWhetherAPlatformExists(t *testing.T) {
 	orig := PlatformExists
@@ -487,10 +487,10 @@ func TestEngineDoesNotRollBackWhenItCannotTellWhetherAPlatformExists(t *testing.
 
 // An optional phase failing must not cancel the optional phases after it — including
 // on a RE-APPLY, which is when preexisting is true and is the ordinary way an operator
-// retries. `case preexisting:` used to be evaluated first and shadowed the optional
-// arm, so the `continue` never ran in exactly the case it was written for: a portal
-// that failed to install meant smoke — the tenant vend that proves the platform works
-// — was never attempted.
+// retries. With `case preexisting:` evaluated first it shadows the optional arm, so the
+// `continue` never runs in exactly the case it was written for: a portal that failed to
+// install would mean smoke — the tenant vend that proves the platform works — was never
+// attempted.
 func TestOptionalPhaseFailureDoesNotCancelLaterOptionalPhasesOnReapply(t *testing.T) {
 	orig := PlatformExists
 	PlatformExists = func(context.Context, *State) PlatformState { return PlatformPresent }
@@ -547,5 +547,102 @@ func TestDefaultPlatformExistsReportsUnknownWhenTheCallFails(t *testing.T) {
 	}
 	if got.rollbackBlocked() != true {
 		t.Error("an Unknown platform state must block rollback")
+	}
+}
+
+// ctxPhase records whether the context its Teardown was handed was still live, and can
+// cancel the run's context from inside Run to reproduce an operator interrupt.
+type ctxPhase struct {
+	id            string
+	fail          bool
+	cancelOnRun   context.CancelFunc
+	teardownErr   error
+	teardownAlive *bool
+	teardownRan   *bool
+}
+
+func (p ctxPhase) ID() string          { return p.id }
+func (p ctxPhase) Title() string       { return p.id }
+func (p ctxPhase) Optional() bool      { return false }
+func (p ctxPhase) Enabled(*State) bool { return true }
+func (p ctxPhase) Run(context.Context, *State) error {
+	if p.cancelOnRun != nil {
+		p.cancelOnRun()
+	}
+	if p.fail {
+		return errors.New("boom")
+	}
+	return nil
+}
+func (p ctxPhase) Teardown(ctx context.Context, _ *State) error {
+	if p.teardownRan != nil {
+		*p.teardownRan = true
+	}
+	if p.teardownAlive != nil {
+		*p.teardownAlive = ctx.Err() == nil
+	}
+	return p.teardownErr
+}
+
+// A rollback must still be able to run when the interrupt is what caused the failure.
+//
+// The TUI's abort path cancels the run's context, which kills the in-flight child and
+// fails the phase. Handing that same cancelled context to the teardown makes every
+// exec.CommandContext below it return instantly, so the rollback reports having run and
+// destroys nothing — while the abort's grace period makes it look like it was given time.
+func TestTeardownRunsOnALiveContextAfterAnInterrupt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	alive, ran := false, false
+	built := ctxPhase{id: "built", teardownAlive: &alive, teardownRan: &ran}
+	// Cancelling from inside Run is the interrupt: the context dies while the engine is
+	// still inside the phase, exactly as a Ctrl-C during a terragrunt apply does.
+	boom := ctxPhase{id: "boom", fail: true, cancelOnRun: cancel}
+
+	// Restored, like every other override in this file. PlatformExists is a package
+	// global, so leaving it set leaks into whichever test the runner reaches next — and a
+	// suite that passes alone and fails beside its sibling is the hardest kind to read.
+	orig := PlatformExists
+	defer func() { PlatformExists = orig }()
+	PlatformExists = func(context.Context, *State) PlatformState { return PlatformAbsent }
+	e := &Engine{Phases: []Phase{built, boom}, Out: io.Discard, CleanOnFail: true}
+	if err := e.Run(ctx, &State{Config: &config.Config{}, Runner: exec.New(io.Discard)}); err == nil {
+		t.Fatal("a failed required phase must return an error")
+	}
+
+	if !ran {
+		t.Fatal("the completed phase was never torn down")
+	}
+	if !alive {
+		t.Fatal("Teardown was handed a cancelled context — every destroy command under it " +
+			"returns instantly, so the rollback is a no-op that reports as having run")
+	}
+}
+
+// A rollback that could not finish leaves billable resources standing, which is the exact
+// outcome it exists to prevent. Under a Hook nothing is printed at all, so the failure has
+// to travel in the returned error or the operator never learns of it.
+func TestTeardownFailureReachesTheCallerUnderAHook(t *testing.T) {
+	built := ctxPhase{id: "built", teardownErr: errors.New("DependencyViolation")}
+	boom := ctxPhase{id: "boom", fail: true}
+
+	orig := PlatformExists
+	defer func() { PlatformExists = orig }()
+	PlatformExists = func(context.Context, *State) PlatformState { return PlatformAbsent }
+	e := &Engine{
+		Phases: []Phase{built, boom}, Out: io.Discard, CleanOnFail: true,
+		Hook: func(Event) {},
+	}
+	err := e.Run(context.Background(), &State{Config: &config.Config{}, Runner: exec.New(io.Discard)})
+	if err == nil {
+		t.Fatal("a failed required phase must return an error")
+	}
+	if !strings.Contains(err.Error(), "DependencyViolation") {
+		t.Errorf("the teardown failure must reach the caller — under a Hook it is printed "+
+			"nowhere, so this error is the only channel.\ngot: %v", err)
+	}
+	if !strings.Contains(err.Error(), "rollback did not complete") {
+		t.Errorf("the error must say the rollback is incomplete, not only that a phase failed.\ngot: %v", err)
 	}
 }

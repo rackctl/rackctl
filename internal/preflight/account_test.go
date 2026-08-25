@@ -12,11 +12,11 @@ import (
 
 // ─────────────────────────── bucket names ───────────────────────────
 //
-// The package header opens with the failure it exists for — "BucketAlreadyExists on a bucket
-// name that is globally unique across every AWS account on earth. Unrecoverable by retry.
-// Discovered 6 minutes in." — and nothing checked a bucket name until now. These pin the three
-// outcomes apart, because collapsing them wastes the check: one is recoverable by a destroy,
-// one is recoverable only by renaming the cluster, and one is not a problem at all.
+// An S3 bucket name is globally unique across every AWS account, so a collision is
+// unrecoverable by retry and knowable before anything is created. These pin the three
+// outcomes apart, because collapsing them wastes the check: one is recoverable by a
+// destroy, one is recoverable only by renaming the cluster, and one is not a problem
+// at all.
 
 // A state backend that already exists is the STEADY STATE, not wreckage. Getting this wrong
 // made the check fail against the account it was written for, and it would have failed on every
@@ -198,7 +198,7 @@ esac`)
 // a correctly built account; the test could not see it because both sides were stale together.
 //
 // It is now fed the name bedrock-account actually creates
-// (components/bedrock-account/main.tf:11,152 — prefix "${var.environment}-${account}-${region}
+// (components/bedrock-account/main.tf,152 — prefix "${var.environment}-${account}-${region}
 // -bedrock" with var.environment pinned to "org" by live/org/env.hcl), so the constant and the
 // fixture can no longer drift as a pair.
 func TestBedrockLogging_TheAccountScopedSingletonIsFineFromAnyEnvironment(t *testing.T) {
@@ -276,9 +276,9 @@ func TestSessionLifetime_NoExpiryIsNotAFailure(t *testing.T) {
 
 // ─────────────────────────── cost allocation ───────────────────────────
 //
-// Two halves of one bill, attributed by different mechanisms, activated separately. The check
-// used to look only at the bare key — which reports healthy on an account whose model spend,
-// the dominant cost, is entirely unattributed.
+// Two halves of one bill, attributed by different mechanisms, activated separately. Looking
+// only at the bare key reports healthy on an account whose model spend — the dominant cost —
+// is entirely unattributed.
 
 // Both keys active covers the tenant's DATASTORES and says nothing about model spend. A
 // Bedrock invocation is not a taggable resource, so no resourceTags/ key is ever populated on
@@ -375,4 +375,59 @@ esac`)
 	env.Cfg.DNS = &config.DNS{HostedZone: "hub.nanohype.dev"}
 
 	mustFail(t, CheckHostedZone(context.Background(), env), "create mode")
+}
+
+// The gate must measure the session the run actually uses.
+//
+// With cloud.assumeRole set, every AWS call rides the STS session minted from that role,
+// whose lifetime is durationSeconds — not the source profile's expiry. Checking only the
+// profile let a 15-minute assumed session pass a gate whose entire purpose is refusing
+// sessions shorter than an hour, and a token that lapses mid-phase leaves a half-applied
+// run that cannot roll itself back.
+func TestSessionLifetime_ShortAssumedSessionIsRefused(t *testing.T) {
+	env := testEnv()
+	env.Cfg.Cloud.AssumeRole = &config.AssumeRole{
+		RoleARN:         "arn:aws:iam::111111111111:role/rackctl",
+		DurationSeconds: 900,
+	}
+	// A profile with plenty of life left, so the only thing that can fail this is the
+	// assumed session's own ceiling.
+	fakeBin(t, "aws", `echo '{"Expiration":"2999-01-01T00:00:00Z"}'`)
+
+	r := CheckSessionLifetime(context.Background(), env)
+	if r.Status != doctor.Fail {
+		t.Fatalf("a 15-minute assumed session must be refused however healthy the source "+
+			"profile is.\ngot %s: %s", r.Status, r.Detail)
+	}
+	if !strings.Contains(r.Detail, "durationSeconds") {
+		t.Errorf("the remedy must name the field to raise.\ngot: %s", r.Detail)
+	}
+}
+
+// An assumed session long enough for the run passes, and the source profile is still
+// checked behind it — rackctl re-assumes from that profile as the session nears expiry.
+func TestSessionLifetime_AdequateAssumedSessionStillChecksTheProfile(t *testing.T) {
+	env := testEnv()
+	env.Cfg.Cloud.AssumeRole = &config.AssumeRole{
+		RoleARN:         "arn:aws:iam::111111111111:role/rackctl",
+		DurationSeconds: 14400,
+	}
+	fakeBin(t, "aws", `echo '{"Expiration":"2000-01-01T00:00:00Z"}'`)
+
+	if r := CheckSessionLifetime(context.Background(), env); r.Status != doctor.Fail {
+		t.Fatalf("an expired source profile must still fail — rackctl re-assumes from it.\n"+
+			"got %s: %s", r.Status, r.Detail)
+	}
+}
+
+// An unset durationSeconds takes the awsid default of an hour, which is exactly the floor
+// rather than under it.
+func TestSessionLifetime_UnsetDurationTakesTheHourDefault(t *testing.T) {
+	env := testEnv()
+	env.Cfg.Cloud.AssumeRole = &config.AssumeRole{RoleARN: "arn:aws:iam::111111111111:role/rackctl"}
+	fakeBin(t, "aws", `echo '{"Expiration":"2999-01-01T00:00:00Z"}'`)
+
+	if r := CheckSessionLifetime(context.Background(), env); r.Status == doctor.Fail {
+		t.Fatalf("the default hour is the floor, not under it.\ngot: %s", r.Detail)
+	}
 }

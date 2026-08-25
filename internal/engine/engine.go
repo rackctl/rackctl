@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/ui"
@@ -59,9 +60,9 @@ func (s PlatformState) rollbackBlocked() bool { return s != PlatformAbsent }
 // PlatformExists reports whether the platform was ALREADY provisioned when this run
 // started. It is the difference between a rollback and a demolition.
 //
-// It FAILS CLOSED. This used to be `return err == nil` over a describe-cluster,
-// which collapsed "there is no platform" and "I could not find out" into the same
-// answer — and picked the one that ARMS the rollback. Expired credentials midway
+// It FAILS CLOSED. A `return err == nil` over a describe-cluster collapses "there is no
+// platform" and "I could not find out" into the same answer — and picks the one that ARMS
+// the rollback. Expired credentials midway
 // through a long run, a throttle, or a transient network fault was enough to make a
 // re-apply against a healthy platform look like a fresh install, and the teardown
 // below destroys the EKS cluster and the VPC. The failure mode the whole rollback
@@ -98,20 +99,16 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 
 	// Rollback is only ever safe when this run BUILT the thing it is about to destroy.
 	//
-	// `rackctl apply` is re-runnable by design (#16): it is how an operator retries after a
+	// `rackctl apply` is re-runnable by design: it is how an operator retries after a
 	// failure, and how they re-apply a config change to a platform that is already up.
 	// Against an existing cluster, phases 1-4 all "succeed" as no-ops — the network is
-	// there, the cluster is there, nothing is created. They are recorded as `completed`
+	// there, the cluster is there, nothing is created — and are recorded as `completed`
 	// all the same.
 	//
-	// So a failure in ANY later phase used to tear those phases down — and phase 4's
-	// teardown destroys the EKS cluster and the VPC. A re-apply that tripped on a config
-	// error would demolish a healthy, running platform that the run had not created and
-	// was never asked to remove.
-	//
-	// That is not hypothetical. A re-apply failed on a ClusterRoleBinding conflict, the
-	// engine began rolling back, and the only reason a 44/44-healthy cluster survived is
-	// that the process happened to be killed mid-teardown.
+	// A failure in any later phase would therefore tear those phases down, and phase 4's
+	// teardown destroys the EKS cluster and the VPC. The blast radius is a healthy,
+	// running platform this run did not create and was never asked to remove, reached
+	// through the ordinary retry path rather than through anything exotic.
 	//
 	// NoRollbackError guards one case — a convergence timeout must not destroy the cloud.
 	// This guards the other, and it is the more dangerous one: the operator did not lose a
@@ -162,10 +159,11 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 			// see NoRollbackError. A workload that has not converged is not a reason to
 			// destroy the cloud it is running on.
 			var noRollback *NoRollbackError
-			// Optionality is decided FIRST. `case preexisting:` used to come first and
-			// shadowed this arm entirely: on a re-apply — which is when preexisting is
-			// true, and the ordinary way an operator retries — a failing optional phase
-			// took the preexisting branch, fell out of the switch and returned. The
+			// Optionality is decided FIRST, and the order is load-bearing. With
+			// `case preexisting:` ahead of it this arm is shadowed entirely: on a re-apply
+			// — which is when preexisting is true, and the ordinary way an operator retries
+			// — a failing optional phase takes the preexisting branch, falls out of the
+			// switch and returns. The
 			// `continue` below was unreachable in exactly the situation it was written
 			// for, so one optional phase failing still cancelled every optional phase
 			// after it. Neither arm rolls back; only this one lets the run go on.
@@ -189,10 +187,9 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				// optional phase inherits it instead of having to remember.
 				//
 				// And the run CONTINUES. The reasoning above — that nothing an optional
-				// phase installs is a prerequisite for anything else — cuts both ways, and
-				// the loop used to honour only half of it: it declined to roll back, then
-				// returned, so a failure in one optional phase cancelled every optional
-				// phase after it.
+				// phase installs is a prerequisite for anything else — cuts both ways.
+				// Honouring only half of it, declining to roll back and then returning,
+				// cancels every optional phase after the one that failed.
 				//
 				// What that cost is specific. portal is the day-2 UI and smoke is the
 				// first-tenant vend, they share nothing, and portal is ordered first — so
@@ -231,7 +228,15 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				// exactly those orphaned: a failed cluster-addons left seven IAM roles
 				// behind, because its Teardown (which destroys the component) was
 				// never called.
-				e.teardown(ctx, st, append(completed, p))
+				if tf := e.teardown(ctx, st, append(completed, p)); len(tf) > 0 {
+					// A teardown that could not finish leaves billable resources standing,
+					// which is the outcome the rollback exists to prevent — so it travels
+					// with the phase failure rather than only being printed. Under a Hook
+					// nothing is printed at all, so returning it is the only way the
+					// operator hears about it.
+					return fmt.Errorf("phase %q failed: %w (and the rollback did not complete: %w)",
+						p.ID(), err, errors.Join(tf...))
+				}
 			}
 			return fmt.Errorf("phase %q failed: %w", p.ID(), err)
 		}
@@ -263,7 +268,39 @@ func (e *Engine) report(ev Event, line string) {
 	fmt.Fprintln(e.Out, line)
 }
 
-func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
+// teardownBudget bounds a whole rollback. It is a reverse walk of the completed phases,
+// each destroying one terragrunt component, plus the reap sweeps ahead of them. Half an
+// hour is above that walk's honest worst case and below leaving the operator with no
+// process and no answer.
+// It must exceed exec.DefaultRunTimeout, and by more than one command's worth. At 30
+// minutes it was HALF the ceiling a single terragrunt destroy is allowed, so one slow
+// component could consume the whole budget and every phase after it would then run on an
+// expired context — returning `context deadline exceeded` instantly and destroying
+// nothing. The reverse walk puts the EKS cluster and the VPC last, so the phases silently
+// skipped are exactly the ones holding the expensive resources the rollback exists to
+// remove.
+//
+// Three hours: above a realistic worst case (an EKS control plane alone runs 15-25
+// minutes, and substrate walks several components) with room for the per-command ceiling
+// to be spent more than once, and still bounded rather than open-ended.
+const teardownBudget = 3 * time.Hour
+
+// teardown reverses the completed phases and returns whatever could not be undone.
+//
+// It runs on a context detached from the caller's cancellation, and that is the whole
+// point rather than a convenience. A rollback is reached precisely when something went
+// wrong, and one of the ways things go wrong is the operator interrupting: the TUI's
+// abort path cancels the context, the in-flight phase's child dies, and this function is
+// then handed the same cancelled context. Every command below is an exec.CommandContext
+// on it, so each would return instantly — a rollback that reports having run and destroys
+// nothing, while the abort's grace period makes it look like it was given time.
+//
+// Detaching keeps a ceiling rather than removing one. An operator who wants out during a
+// rollback interrupts a second time, which takes the default signal disposition.
+func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) []error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), teardownBudget)
+	defer cancel()
+
 	if e.Hook == nil {
 		fmt.Fprintln(e.Out, ui.Warn("failure detected — rolling back provisioned resources"))
 	}
@@ -271,8 +308,8 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 	// Let the controllers delete what they — not Terraform — created, while they are
 	// still alive to do it. Without this a rollback tears the cluster down on top of
 	// live PVCs and Platform CRs, orphaning EBS volumes and IAM roles that nothing
-	// will ever clean up. `rackctl destroy` already did this; the rollback did not,
-	// and a failed install left three unattached volumes behind.
+	// will ever clean up — they are invisible to terraform state and bill indefinitely.
+	// Both teardown paths need it, which is why it lives in its own package.
 	//
 	// But ONLY once this run actually built the cluster, and that condition is the whole
 	// point rather than a tidy-up. Every call below acts on ambient state: reap.All and
@@ -280,10 +317,10 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 	// -A` and patch finalizers off CRs against WHATEVER the kubeconfig currently points
 	// at, and the cluster phase is the only place rackctl ever repoints it. So a failure
 	// in preflight, acquire or identity — none of which create a cluster, and identity is
-	// not wrapped in NoRollbackError — used to reach this code with the kubeconfig still
-	// aimed at the operator's previous context. Bootstrapping staging from a laptop
-	// pointed at a healthy development cluster meant a failed `scripts/init-backend-aws.sh`
-	// deleted every Platform and PVC in development.
+	// not wrapped in NoRollbackError — would otherwise reach this code with the kubeconfig
+	// still aimed at the operator's previous context. Bootstrapping staging from a laptop
+	// pointed at a healthy development cluster would then let a failed
+	// `scripts/init-backend-aws.sh` delete every Platform and PVC in development.
 	//
 	// This is the same invariant assertComponentRoots holds with NoRollbackError, and the
 	// reason it cannot be left to callers to remember: a precondition failure must never
@@ -319,13 +356,21 @@ func (e *Engine) teardown(ctx context.Context, st *State, completed []Phase) {
 			reap.OrphanedNodes(ctx, st.Runner, e.Out, st.Config.ClusterName(), st.Config.Cloud.Region)
 		}
 	}
+	// Every phase is attempted even after one fails: a component that cannot be destroyed
+	// says nothing about the ones behind it, and stopping at the first would strand them.
+	// Same posture as `rackctl destroy`.
+	var failed []error
 	for i := len(completed) - 1; i >= 0; i-- {
 		p := completed[i]
 		if e.Hook == nil {
 			fmt.Fprintln(e.Out, ui.Step("teardown: "+p.Title()))
 		}
-		if err := p.Teardown(ctx, st); err != nil && e.Hook == nil {
-			fmt.Fprintln(e.Out, ui.Fail("teardown "+p.ID()+": "+err.Error()))
+		if err := p.Teardown(ctx, st); err != nil {
+			failed = append(failed, fmt.Errorf("teardown %s: %w", p.ID(), err))
+			if e.Hook == nil {
+				fmt.Fprintln(e.Out, ui.Fail("teardown "+p.ID()+": "+err.Error()))
+			}
 		}
 	}
+	return failed
 }

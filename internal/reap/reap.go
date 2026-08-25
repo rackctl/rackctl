@@ -20,9 +20,9 @@
 //     nothing, billing.
 //
 // This lives in its own package because BOTH paths that tear a platform down need it:
-// `rackctl destroy`, and the engine's rollback when an init fails partway. The
-// rollback did not have it, and a failed install left three unattached gp3 volumes
-// behind.
+// `rackctl destroy`, and the engine's rollback when an init fails partway. A rollback is
+// the harder case of the two — it runs against a half-built cluster where the controllers
+// were very likely never healthy, which is exactly when their finalizers have not run.
 package reap
 
 import (
@@ -49,10 +49,10 @@ import (
 // Destroy the cluster and Karpenter dies with it, leaving its nodes running — orphaned,
 // attached to nothing, and billing.
 //
-// That used to be invisible, because Karpenter's nodes sat in the EKS-managed CLUSTER
-// security group, which EKS deletes along with the cluster. Once they were moved into
-// the Terraform-managed NODE security group (which is what lets Cilium's rules cover
-// them), the orphan became load-bearing: Terraform cannot delete a security group that
+// The orphan is load-bearing because Karpenter's nodes sit in the Terraform-managed NODE
+// security group, which is what lets Cilium's rules cover them. In the EKS-managed CLUSTER
+// security group it would be invisible — EKS deletes that one along with the cluster — but
+// here Terraform cannot delete a security group that
 // an instance still holds, so the whole teardown stopped dead —
 //
 //	Error: deleting Security Group (sg-...): DependencyViolation
@@ -211,7 +211,7 @@ type execer interface {
 //
 // One class of operator-minted role is NOT covered: the eventBridgeScheduler capability
 // mints `<cluster>-<platform>-scheduler-invoke` at the ROOT path with no Path set
-// (platform_capability_policy.go:270). The name filter below WOULD match it — upstream
+// (platform_capability_policy.go). The name filter below WOULD match it — upstream
 // 0546a92 re-keyed it from the environment to the cluster — but the path prefix excludes it
 // before the name is ever considered. It carries the tenant permissions boundary agent-iam
 // destroys, so a Platform declaring that capability whose finalizer did not complete can
@@ -220,7 +220,7 @@ type execer interface {
 // Widening the path is not the answer: enumerating IAM's root path means every role in the
 // account, and this sweep must stay scoped to one cluster. The channel upstream prescribes
 // is the tag sweep — 0546a92 tags these roles so a compromise sweep can pick them out of
-// the root path (platform_capability_policy.go:315-322) — or accepting that the finalizer
+// the root path (platform_capability_policy.go) — or accepting that the finalizer
 // owns the delete, which it does whenever the operator is healthy.
 // A third filter now sits after those two, and it is the one that makes the sweep provable
 // rather than merely narrow: every candidate's TAGS must establish that it is ours.
@@ -262,9 +262,9 @@ func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writ
 	// Enumeration runs in dry-run too, and the line above is why that is an addition rather
 	// than a replacement. Stating the filter is worth doing — it is how an operator checks the
 	// scoping is what they expect. But it is a description of intent, and a description cannot
-	// be wrong in a way anyone notices. The dry-run used to stop there, so the one question a
-	// dry-run of a destructive sweep exists to answer — what would this actually select? — was
-	// answered by restating the filter back.
+	// be wrong in a way anyone notices. A dry-run that stops there answers the one question a
+	// dry-run of a destructive sweep exists for — what would this actually select? — by
+	// restating the filter back.
 	//
 	// Now it says what it will do and then does the read-only half for real, so
 	// `rackctl destroy` without --apply can be pointed at a live account and SHOWN to select
@@ -478,6 +478,10 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 //
 // Enumeration runs in dry-run so the selection can be shown rather than described.
 func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
+	orphanedNodes(ctx, run, run.DryRun, out, cluster, region)
+}
+
+func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster, region string) {
 	if cluster == "" {
 		return
 	}
@@ -499,7 +503,7 @@ func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster
 	}
 	ids = strings.TrimSpace(ids)
 	if ids == "" || ids == "None" {
-		if run.DryRun {
+		if dryRun {
 			fmt.Fprintln(out, ui.OK("no EC2 instances tagged karpenter.sh/managed-by="+cluster+
 				" — this sweep selects nothing"))
 		}
@@ -507,7 +511,7 @@ func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster
 	}
 
 	insts := strings.Fields(ids)
-	if run.DryRun {
+	if dryRun {
 		fmt.Fprintln(out, ui.Step(fmt.Sprintf("(dry-run) would terminate %d Karpenter instance(s): %s",
 			len(insts), strings.Join(insts, ", "))))
 		return
@@ -549,9 +553,9 @@ func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster
 //
 // # WHAT THIS SWEEP CANNOT SEE, AND WHY IT NOW SAYS SO
 //
-// This function used to assert that "every dynamically provisioned volume is tagged
+// It would be wrong to assert that "every dynamically provisioned volume is tagged
 // kubernetes.io/cluster/<name>=owned by the EBS CSI driver". That is not established. The
-// driver is an EKS MANAGED ADDON declared at landing-zone components/aws/cluster/eks.tf:92-105
+// driver is an EKS MANAGED ADDON declared at landing-zone components/aws/cluster/eks.tf
 // with no configuration_values block at all, so neither extraVolumeTags nor k8sTagClusterId is
 // set; and the gp3 StorageClass in eks-gitops sets no tagSpecification parameters. Without
 // one of those, a dynamically provisioned volume carries only the driver's provenance tags —
@@ -577,6 +581,10 @@ func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster
 // Tagging them properly is upstream work — a configuration_values block on the addon — and is
 // filed as such. This is what rackctl can do without it.
 func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
+	orphanedVolumes(ctx, run, run.DryRun, out, cluster, region)
+}
+
+func orphanedVolumes(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster, region string) {
 	if cluster == "" {
 		return
 	}
@@ -596,7 +604,7 @@ func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, clust
 	}
 	ids = strings.TrimSpace(ids)
 	if ids == "" || ids == "None" {
-		if run.DryRun {
+		if dryRun {
 			fmt.Fprintln(out, ui.OK("no available EBS volumes tagged kubernetes.io/cluster/"+cluster+
 				" — this sweep selects nothing"))
 		}
@@ -604,7 +612,7 @@ func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, clust
 	}
 
 	vols := strings.Fields(ids)
-	if run.DryRun {
+	if dryRun {
 		fmt.Fprintln(out, ui.Step(fmt.Sprintf("(dry-run) would delete %d orphaned EBS volume(s): %s",
 			len(vols), strings.Join(vols, ", "))))
 		return
@@ -742,10 +750,10 @@ func fleetSpokes(ctx context.Context, run execer) []string {
 // the reap is deleting.
 //
 // Every Application in the catalog carries automated.selfHeal. A Platform CR is
-// catalog-managed, so deleting it is drift — and ArgoCD corrects drift. Observed on a live
-// teardown: the reap deleted Platform/ops, its finalizer ran and removed the tenant's IAM
-// roles, and ArgoCD recreated the Platform seconds later. The operator then minted the
-// roles again, against a cluster on its way out.
+// catalog-managed, so deleting it is drift — and ArgoCD corrects drift within seconds.
+// Reaping without disarming therefore runs a loop: the finalizer removes the tenant's IAM
+// roles, ArgoCD recreates the Platform, and the operator mints the roles again against a
+// cluster on its way out.
 //
 // What that costs is not the CR. It is that `agent-iam` owns a managed policy those roles
 // attach to, and a managed policy cannot be deleted while any role holds it — so the

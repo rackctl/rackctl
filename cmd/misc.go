@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -55,7 +54,9 @@ var (
 	destroyForceBuckets bool
 	// destroyAccountScoped permits removing the two eks-agent-platform roots under live/org.
 	// Off by default because they are shared by every environment in the account, so a single
-	// environment's teardown removing them is O14's failure arriving through the destroy door.
+	// environment's teardown removing them takes an account-wide singleton from every other
+	// environment — the same failure as creating one per environment, arriving through the
+	// destroy door rather than the apply door.
 	destroyAccountScoped bool
 )
 
@@ -78,9 +79,9 @@ that queried nothing could only ever restate its own filter back.
 Outside development, several S3 buckets (agent-iam artifacts, cluster-addons
 velero/loki/tempo, model-import staging, druid deepstorage) refuse a destroy
 when non-empty unless force_destroy has been applied into state first. Pass
---force-buckets with --apply to do that two-act sequence: apply the owning
-components with TF_VAR_force_destroy_buckets=true, then destroy. Development
-always allows teardown without the flag.
+--force-buckets to do that two-act sequence: apply the owning components with
+TF_VAR_force_destroy_buckets=true, then destroy. Development always allows
+teardown without the flag.
 
 druid is covered: the permitting apply clears its Aurora deletion_protection in
 the same act that lands force_destroy, so act 2 reaches both the per-tenant
@@ -96,21 +97,25 @@ the object rather than at the flag.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load(destroyConfig)
 		if err != nil {
-			return err
+			return withExit(ExitConfig, err)
 		}
-		// --force-buckets needs no dry-run guard: PermitBucketTeardown prints both acts
-		// and refuses where it must, so a dry-run is informative rather than dangerous.
-		ctx := context.Background()
+		// --force-buckets needs no dry-run guard. PermitBucketTeardown's own applies go
+		// through the Runner, which honours DryRun, so a dry-run prints both acts and
+		// changes nothing. It does not refuse: a component that cannot be permitted is
+		// reported and the walk continues, because the DESTROY is where a bucket that
+		// really cannot be emptied has to fail — and it does, on its own component, with
+		// BucketNotEmpty naming it.
+		ctx := cmd.Context()
 		run := exec.New(os.Stdout)
 		run.DryRun = destroyDryRun
 		// Same resolution as apply: with cloud.assumeRole set, a destroy runs as the
 		// role too. A teardown that ran as the operator while the apply ran as a role
 		// would be acting with different permissions on the same resources.
-		base, err := resolveEnv(ctx, cfg, run)
+		_, err = bindIdentity(ctx, cfg, run)
 		if err != nil {
 			return err
 		}
-		run.Env = tgEnvWith(base, cfg)
+		run.Env = tgEnvWith(nil, cfg)
 		run.Dir = engine.RepoPaths(cfg.Org.Name).LandingZone
 
 		fmt.Println(ui.Title(commandTitle("destroy", cfg)))
@@ -119,7 +124,7 @@ the object rather than at the flag.`,
 		}
 		if !run.DryRun {
 			if err := confirmDestroy(cfg.ClusterName(), string(cfg.Environment)); err != nil {
-				return err
+				return withExit(ExitDeclined, err)
 			}
 		}
 		if destroyForceBuckets {
@@ -242,10 +247,11 @@ the object rather than at the flag.`,
 
 		// Reverse of the apply order, through the SAME helper the phases use.
 		//
-		// This loop used to restate terragrunt's init+destroy sequence and build its env from
-		// tgEnv alone — so a standalone `rackctl destroy` passed none of the per-component
-		// variables the apply had injected, and the cluster component fell back to its own
-		// default name while its fail-closed endpoint precondition had nothing to satisfy it.
+		// Restating terragrunt's init+destroy sequence here and building the env from tgEnv
+		// alone is the trap: a standalone `rackctl destroy` would pass none of the
+		// per-component variables the apply injected, and the cluster component would fall
+		// back to its own default name with its fail-closed endpoint precondition
+		// unsatisfied.
 		// phases.Destroy owns both, so the two paths cannot drift.
 		//
 		// Every component is destroyed, with no exceptions. An earlier pass carved model-import
@@ -320,9 +326,9 @@ the object rather than at the flag.`,
 		// The reverse order is cluster-bootstrap, cluster-addons, …, agent-iam, secrets,
 		// cluster, network — so anything that errors in the middle strands the EKS control
 		// plane, the VPC and the NAT gateway, and the run reports the error that caused it
-		// rather than the bill it left. That is not hypothetical: a live teardown failed on
-		// agent-iam because a managed policy still had two operator-minted roles attached,
-		// and everything behind it went untouched.
+		// rather than the bill it left. Failing on agent-iam is the ordinary case, not an
+		// exotic one: a managed policy with an operator-minted role still attached refuses
+		// to delete, and every component behind it in the walk goes untouched.
 		//
 		// So every component is attempted, failures are collected, and the command exits
 		// non-zero naming all of them. Ordering is still dependency-correct — it is the

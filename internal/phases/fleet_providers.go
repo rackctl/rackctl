@@ -11,7 +11,18 @@ import (
 )
 
 // fleetRoleARNLine matches the ServiceAccount annotation eks-fleet ships as a placeholder.
-var fleetRoleARNLine = regexp.MustCompile(`(?m)^(\s*)eks\.amazonaws\.com/role-arn:.*$`)
+//
+// [ \t]* rather than \s*: under (?m), `^` matches at every line start and \s matches a
+// newline, so `^(\s*)` starts the match on a blank line ABOVE the annotation and reports a
+// position that is not the annotation's. The rewrite happens to survive that because ${1}
+// re-emits the whitespace it swallowed — so this is a locator defect with no output
+// corruption today, and exactly the shape that becomes one the moment a caller reports the
+// position or the replacement stops re-emitting the capture.
+//
+// The anchor also keeps a COMMENTED annotation out: `# eks.amazonaws.com/role-arn:` has a
+// '#' where the pattern requires the key, so a superseded line above the live one cannot
+// win the match.
+var fleetRoleARNLine = regexp.MustCompile(`(?m)^([ \t]*)eks\.amazonaws\.com/role-arn:.*$`)
 
 // renderFleetProviders writes a copy of eks-fleet's config/bootstrap/providers.yaml with
 // the real hub role ARN substituted, and returns the path to apply.
@@ -27,9 +38,9 @@ var fleetRoleARNLine = regexp.MustCompile(`(?m)^(\s*)eks\.amazonaws\.com/role-ar
 // so the phase declares success and every spoke vend fails later with no obvious cause.
 //
 // It is also actively destructive of a correct setup. kubectl apply is declarative, so an
-// operator who had put the real ARN on the ServiceAccount gets it reverted to the
-// placeholder — which is what rackctl used to do immediately after printing a note telling
-// them to make sure that annotation was right.
+// operator who has put the real ARN on the ServiceAccount gets it reverted to the
+// placeholder — and a note telling them to check that annotation, printed immediately
+// before reverting it, is worse than saying nothing.
 //
 // rackctl supplies fragile per-run inputs; this is one. The ARN is normally COMPUTED
 // rather than configured: the substrate phase applies landing-zone's fleet-hub into this

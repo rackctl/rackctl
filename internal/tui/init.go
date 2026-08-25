@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -47,6 +47,10 @@ type model struct {
 	finished bool
 	aborted  bool
 	err      error
+	// tail is the most recent line of subprocess output. A phase-level view of a
+	// forty-minute apply is a spinner with nothing behind it; this is what the run is
+	// waiting on, rendered under the active phase.
+	tail func() string
 }
 
 // RunInit runs the bootstrap pipeline under an interactive TUI. Direct command
@@ -56,14 +60,23 @@ type model struct {
 // is what terminates the in-flight terragrunt child rather than orphaning it.
 // opts is for tests, which drive the program headless; production passes none.
 func RunInit(ctx context.Context, title string, st *engine.State, ph []engine.Phase, cleanOnFail bool, opts ...tea.ProgramOption) error {
-	st.Runner.Out = io.Discard
+	// Subprocess output goes to a transcript rather than to io.Discard. The TUI owns the
+	// terminal so this output cannot go to stdout, but discarding it leaves a failed run
+	// with a cross beside a phase name and nothing else — and that output is the diagnosis.
+	org := ""
+	if st.Config != nil {
+		org = st.Config.Org.Name
+	}
+	tr := newTranscript(transcriptDir(org), "apply")
+	defer tr.Close()
+	st.Runner.Out = tr
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	events := make(chan engine.Event, 128)
 	done := make(chan error, 1)
-	eng := &engine.Engine{Phases: ph, Out: io.Discard, CleanOnFail: cleanOnFail, Hook: func(ev engine.Event) { events <- ev }}
+	eng := &engine.Engine{Phases: ph, Out: tr, CleanOnFail: cleanOnFail, Hook: func(ev engine.Event) { events <- ev }}
 	go func() { done <- eng.Run(ctx, st) }()
 
 	rows := make([]phaseRow, len(ph))
@@ -80,7 +93,12 @@ func RunInit(ctx context.Context, title string, st *engine.State, ph []engine.Ph
 	// sharing a backing array — which is exactly why this was easy to miss.)
 	final, err := tea.NewProgram(model{
 		title: title, rows: rows, events: events, done: done, spinner: sp,
+		tail: func() string { return tr.Tail(96) },
 	}, opts...).Run()
+	// The path is reported after the view exits, so it survives the alternate screen
+	// buffer, and on success as well as on failure — a run that worked is also the one an
+	// operator comes back to when a problem surfaces later.
+	tr.Report(os.Stderr)
 	if err != nil {
 		return err
 	}
@@ -217,8 +235,13 @@ func (m model) View() string {
 	case m.finished:
 		b.WriteString(ui.Green.Render("✓ platform is up — hand off to the portal") + "\n")
 	default:
-		// Say what quitting costs. The old "q to quit" invited an abort mid-apply
-		// as though it were closing a window.
+		if m.tail != nil {
+			if s := m.tail(); s != "" {
+				b.WriteString(ui.Gray.Render("  "+s) + "\n")
+			}
+		}
+		// Say what quitting costs. A bare "q to quit" invites an abort mid-apply as
+		// though it were closing a window.
 		b.WriteString(ui.Gray.Render("  q aborts the run — the platform is left part-provisioned") + "\n")
 	}
 	return b.String()

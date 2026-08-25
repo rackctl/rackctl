@@ -69,8 +69,10 @@ func validateNetworkMode(n ClusterNet) []string {
 	// against an empty value, because ApplyDefaults forces both and they therefore have no
 	// unset state: the default IS the sentinel. That is the same shape landing-zone uses
 	// (`var.vpc_cidr == "10.0.0.0/16"`, `var.nat_gateways == 1`), and comparing natGateways
-	// against 0 instead would be wrong — ApplyDefaults has already forced it to 1. The other
-	// three have no meaningful default, so empty/false is the sentinel.
+	// against 0 instead would be wrong — ApplyDefaults has already forced it to 1. Every
+	// remaining lever has no meaningful default, so empty/false is its sentinel. Stated
+	// without a count deliberately: a count is wrong the moment a lever is added, and the
+	// rule is about which sentinel applies, not about how many levers there are.
 
 	if n.VPCCIDR != "" && n.VPCCIDR != defaultVPCCIDR {
 		errs = append(errs, fmt.Sprintf("cluster.network.vpcCidr (%q) is a create-mode lever and does not apply with cluster.network.mode: adopt — an adopted VPC's CIDR is the owner's, and landing-zone reads it back from the VPC (data.aws_vpc.adopt). Leave it unset", n.VPCCIDR))

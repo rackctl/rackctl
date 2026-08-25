@@ -46,11 +46,11 @@ var componentGateRemedy = map[string]string{
 // correct, and it is the reason to keep it rather than to delete it — one os.Stat per
 // component, holding a property nothing else holds, ready for the next divergence.
 //
-// The check is generic rather than a per-component environment allow-list on purpose.
-// Hard-coding which environments carry which leaves would copy landing-zone's live-tree
-// shape into this repo — the forking rackctl exists not to do — and would rot the moment
-// the missing roots are added upstream. Statting what is actually there keeps working
-// either way.
+// The check is generic rather than a per-component environment allow-list. Hard-coding
+// which environments carry which leaves would copy landing-zone's live-tree shape into
+// this repo — the forking rackctl exists not to do — and would go stale the moment a
+// missing root is added upstream. Statting what is actually there keeps working either
+// way.
 //
 // Every failure is wrapped in engine.NoRollbackError, and that is load-bearing rather
 // than defensive. This guard's entire premise is that NOTHING has been provisioned yet,

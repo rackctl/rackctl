@@ -85,11 +85,9 @@ func TestAgentPlatformEnv_SetsTheParseTimeAccountID(t *testing.T) {
 
 // Each KMS variable follows its own landing-zone output.
 //
-// This test previously asserted the opposite — that one output served both — and explained that
-// a second lookup "would be inventing a key that does not exist". That was correct until
-// landing-zone#205, which added `separate_logs_key` and a second output. The output exists now,
-// and reading it is what keeps the wiring correct once an environment separates: on separation
-// the log-path grants MOVE off the secrets key rather than being copied, so an installer still
+// The secrets component publishes logs_kms_key_arn alongside kms_key_arn, and reading it is
+// what keeps the wiring correct once an environment sets separate_logs_key: on separation the
+// log-path grants MOVE off the secrets key rather than being copied, so an installer still
 // passing the data key here fails at CreateLogGroup.
 func TestAgentPlatformEnv_EachKMSVariableFollowsItsOwnOutput(t *testing.T) {
 	st, _ := apState(t)
@@ -115,9 +113,9 @@ func TestAgentPlatformEnv_EachKMSVariableFollowsItsOwnOutput(t *testing.T) {
 	}
 }
 
-// A secrets state written before landing-zone#205 publishes no logs_kms_key_arn, and that must
-// not be a hard failure — most sharply on the teardown path, which reads these outputs back out
-// of a state nothing has re-applied.
+// A secrets state written by a module that had no logs_kms_key_arn output publishes none, and
+// that must not be a hard failure — most sharply on the teardown path, which reads these
+// outputs back out of a state nothing has re-applied.
 //
 // The fallback is sound rather than convenient: the output is published in BOTH modes, so a
 // state missing it came from a module that could not separate the keys, which means the one key
@@ -130,7 +128,7 @@ func TestAgentPlatformEnv_FallsBackWhenTheSecretsStatePredatesTheLogsOutput(t *t
 	env, err := agentPlatformEnv(st)
 	if err != nil {
 		t.Fatalf("an older secrets state must still resolve — hard-failing here would refuse to "+
-			"tear down every platform installed before landing-zone#205: %v", err)
+			"tear down every platform whose state predates the second key output: %v", err)
 	}
 	want := "TF_VAR_logs_kms_key_arn=arn:aws:kms:us-west-2:111111111111:key/data"
 	if !slices.Contains(env, want) {
@@ -346,7 +344,7 @@ func TestAgentPlatform_DisclosesTheAccountScopedApply(t *testing.T) {
 }
 
 // A one-environment teardown must NOT remove the account-scoped roots, and must name what it is
-// leaving — target 5 verifies teardown as a set difference against a baseline, so an undeclared
+// leaving. A teardown is verified as a set difference against a baseline, so an undeclared
 // survivor reads as an unexplained resource.
 func TestAgentPlatformTeardown_LeavesTheAccountRootsAndSaysSo(t *testing.T) {
 	st, out := apState(t)
@@ -363,8 +361,9 @@ func TestAgentPlatformTeardown_LeavesTheAccountRootsAndSaysSo(t *testing.T) {
 	}
 }
 
-// And opting in must say what it costs, because the operator is now doing the thing O14 exists
-// to prevent — deliberately, which is fine, and silently, which is not.
+// And opting in must say what it costs. The operator is deliberately removing an
+// account-wide singleton that every other environment shares, which is fine; doing it
+// silently is not.
 func TestAgentPlatformTeardown_OptingInWarnsItIsAccountWide(t *testing.T) {
 	st, out := apState(t)
 	noteAccountScopedTeardown(st, allAPComponents(), AgentPlatformTeardown{AccountScoped: true})
@@ -448,7 +447,7 @@ func TestApplyAgentPlatform_ApplyStillRequiresTheOutputs(t *testing.T) {
 // tree lands, or EvalSuite reports are silently discarded.
 //
 // The variable is opt-in upstream because it depends on eks-agent-platform's eval-runtime
-// component having written its SSM parameters (cluster-bootstrap/variables.tf:182). rackctl
+// component having written its SSM parameters (cluster-bootstrap/variables.tf). rackctl
 // applies cluster-bootstrap in the gitops phase, one phase BEFORE that tree exists — so the
 // flag cannot be set there, and if it is never set at all, bootstrap.tf never stamps
 // `eks-agent-platform/eval-reports-bucket` on the ArgoCD cluster Secret. The operator then
@@ -715,11 +714,10 @@ func TestAgentPlatformComponents_IsTheExactSet(t *testing.T) {
 
 // And where a real checkout is available, every root must actually resolve.
 //
-// This is the only assertion in the file that can catch upstream DELETING a root, which is a
-// change to somebody else's repo that no rackctl commit accompanies. It has happened twice:
-// cost-pipeline moving to live/org (ledger O21), and accelerator-pools being deleted outright
-// (O27). Both times the first symptom was the phase aborting before applying anything, and both
-// times `rackctl plan` still looked fine, because a dry run only prints a note.
+// This is the only assertion in the file that can catch upstream MOVING or DELETING a root,
+// which is a change to somebody else's repo that no rackctl commit accompanies. The first
+// symptom of one is the phase aborting before it applies anything, and `rackctl plan` cannot
+// surface it — a dry run only prints a note.
 //
 // Skips when no checkout is present rather than failing, since most machines running these tests
 // have never run an install. RACKCTL_AGENT_PLATFORM_CHECKOUT points it at a working clone.
@@ -819,10 +817,10 @@ func TestAgentPlatformComponents_CostRootsAreGatedAsAPair(t *testing.T) {
 // A tree that was never applied must not wedge the teardown.
 //
 // This tree writes to its own state bucket, created by the platform phase and by nothing
-// else. `terragrunt init` against a missing bucket errors, and `rackctl destroy` used to
-// return that error before it reached the landing-zone components — so a run that failed
-// in the cluster or gitops phase left the EKS control plane, the VPC and the NAT gateway
-// billing, and reported a component tree that had never been applied. rackctl points
+// else. `terragrunt init` against a missing bucket errors, and returning that error before
+// reaching the landing-zone components would leave a run that failed in the cluster or
+// gitops phase with the EKS control plane, the VPC and the NAT gateway billing, reporting a
+// component tree that had never been applied. rackctl points
 // operators at `rackctl destroy` from three separate pre-platform failure branches, so
 // this is a designed outcome rather than an edge case.
 func TestDestroyAgentPlatform_SkipsWhenTheTreeWasNeverApplied(t *testing.T) {
@@ -847,6 +845,36 @@ func TestDestroyAgentPlatform_SkipsWhenTheTreeWasNeverApplied(t *testing.T) {
 	}
 	if _, err := os.Stat(logf); err == nil {
 		t.Fatal("terragrunt was invoked against a tree with no state bucket — that init fails, " +
-			"and its error is what used to abort the whole teardown before the EKS cluster")
+			"and its error is what would abort the whole teardown before the EKS cluster")
+	}
+}
+
+// S3 rejects a CreateBucketConfiguration naming us-east-1, and requires one everywhere else.
+//
+// The agent-platform state bucket is minted in phase 6, so getting this wrong fails the
+// install after the VPC, the EKS control plane and the whole substrate are already
+// provisioned and billing — and it fails only in us-east-1, which is the region a
+// deployment is most likely to pick.
+func TestCreateBucketArgs_OmitsLocationConstraintInUSEast1(t *testing.T) {
+	got := createBucketArgs("acct-us-east-1-agent-platform-tfstate", "us-east-1")
+	if slices.Contains(got, "--create-bucket-configuration") {
+		t.Fatalf("us-east-1 must carry no CreateBucketConfiguration — S3 answers "+
+			"InvalidLocationConstraint and the phase dies with the substrate already paid for.\ngot: %v", got)
+	}
+	if !slices.Contains(got, "--region") {
+		t.Errorf("--region is still required; only the configuration block is dropped.\ngot: %v", got)
+	}
+}
+
+// The other half of the same rule: every region that is not us-east-1 requires the block,
+// so dropping it unconditionally would break every one of them instead.
+func TestCreateBucketArgs_CarriesLocationConstraintElsewhere(t *testing.T) {
+	got := createBucketArgs("acct-eu-west-1-agent-platform-tfstate", "eu-west-1")
+	if !slices.Contains(got, "--create-bucket-configuration") {
+		t.Fatalf("a non-us-east-1 bucket needs LocationConstraint or it is created in the "+
+			"wrong region.\ngot: %v", got)
+	}
+	if !slices.Contains(got, "LocationConstraint=eu-west-1") {
+		t.Errorf("the constraint must name the target region.\ngot: %v", got)
 	}
 }

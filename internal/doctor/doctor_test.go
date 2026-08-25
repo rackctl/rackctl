@@ -2,9 +2,11 @@ package doctor
 
 import "testing"
 
-// Every fixture below is the shape of a real failure observed on a live cluster.
-// The point of these tests is that the doctor is provably able to see them — the
-// previous doctor could not see any of them and still reported success.
+// Every fixture below is the shape a real cluster failure takes on the wire, not a
+// simplified stand-in. A health check is only worth its exit status if it can see the
+// shapes that actually occur, and each of these is a state a check could plausibly
+// round up to healthy: a condition that is False rather than absent, a status field
+// spelled like a condition, a pod Succeeded rather than Running.
 
 func TestSameRepo_NormalizesGitURLForms(t *testing.T) {
 	for _, tc := range []struct {

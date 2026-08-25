@@ -21,29 +21,48 @@ func awsEnv(cfg *config.Config) []string {
 	return awsid.Base(cfg)
 }
 
-// identity is the process's AWS identity, resolved once. A command is a
-// single-shot process, so one Identity for its lifetime is the whole scope — and
-// caching it here is what lets a long apply re-assume transparently instead of
-// holding a session that lapses mid-run.
+// identity is the process's AWS identity. A command is a single-shot process, so one
+// Identity for its lifetime is the whole scope, and it holds the session cache that
+// re-assumes before expiry.
 var identity *awsid.Identity
 
-// resolveEnv returns the environment every subprocess of this command runs with.
+// resolveEnv returns the identity every subprocess of this command runs as, resolving
+// it now.
 //
-// It is the single composition point for AWS identity. Callers must not build
-// their own: the bug this replaces was `rackctl check` pinning the profile on one
-// of its two runners and not the other, so the two halves of one command asked AWS
-// as different principals.
+// It is the single composition point for AWS identity. Callers must not build their own:
+// a command that pins the profile on one of its two runners and not the other asks AWS as
+// two different principals for the two halves of one answer.
 //
-// Without cloud.assumeRole this is the profile and region, exactly as before.
+// Without cloud.assumeRole this is the profile and region.
 func resolveEnv(ctx context.Context, cfg *config.Config, run *exec.Runner) ([]string, error) {
 	if identity == nil {
 		identity = awsid.New(cfg, run)
 	}
-	env, err := identity.Env(ctx)
+	return identity.Env(ctx)
+}
+
+// bindIdentity makes every subprocess of this command resolve its identity per
+// invocation, and returns the identity as it stands now so a caller can fail early.
+//
+// Resolving once and freezing the result into Runner.Env is what leaves a long apply
+// holding a session that lapses mid-run: an assumed STS session defaults to an hour, the
+// EKS control plane alone takes a quarter of that, and the rollback that would clean up
+// needs the same credentials the run just lost. awsid.Identity caches its session and
+// re-assumes inside a refresh window — machinery that only runs if something asks it
+// again, which is what Runner.EnvSource does.
+//
+// The first resolve happens here rather than lazily so a role that cannot be assumed
+// fails before preflight and before any spend, not as a permissions error partway
+// through a phase.
+func bindIdentity(ctx context.Context, cfg *config.Config, run *exec.Runner) ([]string, error) {
+	base, err := resolveEnv(ctx, cfg, run)
 	if err != nil {
 		return nil, err
 	}
-	return env, nil
+	run.EnvSource = func(ctx context.Context) ([]string, error) {
+		return identity.Env(ctx)
+	}
+	return base, nil
 }
 
 // tgEnv builds the environment every terragrunt invocation runs with.
@@ -52,11 +71,11 @@ func resolveEnv(ctx context.Context, cfg *config.Config, run *exec.Runner) ([]st
 // account.hcl is a placeholder) and the tfstate bucket is
 // {account}-{region}-tfstate, so terragrunt must see the real account.
 //
-// TF_VAR_gitops_repo_url is the one that matters most, and its absence was a real
-// bug: cluster-bootstrap's gitops_repo_url used to default to the UPSTREAM catalog
-// (nanohype/eks-gitops), and rackctl never passed a value — it only printed the
-// fork's name in a log line. So every install wired its app-of-apps to upstream
-// main, unpinned, while the fork rackctl had just created for the org sat unread.
+// TF_VAR_gitops_repo_url is the one that matters most, and its ABSENCE is the bug it
+// prevents: cluster-bootstrap's gitops_repo_url defaults to the upstream catalog, so an
+// installer that prints the fork's name in a log line and passes no value wires every
+// install's app-of-apps to upstream main, unpinned, while the fork it just created for the
+// org sits unread.
 // A cluster vended into another org was found syncing from nanohype/eks-gitops@main.
 //
 // landing-zone now declares gitops_repo_url with NO default, so a missing value
@@ -115,8 +134,8 @@ func tgEnvWith(base []string, cfg *config.Config) []string {
 		// enable_accelerators is deliberately absent. It labelled the cluster
 		// eks-agent-platform/accelerators=true so the accelerators ApplicationSet targeted it,
 		// and the whole GPU path — that ApplicationSet, the accelerator-pools component, and
-		// landing-zone's variable and label — was deleted upstream (ledger O27). The variable is
-		// now undeclared, so injecting it would be inert rather than wrong; it is gone anyway,
+		// landing-zone's variable and label — no longer exists upstream. The variable is
+		// undeclared, so injecting it would be inert rather than wrong; it is absent anyway,
 		// because a knob whose documentation promises an effect it no longer has is worse than
 		// no knob. addons.accelerators is refused at config load, not ignored — see
 		// internal/config/retired.go.
@@ -135,7 +154,7 @@ func tgEnvWith(base []string, cfg *config.Config) []string {
 		// enable_portal_reader mints the portal's read-only ServiceAccount and a DURABLE
 		// token, so the portal can register the cluster and watch Platform/Tenant CRs.
 		//
-		// It defaults to TRUE upstream (cluster-bootstrap/variables.tf:154) and no leaf pins
+		// It defaults to TRUE upstream (cluster-bootstrap/variables.tf) and no leaf pins
 		// it, so a portal-enabled install already got the reader — this injection does not
 		// fix an inert knob. What it does is the opposite, and deliberately: it turns the
 		// reader OFF when controlPlane.portal is false, because a durable cluster-read token

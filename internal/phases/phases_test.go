@@ -21,8 +21,8 @@ import (
 // every AWS dependency the addons need. ArgoCD failing to install — a GitHub 401 on the
 // tenants-repo deploy key, a chart that will not render — is not a reason to demolish any
 // of it. The convergence wait further down this same phase already says exactly that; the
-// apply above it used to return BARE, so the sweep ran and destroyed the cluster and the
-// VPC over a credential fixable in ten seconds.
+// apply above it must not return BARE, or the sweep runs and destroys the cluster and the
+// VPC over a credential fixable in seconds.
 func TestGitopsPhase_AFailedInstallDoesNotDestroyTheProvisionedCloud(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
@@ -248,11 +248,11 @@ func TestCoreComponents_NetworkFirst(t *testing.T) {
 // PHASE STRUCTURE — a substrate phase and a gitops phase — not in a component's index in a
 // shared list.
 //
-// That distinction is the whole lesson of #26/#29. #26 "fixed" this by reordering
-// CoreComponents and asserting that list; it did nothing, because the apply order is driven
-// by which phase owns a component. The invariant only became real when cluster-addons and
-// cluster-bootstrap were split across two phases whose order the engine executes literally.
-// So this test asserts the phase order and the ownership, which together ARE the guarantee.
+// That distinction is the whole point. Reordering CoreComponents and asserting that list
+// guards nothing, because the apply order is driven by which phase owns a component, not by a
+// component's index in a shared slice. The invariant is real only because cluster-addons and
+// cluster-bootstrap sit in two phases whose order the engine executes literally — so this test
+// asserts the phase order and the ownership, which together ARE the guarantee.
 func TestPhases_SubstrateBeforeGitOps(t *testing.T) {
 	ids := make([]string, 0)
 	for _, p := range All() {
@@ -715,9 +715,9 @@ func TestComponentEnv_AdoptVarsOnlyReachNetwork(t *testing.T) {
 	}
 }
 
-// druid is opt-in real money. O1 settled the teardown wedge upstream; the apply note now
-// names the substrate and points at the two-act force_destroy_buckets path for non-dev,
-// rather than claiming the cluster can never come down.
+// druid is opt-in real money. The apply note names the substrate and points at the two-act
+// force_destroy_buckets path outside development, rather than claiming the cluster can
+// never come down — landing-zone sets skip_final_snapshot and force_destroy, so it can.
 func TestSubstrate_NotesDruidWhenEnabled(t *testing.T) {
 	var out strings.Builder
 	run := exec.New(&out)
@@ -732,7 +732,7 @@ func TestSubstrate_NotesDruidWhenEnabled(t *testing.T) {
 		t.Fatalf("enabling druid must note that the analytics substrate is being applied.\ngot:\n%s", out.String())
 	}
 	if strings.Contains(out.String(), "will not tear down cleanly") {
-		t.Fatalf("O1 settled the teardown wedge — the old permanent-wedge warning must go.\ngot:\n%s", out.String())
+		t.Fatalf("a druid teardown is not a permanent wedge — the note must not say it is.\ngot:\n%s", out.String())
 	}
 }
 
@@ -771,5 +771,101 @@ func TestCoreComponents_FleetHubTracksTheEKSFleetGate(t *testing.T) {
 	// It reads the cluster component's OIDC outputs, so it cannot precede it.
 	if slices.Index(got, "fleet-hub") < slices.Index(got, "cluster") {
 		t.Errorf("fleet-hub depends on the cluster component's OIDC outputs and must follow it:\n%v", got)
+	}
+}
+
+// The three severity SNS topics are provisioned and nothing routes alerts into them.
+//
+// That gap must be stated at apply time, not left to a comment. A topic with no route is
+// indistinguishable from a working one until the page that never arrives is also the
+// evidence it was needed, so the disclosure is the honest half of shipping the producer.
+func TestSubstrate_DisclosesThatNothingRoutesAlertsIntoTheSeverityTopics(t *testing.T) {
+	var out strings.Builder
+	run := exec.New(&out)
+	run.DryRun = true
+	st := &engine.State{Config: baseCfg(), Runner: run, Repos: engine.Repos{LandingZone: t.TempDir()}}
+
+	_ = (substrate{}).Run(context.Background(), st)
+
+	got := out.String()
+	for _, want := range []string{"alerts_{critical,warning,info}_topic_arn", "NOTHING", "out of band"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the operator must be told the topics have no consumer — %q missing:\n%s", want, got)
+		}
+	}
+}
+
+// A destroy is retried and an apply is not, and the difference is convergence rather than
+// mutation: `terragrunt destroy` re-reads state and reconciles toward empty, so a second
+// attempt removes what is left. An apply that failed partway has already moved state.
+//
+// Driven through a fake terragrunt that fails transiently, so this asserts which Runner
+// method each verb reached rather than which one the source appears to name.
+func TestTG_DestroyRetriesATransientFailureAndApplyDoesNot(t *testing.T) {
+	for _, tc := range []struct {
+		verb     string
+		attempts string
+	}{
+		{"destroy", "3"},
+		{"apply", "1"},
+	} {
+		dir := t.TempDir()
+		counter := filepath.Join(dir, "n")
+		script := "#!/bin/sh\n" +
+			"case \"$*\" in *" + tc.verb + "*) ;; *) exit 0 ;; esac\n" +
+			"n=$(cat " + counter + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " + counter + "\n" +
+			"if [ \"$n\" -lt 3 ]; then echo 'An error occurred (ThrottlingException)' >&2; exit 254; fi\n" +
+			"exit 0\n"
+		if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte(script), 0o755); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		st := &engine.State{Config: baseCfg(), Runner: exec.New(io.Discard),
+			Repos: engine.Repos{LandingZone: t.TempDir()}}
+		_ = tg(context.Background(), st, tc.verb, "network")
+
+		n, _ := os.ReadFile(counter)
+		if strings.TrimSpace(string(n)) != tc.attempts {
+			t.Errorf("%s was attempted %s time(s), want %s", tc.verb,
+				strings.TrimSpace(string(n)), tc.attempts)
+		}
+	}
+}
+
+// A failed `cluster` destroy must NOT prevent `network` from being attempted.
+//
+// network is LAST in the reverse walk and holds the VPC, its NAT gateways and their EIPs.
+// Returning on the first failure bills the operator for a NAT gateway attached to nothing,
+// reported only as the cluster error that preceded it — and it is the defect
+// substrate.Teardown, engine.teardown and `rackctl destroy` each name and avoid.
+func TestClusterTeardown_AttemptsNetworkEvenWhenClusterFails(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "argv")
+	// A terragrunt that fails every `destroy cluster` and records every invocation.
+	script := "#!/bin/sh\necho \"$*\" >> " + log + "\n" +
+		"case \"$*\" in *destroy*) case \"$*\" in *-cluster*|*/cluster*) exit 1 ;; esac ;; esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	st := &engine.State{Config: baseCfg(), Runner: exec.New(io.Discard),
+		Repos: engine.Repos{LandingZone: t.TempDir()}}
+	err := (cluster{}).Teardown(context.Background(), st)
+
+	if err == nil {
+		t.Fatal("a failed component must still be reported")
+	}
+	b, _ := os.ReadFile(log)
+	if !strings.Contains(string(b), "network") {
+		t.Fatalf("network was never attempted after cluster failed — the VPC and its NAT "+
+			"gateways are stranded, and the run reports only the cluster error.\nargv:\n%s", b)
+	}
+	if !strings.Contains(err.Error(), "cluster") {
+		t.Errorf("the cluster failure must survive into the returned error: %v", err)
 	}
 }

@@ -73,25 +73,23 @@ func CoreComponents(cfg *config.Config) []string {
 	if cfg.FullObservability() {
 		comps = append(comps, "managed-monitoring") // must precede cluster-bootstrap
 	}
-	// observability is NOT conditional, and it is gated on nothing: it publishes the three
+	// observability is NOT conditional and is gated on nothing: it publishes the three
 	// /eks-agent-platform/<cluster>/observability/alerts_{critical,warning,info}_topic_arn
-	// parameters unconditionally, and it is their sole producer. rackctl applied it nowhere at
-	// all until now, so every rackctl-installed cluster had consumers of that contract and no
-	// producer.
+	// parameters unconditionally, and it is their sole producer. Without it a cluster has
+	// consumers of that contract and nothing on the other end.
 	//
-	// Its POSITION here is currently arbitrary — no component rackctl applies reads those
-	// parameters, so only the phase boundary (substrate before gitops) is load-bearing. It is
-	// placed early because the consumer that WILL bind is eks-agent-platform's kill-switch,
+	// Its position here is not load-bearing — no component rackctl applies reads those
+	// parameters, so only the phase boundary (substrate before gitops) constrains it. It is
+	// placed early because the consumer that binds is eks-agent-platform's kill-switch,
 	// whose burn-rate rules resolve both topic ARNs through unguarded `data` blocks at PLAN
-	// time. rackctl does not apply that tree yet; when it does, this ordering stops being
-	// arbitrary and starts being required.
+	// time, and that ordering becomes required the moment rackctl applies that tree.
 	comps = append(comps, "observability")
 	// druid is the per-tenant analytics substrate (Aurora Serverless + optionally MSK), gated
 	// because it is real money and most platforms never need it. Its live leaf is
 	// self-sufficient — it carries its own `tenants` sizing map — and it depends on network and
 	// cluster, both of which the cluster phase applied before this one. Live roots exist under
-	// every workload environment. Teardown: development always; elsewhere via
-	// force_destroy_buckets (O1 settled upstream; target 11 wires the two-act apply).
+	// every workload environment. Teardown: development always; elsewhere the two-act apply
+	// behind --force-buckets, which lands force_destroy in state before the destroy runs.
 	if cfg.Addons.Druid {
 		comps = append(comps, "druid")
 	}
@@ -221,10 +219,10 @@ func destroy(ctx context.Context, st *engine.State, component string) error {
 // Destroy runs one component's teardown with its scoped env. Exported for `rackctl destroy`,
 // which walks CoreComponents in reverse outside the phase engine.
 //
-// It exists so that path cannot drift from this one. It used to restate the init+destroy
-// sequence itself and build its env from tgEnv alone — so a standalone `rackctl destroy`
-// passed none of the per-component variables the apply had, and the cluster component fell
-// back to its own default name. Restating what a shared helper already does is the mistake
+// It exists so that path cannot drift from this one. A destroy that restated the
+// init+destroy sequence itself and built its env from tgEnv alone would pass none of the
+// per-component variables the apply passed, and the cluster component would fall back to
+// its own default name. Restating what a shared helper already does is the mistake
 // substrateComponents was written to prevent; this is the same mistake one layer down.
 func Destroy(ctx context.Context, st *engine.State, component string) error {
 	return destroy(ctx, st, component)
@@ -233,9 +231,9 @@ func Destroy(ctx context.Context, st *engine.State, component string) error {
 // componentEnv returns the TF_VARs a single landing-zone component declares. Components not
 // named here take nothing beyond the globals in tgEnv.
 //
-// Every entry must correspond to a variable that component actually declares. TF_VAR_cluster_name
-// used to be injected into `network` as well, on the stated grounds that "network and cluster
-// must agree on it or Karpenter/ELB discovery breaks" — but components/aws/network declares no
+// Every entry must correspond to a variable that component actually declares.
+// TF_VAR_cluster_name does NOT go to `network`, however plausible "network and cluster must
+// agree on it or Karpenter/ELB discovery breaks" sounds: components/aws/network declares no
 // cluster_name variable at all, and its own comment says the cluster-ownership and
 // Karpenter-discovery tags are per-cluster and applied by the CLUSTER component via
 // aws_ec2_tag, precisely because the VPC is shared per environment and cluster-agnostic.
@@ -330,6 +328,22 @@ func tg(ctx context.Context, st *engine.State, verb, component string, extraEnv 
 	// terragrunt 1.0+ takes global flags (--working-dir, --non-interactive) before
 	// the command; -auto-approve is a tofu flag after it. The old post-command
 	// --terragrunt-working-dir is silently ignored by 1.0.x (runs in the cwd).
+	//
+	// A DESTROY may be retried; an APPLY may not, and the difference is convergence rather
+	// than mutation. `terragrunt destroy` re-reads state and reconciles toward empty, so a
+	// second attempt does not repeat a deletion the first completed — it looks again and
+	// removes what is left. `terragrunt apply` has no such guarantee: one that failed
+	// partway has already moved state, and re-running it on the operator's behalf is a
+	// second apply against that moved state.
+	//
+	// The asymmetry earns its place on the teardown path specifically. The alternative to
+	// retrying a throttle mid-destroy is a stopped teardown with the EKS control plane, the
+	// VPC and the NAT gateway still billing — the exact outcome the reverse walk exists to
+	// prevent. Only the named transient shapes in internal/exec retry; anything else, an
+	// AccessDenied or a DependencyViolation, fails on the first attempt and is reported.
+	if verb == "destroy" {
+		return st.Runner.Reconcile(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", verb, "-auto-approve")
+	}
 	return st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", verb, "-auto-approve")
 }
 
@@ -377,7 +391,7 @@ func (preflight) Run(ctx context.Context, st *engine.State) error {
 		"--service-code", "ec2", "--quota-code", "L-1216C47A"); err != nil {
 		return err
 	}
-	if st.Config.Quotas.AutoRequest {
+	if st.Config.Quotas.AutoRequestEnabled() {
 		// Only file an increase if we are actually below the target. Service Quotas
 		// rejects a request for a value at or below the current one:
 		//
@@ -417,10 +431,10 @@ type acquire struct{ base }
 //
 // Two things this must get right, and the naive version gets neither.
 //
-// `git clone` fails outright if the target exists, so a rerun of init used to die
-// before doing anything. Reruns are the NORMAL case: the engine's rollback destroys
-// cloud resources but deliberately does not delete the operator's repos or working
-// copies, so the second invocation always finds them.
+// `git clone` fails outright if the target exists, so a bare clone cannot survive a
+// rerun — and reruns are the NORMAL case: the engine's rollback destroys cloud resources
+// but deliberately does not delete the operator's repos or working copies, so the second
+// invocation always finds them.
 //
 // But merely REUSING what is there is worse than failing. These checkouts are the
 // infrastructure code — landing-zone is what terragrunt applies. A stale clone means a
@@ -449,12 +463,12 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir, ref string) 
 		if fresh {
 			return nil
 		}
-		// Removing a pin has to actually unpin. A previous pinned run left this
-		// checkout on a detached HEAD, and `git pull --ff-only` cannot fast-forward
-		// one — so dropping the entry from `versions` used to leave the repo sitting
-		// on the old commit forever, while the note blamed a divergence that had not
-		// happened. The config said latest, the disk said the old tag, and the
-		// diagnosis pointed somewhere else entirely.
+		// Removing a pin has to actually unpin. A previous pinned run leaves this
+		// checkout on a detached HEAD, and `git pull --ff-only` cannot fast-forward one —
+		// so dropping the entry from `versions` without reattaching leaves the repo on the
+		// old commit forever, while the note blames a divergence that has not happened.
+		// The config says latest, the disk says the old tag, and the diagnosis points
+		// somewhere else entirely.
 		if err := reattachHEAD(ctx, st, name); err != nil {
 			note(st, "%s: unpinned, but could not return to the default branch (%v) — this run "+
 				"will use the code as it stands on disk", name, err)
@@ -554,9 +568,8 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir, ref string) 
 // is no better: GitHub refuses to fork a repo into the account that owns it.
 //
 // Neither is fatal, which is exactly why it is worth naming. The run continues against a
-// catalog that is correct, having just told the operator it is diverged — and "the tool
-// says something alarming that turns out to mean nothing" is how a real divergence
-// warning stops being read.
+// catalog that is correct, having just told the operator it is diverged. An alarming
+// message that reliably means nothing is how a real divergence warning stops being read.
 func forkOrSync(ctx context.Context, st *engine.State, org string) error {
 	// A pinned catalog must not be fast-forwarded. `gh repo sync` moves the fork's main
 	// to upstream's, and the local checkout is then rewound to the pin — so the fork
@@ -665,8 +678,8 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 	// operator's egress IP when the allow-list is empty. Config validation has already
 	// rejected any contradictory network combination.
 	//
-	// This phase deliberately sets nothing on st.Runner.Env. It used to, and those variables
-	// then rode into every phase after it; see the comment on apply().
+	// This phase sets nothing on st.Runner.Env: a variable left there rides into every phase
+	// after it, and an ambient TF_VAR beats whatever a later leaf pinned. See apply().
 	note(st, "provisioning VPC then EKS control plane (network → cluster; strict ordering)")
 	for _, comp := range []string{"network", "cluster"} {
 		if err := apply(ctx, st, comp); err != nil {
@@ -693,16 +706,33 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 
 func (cluster) Teardown(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
+
+	// Every component is attempted, and the sweep runs whatever happened. Returning on the
+	// first failure is the defect substrate.Teardown, engine.teardown and `rackctl destroy`
+	// each name and avoid — and it lands hardest here, because `network` is LAST and holds
+	// the VPC, its NAT gateways and their EIPs.
+	//
+	// The shape it produces: `terragrunt destroy cluster` fails on a DependencyViolation —
+	// a lingering ENI, a security group still held — and the VPC behind it is never even
+	// attempted. The operator is billed for a NAT gateway attached to nothing, reported
+	// only as the cluster error that preceded it.
+	//
+	// The volume sweep runs after the attempt rather than after success for the same
+	// reason. A cluster that partly came down has orphaned volumes whether or not the
+	// component reported cleanly, and skipping the sweep on failure withholds it in exactly
+	// the case that produces the most orphans.
+	var failed []error
 	for _, comp := range []string{"cluster", "network"} { // reverse of apply
 		if err := destroy(ctx, st, comp); err != nil {
-			return err
+			failed = append(failed, fmt.Errorf("destroy %s: %w", comp, err))
 		}
 	}
-	// The cluster is gone, so nothing of its can still be attached. Anything still
-	// tagged for it is an orphan by definition — sweep it, or it bills forever.
+
+	// Anything still tagged for this cluster is an orphan — sweep it, or it bills forever.
 	reap.OrphanedVolumes(ctx, st.Runner, os.Stdout,
 		st.Config.ClusterName(), st.Config.Cloud.Region)
-	return nil
+
+	return errors.Join(failed...)
 }
 
 // substrateComponents is the AWS substrate the GitOps layer consumes: every landing-zone
@@ -770,15 +800,27 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 			"eks-gitops/docs/runbooks/observability-tier.md")
 	}
 
-	// druid is real money and opt-in. landing-zone now sets skip_final_snapshot /
-	// final_snapshot_identifier on Aurora and force_destroy on the per-tenant buckets
-	// (development always; elsewhere via force_destroy_buckets — the two-act contract
-	// target 11 wires). Development tears down cleanly; staging/production need that
-	// flag applied before destroy.
+	// The three severity topics exist and nothing routes to them, which is a gap an
+	// operator has to close deliberately rather than discover from a page that never
+	// arrived. observability-slo's fleet-alerting contract is per-cluster composite alarms
+	// notifying one SNS topic per severity; rackctl provisions the topics, and the routing
+	// that would deliver an alert into them is not expressible through any input rackctl
+	// holds. Saying so is the honest half of shipping the producer.
+	note(st, "observability: publishing the three severity SNS topics under "+
+		"/eks-agent-platform/%s/observability/alerts_{critical,warning,info}_topic_arn. "+
+		"NOTHING rackctl applies routes alerts into them — wire a Grafana contact point (or "+
+		"an alertmanager receiver) at those ARNs out of band, or the topics stay silent and "+
+		"a page that never arrives is indistinguishable from a healthy cluster",
+		st.Config.ClusterName())
+
+	// druid is real money and opt-in. landing-zone sets skip_final_snapshot /
+	// final_snapshot_identifier on Aurora and force_destroy on the per-tenant buckets —
+	// unconditionally in development, elsewhere behind force_destroy_buckets. Development
+	// therefore tears down cleanly; staging and production need that flag applied first.
 	if st.Config.Addons.Druid {
 		note(st, "addons.druid: true — applying the per-tenant analytics substrate (Aurora Serverless, "+
 			"optionally MSK). Development tears down cleanly; outside development a destroy needs "+
-			"force_destroy_buckets applied first (rackctl destroy --force-buckets once target 11 lands)")
+			"force_destroy_buckets applied first — pass `rackctl destroy --force-buckets`")
 	}
 
 	// Say exactly what model-import provisions, and — more importantly — what it does
@@ -1018,10 +1060,11 @@ var agentPlatformCRDs = []string{
 // on the ArgoCD cluster Secret. The chart carries its own crds/, so the CRDs come
 // with it.
 //
-// This phase used to `helm upgrade --install operator` on top of that — a SECOND,
-// competing Helm release of the same chart, racing ArgoCD for ownership of the same
-// Deployment, ClusterRoles and CRDs. It pulled oci://ghcr.io/nanohype/charts/operator,
-// which does not exist (the release workflow's chart-push-to-OCI step is skipped, and
+// This phase does NOT `helm upgrade --install operator` on top of that. Doing so would be
+// a SECOND, competing Helm release of the same chart, racing ArgoCD for ownership of the
+// same Deployment, ClusterRoles and CRDs — and it would pull
+// oci://ghcr.io/nanohype/charts/operator, which does not exist (the release workflow's
+// chart-push-to-OCI step is skipped, and
 // that path 403s), then silently fell back to a local clone — so the cluster ran an
 // operator installed from a working copy on the machine that happened to run rackctl,
 // while ArgoCD believed it owned one from git.
@@ -1054,10 +1097,10 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 	//
 	// This is a re-apply, and it is the only way the annotation can ever be stamped. The
 	// variable is opt-in upstream BECAUSE it depends on another component having run
-	// (cluster-bootstrap/variables.tf:182 — "Requires that component to have applied
+	// (cluster-bootstrap/variables.tf — "Requires that component to have applied
 	// first"), and rackctl runs cluster-bootstrap in the gitops phase, one phase before the
 	// agent-platform tree exists. Setting the flag there would fail the SSM read; leaving it
-	// unset means bootstrap.tf:397-400 never stamps
+	// unset means bootstrap.tf never stamps
 	// `eks-agent-platform/eval-reports-bucket` on the ArgoCD cluster Secret, the operator
 	// ApplicationSet renders evalReportsBucket empty, and every EvalSuite run completes with
 	// its reports going nowhere durable. Nothing errors — which is the whole problem.
@@ -1103,10 +1146,9 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 
 // Teardown destroys the agent-platform AWS substrate this phase applied.
 //
-// The operator itself is untouched, for the reason this used to be a no-op entirely: it is an
-// ArgoCD Application, so it goes when the cluster does. Uninstalling a Helm release rackctl
-// no longer creates would fail, and deleting it out from under ArgoCD would just make ArgoCD
-// put it back.
+// The operator itself is untouched: it is an ArgoCD Application, so it goes when the
+// cluster does. Uninstalling a Helm release rackctl does not create would fail, and
+// deleting it out from under ArgoCD would only make ArgoCD put it back.
 //
 // The terraform tree is different — rackctl applies it directly, so rackctl owns unwinding
 // it, and it has to happen HERE rather than later in the rollback. Reverse-phase order puts
@@ -1317,7 +1359,7 @@ func (portal) Run(ctx context.Context, st *engine.State) error {
 		sub.DBHost, sub.DBSecretARN)
 
 	args := []string{
-		"upgrade", "--install", "portal", portalChartRef(st),
+		"upgrade", "--install", "portal", portalChartRef(ctx, st),
 		"--namespace", ns, "--create-namespace",
 		"--set", "externalSecret.enabled=true",
 		"--set", "externalSecret.relationalSecretArn=" + sub.DBSecretARN,
@@ -1389,7 +1431,7 @@ var portalTenantValues = []string{"externalSecret", "tenantInfra"}
 // which portal this install is. Reaching past that for whatever GHCR published last
 // defeats the pin exactly the way an ApplicationSet pinning its own revision and letting
 // children track main does — a pinned install that quietly deploys something else.
-func portalChartRef(st *engine.State) string {
+func portalChartRef(ctx context.Context, st *engine.State) string {
 	const published = "oci://ghcr.io/nanohype/portal/charts/portal"
 
 	checkout := func(why string) string {
@@ -1408,7 +1450,7 @@ func portalChartRef(st *engine.State) string {
 				"a portal the pin does not name", ref))
 	}
 
-	out, err := st.Runner.Capture(context.Background(), "helm", "show", "values", published)
+	out, err := st.Runner.Capture(ctx, "helm", "show", "values", published)
 	if err != nil {
 		return checkout(fmt.Sprintf("%s is unreachable", published))
 	}
@@ -1475,9 +1517,9 @@ const tenantControlPlaneNamespace = "eks-agent-platform"
 // Two traps live in these three lines, and this phase fell into both.
 //
 // The chart's values are nested under `platform.` — platform.name, platform.tenant,
-// platform.persona. rackctl used to pass bare `tenant=` and `persona=`, and never passed
-// platform.name at all. Helm accepts unknown --set paths silently, so those became three
-// orphan values no template reads, and the render died on the chart's own
+// platform.persona. Passing bare `tenant=` and `persona=` — and no platform.name at all —
+// is the shape that fails: Helm accepts unknown --set paths silently, so those become three
+// orphan values no template reads, and the render dies on the chart's own
 // `fail "platform.name is required"` guard before a single object was created. Silence is
 // why it survived: --set on a path nothing reads produces no warning, and the phase is
 // opt-in, so an install that never enabled a firstTenant looked entirely healthy.

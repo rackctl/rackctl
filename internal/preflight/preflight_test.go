@@ -59,6 +59,13 @@ func TestRun_EveryCheckIsRegistered(t *testing.T) {
 	fakeBin(t, "aws", `exit 1`)
 	fakeBin(t, "gh", `exit 1`)
 	t.Setenv("GITHUB_TOKEN", "")
+	// git and HOME are shimmed too, because Run() executes every check — including
+	// CheckVendFreshness, which sets Runner.Dir from engine.RepoPaths($HOME/.rackctl/...)
+	// and shells out to git. Left real, this test reaches the operator's own checkouts and
+	// runs `git fetch --quiet origin` against the network: a unit test whose result depends
+	// on a machine's disk and an upstream being reachable.
+	t.Setenv("HOME", t.TempDir())
+	fakeBin(t, "git", `exit 1`)
 
 	var names []string
 	for _, r := range Run(context.Background(), testEnv()) {
@@ -101,7 +108,7 @@ func TestCheckGitHubToken_FailsWhenTheConfigNeedsATokenAndNoneExists(t *testing.
 }
 
 // `gh auth login` stores the credential in gh's keyring and exports nothing. rackctl
-// bridges it, so this is a healthy state rather than the failure it used to be.
+// bridges it, so this is a healthy state rather than a failure.
 func TestCheckGitHubToken_OKWhenGhHoldsOne(t *testing.T) {
 	fakeBin(t, "gh", `[ "$1 $2" = "auth token" ] && echo ghs_x; exit 0`)
 

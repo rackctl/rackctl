@@ -57,8 +57,9 @@ than it saves:
   nothing before it depended on the optional phase
 - **ArgoCD failing to install or converge** in phase 5 — the cloud is built and the cluster
   is the only surface the failure can be diagnosed on
-- a **refusal issued before anything ran**, such as `--force-buckets` against druid outside
-  development
+- a **refusal issued before anything was applied** — the acquire phase stating that a
+  component this config will apply has no live root in this environment, or the fleet phase
+  refusing to install a Crossplane provider whose account-id placeholder did not substitute
 
 Each prints why it stopped and leaves `rackctl destroy` as the explicit next step. A phase
 that returns `engine.NoRollbackError` is opting into this; anything else rolls back.
@@ -79,18 +80,32 @@ that returns `engine.NoRollbackError` is opting into this; anything else rolls b
 - **Teardown safety, in both directions** — a failed `--apply` destroys the completed phases in reverse (`terragrunt destroy` per component), so no stranded VPC/EKS. The harder half is knowing when *not* to: a rollback that runs when it should not is the more expensive bug. rackctl refuses to sweep a platform this run did not create, refuses to destroy an `eks-fleet` hub while it still has spokes (that orphans real clusters in other accounts), and treats an optional phase's failure or a phase-5 convergence failure as "leave it standing" rather than "demolish it".
 - **`--force-buckets` is two acts, and sometimes zero** — `force_destroy` has no effect until an apply has landed it in state, so injecting it only on the destroy path fails on `BucketNotEmpty`. The flag is applied first, then the teardown runs. druid is covered: the permitting apply clears its tenant Aurora's `deletion_protection` in the same act that lands `force_destroy`, so act 2 reaches the per-tenant deepstorage buckets and the DB cluster together. Without the flag that destroy deletes the deepstorage buckets (no versioning, no expiry, only copy) and *then* fails on `DeleteDBCluster` — segments gone, Aurora standing, sweep halted with the cluster, VPC and NAT gateways still billing.
 
+## Documentation
+
+- [`AGENTS.md`](AGENTS.md) — the agent-facing contract: how to drive rackctl, its exit-code
+  and JSON-report contracts, and how to add a phase, a config field or a gate
+- [`docs/runbook.md`](docs/runbook.md) — what to do when an install, check or teardown goes
+  wrong: whether the rollback ran, the failures that recur, and what rackctl deliberately
+  leaves behind
+- [`docs/exit-codes.md`](docs/exit-codes.md) — the nine exit statuses and the
+  `check --output json` shape
+- [`.env.example`](.env.example) — every environment variable rackctl reads
+- [`examples/rackctl.yaml`](examples/rackctl.yaml) — the full config surface, annotated
+
 ## Development
 
 ```sh
 make build     # -> ./rackctl (version stamped from git)
 make test      # go test -race ./...
+make cover     # the coverage floors, enforced
+make gates     # every gate proves it can still reject, then runs
 make vet fmt
 ```
 
 Layout:
 
 ```
-cmd/            root · init · preflight · doctor · upgrade · destroy · version
+cmd/            root · plan · apply · check · destroy · version
 internal/
   config/       rackctl.yaml schema + load/default/validate
   exec/         dry-run-aware tool runner (tofu/terragrunt/kubectl/helm/aws/gh)

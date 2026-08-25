@@ -1,9 +1,9 @@
 version: "2"
 
 # Lint runs in CI as a step of the `build` job — the one context protect-main requires — so it
-# gates merges rather than being a thing somebody remembers to run. That is deliberate: this
-# session alone turned up two symbols that compiled, passed every test, and did nothing, and a
-# check nobody runs would not have found either.
+# gates merges rather than being a thing somebody remembers to run. A dead symbol compiles and
+# passes every test by definition, so the suite cannot be the thing that finds it; only a
+# linter that runs on every merge can.
 
 linters:
   # The default set (errcheck, govet, ineffassign, staticcheck, unused) is the whole point here.

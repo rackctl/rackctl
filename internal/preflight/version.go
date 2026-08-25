@@ -36,7 +36,28 @@ func CheckVersionSkew(ctx context.Context, env *Env) doctor.Result {
 
 	have, err := env.aws(ctx, "eks", "describe-cluster",
 		"--name", clusterName(env.Cfg), "--query", "cluster.version")
-	if err != nil || have == "" || have == "None" {
+	// "I could not find out" is not "there is nothing there", and collapsing the two picks
+	// the answer that lets the run proceed. AccessDenied, a throttle, an expired token and
+	// a network fault all land in err, and all of them would report this gate as passed —
+	// the gate standing between an operator and an irreversible EKS upgrade.
+	//
+	// engine.PlatformExists makes the same distinction with a three-valued type and for the
+	// same reason; here the third answer is a warning, because an unreadable cluster is not
+	// itself a reason to refuse to install.
+	if err != nil {
+		// ResourceNotFoundException is EKS answering the question: the cluster is not
+		// there. Anything else — AccessDenied, a throttle, an expired token, a network
+		// fault — means the question went unanswered, and reporting that as "no live
+		// cluster" passes the gate standing between an operator and an irreversible
+		// upgrade.
+		if strings.Contains(err.Error(), "ResourceNotFoundException") {
+			return ok(name, "no live cluster — any supported version is a valid starting point")
+		}
+		return warn(name, "could not read the live cluster's version ("+err.Error()+
+			") — skew is UNCHECKED for this run, not confirmed absent. Fix the credentials or "+
+			"connectivity and re-run to restore the gate")
+	}
+	if have == "" || have == "None" {
 		return ok(name, "no live cluster — any supported version is a valid starting point")
 	}
 

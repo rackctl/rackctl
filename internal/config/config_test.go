@@ -352,7 +352,7 @@ func TestApplyDefaults_SystemNodesCompletesPerField(t *testing.T) {
 // never injected — so asking for exactly the shown list silently gets the component's list.
 func TestDefault_SystemNodeInstanceTypesMatchLandingZone(t *testing.T) {
 	got := Default().Cluster.SystemNodes.InstanceTypes
-	want := []string{"m7g.xlarge", "m6g.xlarge"} // components/aws/cluster/variables.tf:142
+	want := []string{"m7g.xlarge", "m6g.xlarge"} // components/aws/cluster/variables.tf
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v — see the comment on Default()", got, want)
 	}
@@ -407,11 +407,11 @@ func TestFleetHubRoleARN_ExplicitOverridesTheDerivedOne(t *testing.T) {
 	}
 }
 
-// eksFleet with no fleetHubRoleArn is now the NORMAL configuration, and must validate.
+// eksFleet with no fleetHubRoleArn is the NORMAL configuration and must validate.
 //
-// It used to be an error whose remedy was `terragrunt output -raw hub_role_arn` against a
-// root rackctl does not apply — against a tree whose cluster dependency has no state, so
-// the command could not run either.
+// Requiring one would send the operator to `terragrunt output -raw hub_role_arn` against a
+// root rackctl does not apply, in a tree whose cluster dependency has no state — a remedy
+// that cannot be followed.
 func TestValidate_EKSFleetDoesNotRequireAPastedHubRole(t *testing.T) {
 	c := Default()
 	c.Org.Name = "acme"

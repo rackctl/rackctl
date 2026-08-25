@@ -69,10 +69,10 @@ func callStartingWith(t *testing.T, calls []string, prefix string) string {
 }
 
 // charts/tenant nests its values under `platform.` and hard-fails the render on a missing
-// platform.name. rackctl used to pass bare `tenant=`/`persona=` and never passed
-// platform.name at all, so helm accepted three orphan values no template reads and the
-// render died before creating a single object. --set on an unread path is silent, which is
-// why it shipped — so the argv is pinned here, and a key rename upstream breaks a unit
+// platform.name. Passing bare `tenant=`/`persona=` and no platform.name leaves helm
+// accepting three orphan values no template reads, and the render dies before creating a
+// single object. --set on an unread path is silent, which is why such a mistake survives
+// review — so the argv is pinned here, and a key rename upstream breaks a unit
 // test in a second instead of a real bootstrap an hour in.
 func TestSmoke_HelmSetKeysMatchTheTenantChart(t *testing.T) {
 	st, calls := fakeTools(t)

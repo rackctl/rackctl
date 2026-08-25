@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -56,9 +57,35 @@ func TestVersionSkew_SameVersionIsFine(t *testing.T) {
 
 // A fresh install has no skew — any supported version is a valid starting point. Failing here
 // would block every first install, which is the majority case.
+//
+// The fixture is what EKS actually answers for an absent cluster, not a bare non-zero exit:
+// the two are different answers and this check now tells them apart.
 func TestVersionSkew_NoClusterIsNotAFailure(t *testing.T) {
-	fakeBin(t, "aws", `exit 1`)
+	fakeBin(t, "aws", `echo "An error occurred (ResourceNotFoundException) when calling the DescribeCluster operation: No cluster found" >&2; exit 254`)
 	if r := CheckVersionSkew(context.Background(), skewEnv(t, "1.36")); r.Status != doctor.OK {
 		t.Fatalf("no live cluster means nothing to compare against.\ngot %s: %s", r.Status, r.Detail)
+	}
+}
+
+// An unreadable cluster is NOT an absent one, and the difference is the whole gate.
+//
+// AccessDenied, a throttle and an expired token would each otherwise render as "no live
+// cluster — any supported version is a valid starting point", passing the one check standing
+// between an operator and an irreversible EKS upgrade. Unknown must say unknown.
+func TestVersionSkew_UnreadableClusterIsNotReportedAsAbsent(t *testing.T) {
+	for _, stderr := range []string{
+		"An error occurred (AccessDeniedException) when calling the DescribeCluster operation",
+		"An error occurred (ThrottlingException) when calling the DescribeCluster operation",
+		"ExpiredToken: The security token included in the request is expired",
+	} {
+		fakeBin(t, "aws", `echo `+strconv.Quote(stderr)+` >&2; exit 254`)
+		r := CheckVersionSkew(context.Background(), skewEnv(t, "1.36"))
+		if r.Status == doctor.OK {
+			t.Errorf("%q was reported as a clean pass — an unanswered question must not read "+
+				"as a healthy answer.\ngot: %s", stderr, r.Detail)
+		}
+		if !strings.Contains(r.Detail, "UNCHECKED") {
+			t.Errorf("the operator must be told the gate did not run.\ngot: %s", r.Detail)
+		}
 	}
 }

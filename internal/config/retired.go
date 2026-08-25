@@ -7,8 +7,8 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// A retired field is one rackctl used to honour and no longer does, usually because the thing it
-// switched on was deleted upstream.
+// A retired field is one rackctl does not honour, named here so a config still setting it is
+// refused rather than ignored. They are usually fields whose upstream feature is gone.
 //
 // Deleting the Go field is the whole fix in a strict decoder. It is not the whole fix here:
 // Load uses sigs.k8s.io/yaml, which routes through encoding/json and IGNORES keys with no
@@ -37,7 +37,7 @@ type retiredField struct {
 var retiredFields = []retiredField{
 	{
 		path: "addons.accelerators",
-		gone: "the GPU/accelerator stack was deleted upstream (ledger O27) — the addons-accelerators " +
+		gone: "the GPU/accelerator stack does not exist upstream — the addons-accelerators " +
 			"ApplicationSet in eks-gitops, the accelerator-pools component and its live roots in " +
 			"eks-agent-platform, and landing-zone's enable_accelerators variable and cluster label. " +
 			"Three layers of it were inert: the DRA chart named a release published by no registry, " +

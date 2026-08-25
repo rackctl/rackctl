@@ -132,9 +132,9 @@ type OrgGitOps struct {
 // This is the value cluster-bootstrap hands to the app-of-apps Application and
 // publishes on the ArgoCD cluster Secret, from which every ApplicationSet in the
 // catalog templates its own source. It must therefore point at the ORG'S FORK, not
-// at the upstream catalog: landing-zone's gitops_repo_url used to default to
-// nanohype/eks-gitops, and because nothing passed a value, every install silently
-// synced from upstream main while the org's fork sat unread.
+// at the upstream catalog. cluster-bootstrap's own default is the upstream repo, so an
+// installer that passes no value wires every install to upstream main while the org's fork
+// sits unread — silently, because the app-of-apps is healthy either way.
 //
 // Returns "" for an empty repo so callers can detect the unset case rather than
 // emit a URL like "https://.git".
@@ -407,9 +407,19 @@ type ClusterNet struct {
 }
 
 type Quotas struct {
-	AutoRequest bool `json:"autoRequest"` // file L-1216C47A (EC2 vCPU) etc. before provisioning
-	VCPU        int  `json:"vcpu"`
+	// AutoRequest files the quota increases a fresh account needs (L-1216C47A, EC2 vCPU)
+	// before provisioning. A pointer, not a bool, because it defaults to TRUE: with a
+	// plain bool an operator writing `autoRequest: false` is indistinguishable from one
+	// who omitted the key, and defaulting would put back the request they declined.
+	// Read it through AutoRequestEnabled.
+	AutoRequest *bool `json:"autoRequest,omitempty"`
+	VCPU        int   `json:"vcpu"`
 }
+
+// AutoRequestEnabled reports whether preflight may file quota increases. Unset means yes:
+// a fresh account caps at ~32 vCPU and an install that discovers that at provisioning time
+// has already paid for a VPC.
+func (q Quotas) AutoRequestEnabled() bool { return q.AutoRequest == nil || *q.AutoRequest }
 
 type Addons struct {
 	Druid bool `json:"druid"`
@@ -592,6 +602,13 @@ func (c *Config) FleetHubRoleARN() string {
 	return fmt.Sprintf("arn:aws:iam::%s:role/%s", c.Cloud.AccountID, fleetHubRoleName)
 }
 
+// FirstTenant is the tenant the smoke phase vends to prove the vending path works.
+//
+// Name and Tenant become Kubernetes object names and a Helm release name, so they carry
+// the same RFC-1123 constraint cluster.name does. Nothing downstream re-checks them: the
+// smoke phase is enabled purely on this struct being non-nil, and an empty Name reaches
+// `helm upgrade --install ""` — which fails opaquely at the end of a successful install,
+// on the one phase whose entire purpose is to prove the rest of it worked.
 type FirstTenant struct {
 	Name             string `json:"name"`
 	Persona          string `json:"persona"`
@@ -614,13 +631,13 @@ func Default() *Config {
 			EndpointPublicAccess: true,
 			// Matches landing-zone's system_node_instance_types default, for the same reason
 			// Version does. No leaf pins the variable, and a value equal to Default() is never
-			// injected — so the single-type list rackctl used to show was not merely wrong, it
-			// was UNREACHABLE: an operator who deliberately wanted Graviton3 only wrote exactly
-			// that, nothing was injected, and m6g nodes joined the group anyway.
+			// injected — so a single-type list here would not merely be wrong, it would be
+			// UNREACHABLE: an operator deliberately wanting Graviton3 only would write exactly
+			// that, nothing would be injected, and m6g nodes would join the group anyway.
 			SystemNodes: NodeGroup{InstanceTypes: []string{"m7g.xlarge", "m6g.xlarge"}, MinSize: 2, MaxSize: 6, DesiredSize: 2},
 			Network:     ClusterNet{VPCCIDR: defaultVPCCIDR, NATGateways: 1},
 		},
-		Quotas:        Quotas{AutoRequest: true, VCPU: 256},
+		Quotas:        Quotas{AutoRequest: boolPtr(true), VCPU: 256},
 		Observability: Observability{Tier: TierFull},
 		AgentPlatform: AgentPlatform{
 			Enable:               boolPtr(true),
@@ -681,8 +698,14 @@ func (c *Config) ApplyDefaults() {
 	if c.Observability.Tier == "" {
 		c.Observability.Tier = d.Observability.Tier
 	}
+	// Field by field, for the third time in this function and for the same reason:
+	// replacing the struct wholesale wipes a sibling the operator set deliberately.
+	// `quotas: {autoRequest: false}` with no vcpu is the natural way to say "do not file
+	// a quota increase on my behalf", and taking the whole default struct turned it back
+	// on — so preflight filed a real AWS request against an account whose operator had
+	// declined it.
 	if c.Quotas.VCPU == 0 {
-		c.Quotas = d.Quotas
+		c.Quotas.VCPU = d.Quotas.VCPU
 	}
 	if c.AgentPlatform.Enabled() && len(c.AgentPlatform.BedrockModelFamilies) == 0 {
 		c.AgentPlatform.BedrockModelFamilies = d.AgentPlatform.BedrockModelFamilies
@@ -885,6 +908,31 @@ func (c *Config) Validate() error {
 	}
 	if c.ControlPlane.Portal && c.Org.GitOps.TenantsRepo == "" {
 		errs = append(errs, "org.gitops.tenantsRepo is required when controlPlane.portal is true")
+	}
+	// firstTenant reaches helm and the API server unmodified, and the phase that consumes
+	// it is enabled on the block being PRESENT rather than on any field being set — so
+	// `firstTenant: {}` is a non-nil struct of empty strings that installs a release named
+	// "" at the very end of an otherwise successful provision.
+	if ft := c.FirstTenant; ft != nil {
+		if ft.Name == "" {
+			errs = append(errs, "firstTenant.name is required when the firstTenant block is present — "+
+				"it is the Platform CR's name and the Helm release name, and an empty one installs a "+
+				"release called \"\" on the phase that exists to prove the platform works")
+		} else if !rfc1123Label.MatchString(ft.Name) {
+			errs = append(errs, fmt.Sprintf("firstTenant.name %q must be a lowercase DNS label "+
+				"(a-z, 0-9, -; starting and ending alphanumeric) — it becomes a Kubernetes object name", ft.Name))
+		}
+		if ft.Tenant == "" {
+			errs = append(errs, "firstTenant.tenant is required when the firstTenant block is present — "+
+				"it names the owning team and becomes the CR-home namespace tenants-<team>")
+		} else if !rfc1123Label.MatchString(ft.Tenant) {
+			errs = append(errs, fmt.Sprintf("firstTenant.tenant %q must be a lowercase DNS label — "+
+				"it becomes the tenants-<team> namespace", ft.Tenant))
+		}
+		if ft.MonthlyBudgetUSD < 0 {
+			errs = append(errs, fmt.Sprintf("firstTenant.monthlyBudgetUsd %d cannot be negative — "+
+				"it becomes the BudgetPolicy's spend ceiling", ft.MonthlyBudgetUSD))
+		}
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("invalid config:\n  - %s", strings.Join(errs, "\n  - "))

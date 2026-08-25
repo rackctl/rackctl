@@ -13,7 +13,7 @@ import (
 // direction before — flag help that claimed a teardown worked where it did not — so the rule is
 // that behaviour and help change in the same commit, and this is what holds it.
 func TestDestroyHelp_DoesNotCarryTheRetiredDruidCarveOut(t *testing.T) {
-	for _, claim := range []string{"ledger O8", "NOT covered outside development", "clear deletion_protection out of band"} {
+	for _, claim := range []string{"NOT covered outside development", "clear deletion_protection out of band"} {
 		if strings.Contains(destroyCmd.Long, claim) {
 			t.Errorf("destroy long help still carries the retired druid carve-out: %q", claim)
 		}
@@ -45,7 +45,7 @@ func TestDestroyHelp_DisclosesTheBypassGovernanceRequirement(t *testing.T) {
 	}
 	for _, stale := range []string{"do not\nyet accept", "until that lands upstream"} {
 		if strings.Contains(destroyCmd.Long, stale) {
-			t.Errorf("destroy long help still describes the retired O5 gap: %q", stale)
+			t.Errorf("destroy long help still describes a bucket-teardown gap that no longer exists: %q", stale)
 		}
 	}
 }

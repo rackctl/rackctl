@@ -1,7 +1,14 @@
 // Package cmd wires the rackctl CLI.
 package cmd
 
-import "github.com/spf13/cobra"
+import (
+	"context"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/spf13/cobra"
+)
 
 var rootCmd = &cobra.Command{
 	Use:   "rackctl",
@@ -12,8 +19,31 @@ var rootCmd = &cobra.Command{
 	SilenceErrors: true,
 }
 
-// Execute runs the root command.
-func Execute() error { return rootCmd.Execute() }
+// Execute runs the root command under a context cancelled by SIGINT or SIGTERM.
+//
+// The signal context is what makes an interrupt survivable. Every subprocess rackctl
+// starts is an exec.CommandContext on a context descended from this one, so cancelling it
+// terminates the in-flight terragrunt, kubectl or helm rather than leaving it parented to
+// a dead shell. Without it the Go default disposition applies and the process dies at
+// once — mid-apply, with whatever the child created since its last state write untracked
+// by terraform and unreachable by a rollback that no longer has a process to run in.
+//
+// Commands reach it through cobra's cmd.Context(); none constructs its own root.
+// A second interrupt must still be able to end the process. While NotifyContext's
+// registration stands, further signals are absorbed rather than delivered, so an operator
+// who interrupts during a rollback — which runs detached from this cancellation, by
+// design — would otherwise have no way out short of another terminal. Unregistering as
+// soon as the context is cancelled restores the default disposition: the first interrupt
+// unwinds, the second kills.
+func Execute() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return rootCmd.ExecuteContext(ctx)
+}
 
 func init() {
 	rootCmd.AddCommand(planCmd, applyCmd, destroyCmd, checkCmd, versionCmd)
