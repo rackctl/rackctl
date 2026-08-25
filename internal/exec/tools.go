@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"strings"
@@ -32,7 +33,64 @@ const (
 	// has not answered in two minutes is wedged, not slow — kubectl calls in this repo
 	// already carry --request-timeout=30s for the same reason.
 	DefaultQueryTimeout = 2 * time.Minute
+
+	// DefaultReadAttempts is how many times a READ is tried before its error stands.
+	//
+	// Reads only, and the asymmetry is the whole design. A cloud API answering
+	// ThrottlingException or a resolver dropping one packet is the case retry exists for,
+	// and a list or describe is idempotent by construction — asking twice costs a request.
+	// A MUTATION is not: re-running a terragrunt apply that failed halfway is a second
+	// apply against state the first one already moved, and an installer that does that on
+	// the operator's behalf is worse than one that stops and says so. Run therefore never
+	// retries, and that is deliberate rather than unfinished.
+	//
+	// Three, because the failures worth retrying are transient in seconds — a throttle, a
+	// re-elected endpoint, a DNS blip. A read still failing on the third attempt is not
+	// slow, it is wrong, and more attempts only delay saying so.
+	DefaultReadAttempts = 3
+
+	// retryBase is the first backoff. It doubles per attempt and carries jitter, so a
+	// phase issuing many reads against one throttled API does not re-issue them in lockstep
+	// and reproduce the throttle it is backing off from.
+	retryBase = 500 * time.Millisecond
 )
+
+// retryable reports whether a failed read is worth trying again.
+//
+// Deliberately narrow. A retry loop that cannot tell a throttle from a permission error
+// turns a clear AccessDenied into the same error three attempts later, and turns a missing
+// resource into a slow missing resource — so this matches the transient shapes by name and
+// treats everything else as final. A timeout of our own is also not retryable: the ceiling
+// already expressed how long the caller was willing to wait.
+func retryable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	s := err.Error()
+	for _, transient := range []string{
+		"ThrottlingException", "Throttling", "TooManyRequestsException",
+		"RequestLimitExceeded", "SlowDown", "ServiceUnavailable",
+		"InternalError", "InternalFailure", "RequestTimeout",
+		"connection reset", "connection refused", "no such host",
+		"i/o timeout", "TLS handshake timeout", "unexpected EOF",
+		"etcdserver: request timed out", "the server is currently unable to handle the request",
+	} {
+		if strings.Contains(s, transient) {
+			return true
+		}
+	}
+	return false
+}
+
+// backoff is the delay before attempt n (1-based), doubling with jitter.
+//
+// The jitter is not cosmetic: a phase that issues a dozen reads against one throttled API
+// and backs them all off by the same interval re-issues them together and reproduces the
+// throttle. Full jitter over the doubled window is the standard fix.
+func backoff(n int) time.Duration {
+	window := retryBase << (n - 1)
+	return time.Duration(rand.Int64N(int64(window)) + int64(retryBase))
+}
 
 // Runner shells out to external tools.
 type Runner struct {
@@ -60,6 +118,9 @@ type Runner struct {
 	// QueryTimeout overrides DefaultQueryTimeout for Capture and Query. Zero takes
 	// the default.
 	QueryTimeout time.Duration
+	// ReadAttempts overrides DefaultReadAttempts. Zero takes the default; 1 disables
+	// retry, which is what a test asserting a single invocation wants.
+	ReadAttempts int
 }
 
 // New returns a Runner writing to out.
@@ -165,6 +226,10 @@ func (r *Runner) Capture(ctx context.Context, name string, args ...string) (stri
 	if r.DryRun {
 		return "", nil
 	}
+	return r.retryRead(ctx, name, func() (string, error) { return r.captureOnce(ctx, name, args...) })
+}
+
+func (r *Runner) captureOnce(ctx context.Context, name string, args ...string) (string, error) {
 	timeout := r.queryTimeout()
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -186,6 +251,32 @@ func (r *Runner) Capture(ctx context.Context, name string, args ...string) (stri
 		return "", fail(ctx, child, name, timeout, errb.String(), err)
 	}
 	return strings.TrimSpace(out.String()), nil
+}
+
+// readAttempts is how many times this Runner tries a read. Zero takes the default.
+func (r *Runner) readAttempts() int {
+	if r.ReadAttempts > 0 {
+		return r.ReadAttempts
+	}
+	return DefaultReadAttempts
+}
+
+// retryRead runs a read up to readAttempts times, backing off between transient failures.
+func (r *Runner) retryRead(ctx context.Context, name string, once func() (string, error)) (string, error) {
+	var out string
+	var err error
+	for attempt := 1; attempt <= r.readAttempts(); attempt++ {
+		out, err = once()
+		if err == nil || !retryable(err) || attempt == r.readAttempts() {
+			return out, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("%s: %w", name, ctx.Err())
+		case <-time.After(backoff(attempt)):
+		}
+	}
+	return out, err
 }
 
 // Query runs a READ-ONLY command and returns trimmed stdout, executing even in dry-run.
@@ -222,6 +313,10 @@ func (r *Runner) Capture(ctx context.Context, name string, args ...string) (stri
 // never ran. Not inheriting Dir means the enumeration works wherever it is called from, which
 // for a cloud API is the only correct behaviour.
 func (r *Runner) Query(ctx context.Context, name string, args ...string) (string, error) {
+	return r.retryRead(ctx, name, func() (string, error) { return r.queryOnce(ctx, name, args...) })
+}
+
+func (r *Runner) queryOnce(ctx context.Context, name string, args ...string) (string, error) {
 	timeout := r.queryTimeout()
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

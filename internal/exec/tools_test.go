@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -233,5 +235,113 @@ func TestEnvSource_FailureFailsTheCall(t *testing.T) {
 	}
 	if _, err := r.Query(context.Background(), "sh", "-c", "true"); err == nil {
 		t.Fatal("Query must fail too")
+	}
+}
+
+// A throttled read is retried; the retry is what stops a transient AWS response failing a
+// phase that would have succeeded a second later.
+func TestCapture_RetriesATransientFailure(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "n")
+	script := "#!/bin/sh\n" +
+		"n=$(cat " + counter + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " + counter + "\n" +
+		"if [ \"$n\" -lt 3 ]; then echo 'An error occurred (ThrottlingException)' >&2; exit 254; fi\n" +
+		"echo settled\n"
+	if err := os.WriteFile(filepath.Join(dir, "flaky"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	r := New(&bytes.Buffer{})
+	out, err := r.Capture(context.Background(), "flaky")
+	if err != nil {
+		t.Fatalf("a throttle that clears must not fail the read: %v", err)
+	}
+	if out != "settled" {
+		t.Fatalf("got %q, want %q", out, "settled")
+	}
+}
+
+// A permission error is NOT retried. A retry loop that cannot tell a throttle from an
+// AccessDenied turns a clear answer into the same answer three attempts later, and turns a
+// missing resource into a slow missing resource.
+func TestCapture_DoesNotRetryAFinalError(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "n")
+	script := "#!/bin/sh\n" +
+		"n=$(cat " + counter + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " + counter + "\n" +
+		"echo 'An error occurred (AccessDeniedException)' >&2; exit 254\n"
+	if err := os.WriteFile(filepath.Join(dir, "denied"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	r := New(&bytes.Buffer{})
+	if _, err := r.Capture(context.Background(), "denied"); err == nil {
+		t.Fatal("AccessDenied must fail the read")
+	}
+	n, _ := os.ReadFile(counter)
+	if strings.TrimSpace(string(n)) != "1" {
+		t.Errorf("a final error was attempted %s times — retrying it only delays the answer",
+			strings.TrimSpace(string(n)))
+	}
+}
+
+// A MUTATION is never retried, and the asymmetry is the design. Re-running a terragrunt
+// apply that failed halfway is a second apply against state the first one already moved,
+// and an installer that does that on the operator's behalf is worse than one that stops.
+func TestRun_NeverRetries(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "n")
+	script := "#!/bin/sh\n" +
+		"n=$(cat " + counter + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " + counter + "\n" +
+		"echo 'An error occurred (ThrottlingException)' >&2; exit 254\n"
+	if err := os.WriteFile(filepath.Join(dir, "mutate"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	r := New(&bytes.Buffer{})
+	if err := r.Run(context.Background(), "mutate"); err == nil {
+		t.Fatal("the mutation failed and must be reported as failed")
+	}
+	n, _ := os.ReadFile(counter)
+	if strings.TrimSpace(string(n)) != "1" {
+		t.Fatalf("a mutation was attempted %s times — re-applying on the operator's behalf is "+
+			"a second apply against state the first one already moved",
+			strings.TrimSpace(string(n)))
+	}
+}
+
+// Backoff carries jitter. Without it a phase issuing many reads against one throttled API
+// backs them all off by the same interval, re-issues them together, and reproduces the
+// throttle it is backing off from.
+func TestBackoff_IsJitteredAndGrows(t *testing.T) {
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 40; i++ {
+		seen[backoff(1)] = true
+	}
+	if len(seen) < 5 {
+		t.Errorf("backoff(1) produced %d distinct delays over 40 draws — a fixed delay "+
+			"re-issues a throttled batch in lockstep", len(seen))
+	}
+	for i := 0; i < 20; i++ {
+		if backoff(3) < retryBase {
+			t.Fatal("backoff must never fall below the base")
+		}
+	}
+}
+
+// An interrupt during a backoff must end the read, not sleep through it.
+func TestRetryRead_CancellationBeatsTheBackoff(t *testing.T) {
+	r := New(&bytes.Buffer{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := r.retryRead(ctx, "aws", func() (string, error) {
+		return "", errors.New("ThrottlingException")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled context must end the retry loop, got %v", err)
 	}
 }
