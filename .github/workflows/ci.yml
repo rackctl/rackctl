@@ -61,6 +61,27 @@ jobs:
       # Nothing a gate prints about itself is consulted: a four-line script that echoed
       # "control: … rejected" and exited 0 passed the previous version of this step with
       # zero checks behind it.
+      # SHELLCHECK PARSES; DASH RUNS. Both, because they answer different questions and the
+      # first cannot answer the second: a static parser does not know which interpreter an
+      # operator has. `curl -fsSL rackctl.sh/install | sh` runs scripts/install.sh under
+      # whatever /bin/sh is on that machine, which on Debian is dash and on macOS is bash in
+      # POSIX mode — and bash-in-POSIX-mode ACCEPTS bash-isms, so a developer's local run
+      # cannot surface one.
+      #
+      # --severity=warning because the bash-ism diagnostics (SC3044 and friends) are
+      # warnings, and a gate that only fails on errors would pass every one of them.
+      - name: shellcheck
+        run: shellcheck -s sh --severity=warning scripts/*.sh
+      # The runtime half. install.sh fetches and installs, so it is parsed rather than run;
+      # coverage.sh's controls are self-contained and are executed under a real POSIX shell.
+      - name: posix shell
+        run: |
+          # /bin/sh on ubuntu-latest IS dash. Asserted rather than assumed: if the runner
+          # image ever ships bash as /bin/sh, this step would silently become a bash run and
+          # stop testing what it exists to test.
+          readlink -f /bin/sh | grep -q dash
+          /bin/sh -n ./scripts/install.sh
+          /bin/sh ./scripts/coverage.sh --controls-only
       - name: gate floor
         run: python3 ./scripts/floor.py
       # Every version the repo pins is matched by a Renovate manager. Asserted rather than
