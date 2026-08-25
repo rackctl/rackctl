@@ -212,8 +212,12 @@ def pins_fixtures(d):
            "actions/checkout@v4"
 
 
+# One violation per fixture, and the good one has to be genuinely clean — including of the
+# vacuity a gate is entitled to refuse. prose.py rejects a tree in which it scanned nothing
+# but gate scripts, so this fixture is repo content: a file at the fixture root, not under
+# scripts/.
 PROSE_GOOD = """\
-// Package x does a thing.
+// Package x does a thing, and `x.go` is where it does it.
 //
 // A value must fail rather than silently resolve: a fallback here would be reachable
 // exactly when the guarantee is absent.
@@ -302,9 +306,14 @@ def main():
         f for f in os.listdir(SCRIPTS)
         if (f.endswith(".sh") or f.endswith(".py")) and f not in NOT_A_GATE
     )
-    if not discovered:
-        print("floor: no gates discovered — a walk that matches nothing reports success "
-              "over zero checks", file=sys.stderr)
+    # A floor, not a non-empty check. One gate discovered where there were four is the same
+    # silent pass as none, and it is the likelier accident: a rename, an extension change, an
+    # exemption added too broadly. Sized under the real count so normal growth needs no edit.
+    MIN_GATES = 2
+    if len(discovered) < MIN_GATES:
+        print(f"floor: {len(discovered)} gate(s) discovered, floor {MIN_GATES} — a walk that "
+              "matches nothing, or almost nothing, reports success over zero checks",
+              file=sys.stderr)
         sys.exit(1)
 
     for name, why in NOT_A_GATE.items():
@@ -384,6 +393,11 @@ def main():
                           file=sys.stderr)
                     status = 1
                     break
+    MIN_WORKFLOWS = 2
+    if wfs and len(wfs) < MIN_WORKFLOWS:
+        print(f"floor: {len(wfs)} workflow(s) scanned, floor {MIN_WORKFLOWS} — too few to be "
+              "the set this repository ships; the walk stopped reaching them", file=sys.stderr)
+        status = 1
     if wfs and status == 0:
         print(f"floor: {len(wfs)} workflow(s) scanned, no step soft-fails")
 

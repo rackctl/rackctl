@@ -149,6 +149,32 @@ jobs:
           # `declare -A` and case-modification expansion. Only executing rejects them.
           /bin/sh ./scripts/install_test.sh
           /bin/sh ./scripts/coverage.sh --controls-only
+      - name: release config
+        # The release path was config-read-only: nothing ever ran goreleaser, so a config
+        # that had stopped producing binaries would surface at tag time.
+        #
+        # `check` is not run bare, because it exits 2 on a deprecation this repo takes
+        # deliberately — `brews` over `homebrew_casks`, since casks are macOS-only and this
+        # binary ships for Linux too. A gate permanently red for a decision already made
+        # teaches people to bypass it. So the DEPRECATED set is compared against the one
+        # entry that is expected: a NEW deprecation fails, and `brews` being REMOVED
+        # upstream fails too, which is exactly the trigger .goreleaser.yaml says to revisit
+        # this on.
+        run: |
+          go install github.com/goreleaser/goreleaser/v2@v2.18.0
+          goreleaser build --snapshot --clean --single-target
+          # In an `if` condition, so a non-zero status does not end the step under `set -e`
+          # and does not need a soft-fail idiom to survive. The status is not the verdict
+          # here — the set of deprecations is.
+          if goreleaser check > check.out 2>&1; then
+            echo "goreleaser check exited 0; the deprecation set below decides this step"
+          fi
+          got=$(grep -oE 'DEPRECATED:[[:space:]]+[a-z_]+' check.out | awk '{print $2}' | sort -u | tr '\n' ' ')
+          if [ "$got" != "brews " ]; then
+            echo "goreleaser check reported deprecations [$got], expected [brews ]" >&2
+            cat check.out >&2
+            exit 1
+          fi
       - name: gate floor
         run: python3 ./scripts/floor.py
       # Every version the repo pins is matched by a Renovate manager. Asserted rather than
