@@ -229,4 +229,15 @@ self_test || exit 1
 [ "${1:-}" = "--controls-only" ] && exit 0
 
 go test -coverprofile="$PROFILE" -covermode=set ./... >/dev/null
-go tool cover -func="$PROFILE" | check_report
+
+# Not piped into check_report. A pipeline's status is its LAST element, so a failing
+# `go tool cover` would hand check_report an empty report and vanish. Read directly rather
+# than through `set -o pipefail`, which is a late addition to POSIX and to dash: the status
+# of the command that matters should not depend on which /bin/sh is running the script.
+REPORT="${TMPDIR:-/tmp}/rackctl-cover-func.$$"
+trap 'rm -f "$REPORT"' EXIT
+if ! go tool cover -func="$PROFILE" > "$REPORT"; then
+  echo "coverage: go tool cover could not read $PROFILE — no verdict was reached" >&2
+  exit 2
+fi
+check_report < "$REPORT"

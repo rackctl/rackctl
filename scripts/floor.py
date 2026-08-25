@@ -94,7 +94,23 @@ CRASH_MARKERS = (
 )
 
 
-def crashed(out):
+# Statuses that mean the shell could not RUN the gate, so no verdict was reached. A floor
+# reading "non-zero means it rejected" scores these as catches, and a gate whose tool went
+# missing then reports as the strictest gate in the suite.
+NOT_A_VERDICT = {126: "found but not executable", 127: "not found"}
+
+
+def crashed(out, rc=None):
+    """Did the gate fail to reach a verdict, rather than reach one?
+
+    Two rules, because either alone is escapable. The text rule catches a gate that died
+    mid-run and said so. The NUMBER catches the case the text rule cannot see at all: a gate
+    that exits 127 having written nothing, because it discarded its diagnostics or its tool
+    produced none. There is no string to match, and the status is indistinguishable from a
+    rejection except by its value.
+    """
+    if rc in NOT_A_VERDICT:
+        return True
     return any(m in out for m in CRASH_MARKERS)
 
 
@@ -245,10 +261,10 @@ def self_check(d):
     rc_good, out_good = run(["python3", crasher], None, {"REPO_ROOT": good})
     rc_bad, out_bad = run(["python3", crasher], None, {"REPO_ROOT": bad})
 
-    if crashed(out_good) or rc_good != 0:
+    if crashed(out_good, rc_good) or rc_good != 0:
         print("floor: the crash control does not pass its own good fixture", file=sys.stderr)
         return 1
-    if not crashed(out_bad):
+    if not crashed(out_bad, rc_bad):
         print("floor: the crash control crashed and this floor did not notice — the crash "
               "rule has stopped firing", file=sys.stderr)
         return 1
@@ -256,7 +272,23 @@ def self_check(d):
         print("floor: the crash control no longer defeats the status and marker rules, so "
               "it is not testing what it was built to test", file=sys.stderr)
         return 1
-    print("floor: crash rule fires on a gate built to defeat the status and marker rules")
+    # The second shape: 127 with NO output. The text rule cannot see it — there is no text.
+    rc_q, out_q = run(["python3", crasher], None,
+                      {"REPO_ROOT": bad, "CRASHER_MODE": "silent127"})
+    if out_q.strip():
+        print("floor: the silent-127 control printed something, so it is no longer testing "
+              "the case a text rule cannot see", file=sys.stderr)
+        return 1
+    if rc_q not in NOT_A_VERDICT:
+        print(f"floor: the silent-127 control exited {rc_q}, not 127 — it is not testing "
+              "what it was built to test", file=sys.stderr)
+        return 1
+    if not crashed(out_q, rc_q):
+        print("floor: a gate that exited 127 having written nothing was scored as a "
+              "rejection — the number rule has stopped firing", file=sys.stderr)
+        return 1
+    print("floor: crash rule fires on a gate built to defeat the status and marker rules, "
+          "and on one that exits 127 in silence")
     return 0
 
 
@@ -292,7 +324,7 @@ def main():
         (good_cmd, good_cwd, good_env), (bad_cmd, bad_cwd, bad_env), marker = FIXTURES[name](d)
 
         rc, good_out = run(good_cmd, good_cwd, good_env)
-        if crashed(good_out):
+        if crashed(good_out, rc):
             print(f"floor: {name} CRASHED on a known-good input — a gate that cannot run is "
                   "not a gate that passes", file=sys.stderr)
             status = 1
@@ -304,11 +336,12 @@ def main():
             continue
 
         rc, out = run(bad_cmd, bad_cwd, bad_env)
-        if crashed(out):
+        if crashed(out, rc):
             print(f"floor: {name} CRASHED on the known-bad input rather than rejecting it. A "
                   "crash exits non-zero and can even name the planted violation in its "
                   "exception, so it satisfies both the status and the marker check while "
-                  "performing no check at all.", file=sys.stderr)
+                  "performing no check at all. A status of 126 or 127 counts here too: the "
+                  "shell could not run the gate, and no verdict was reached.", file=sys.stderr)
             status = 1
             continue
         if rc == 0:
