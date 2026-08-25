@@ -142,11 +142,20 @@ def load_managers(path):
         if unknown:
             die(f"{path}: the customManager for {name} carries {sorted(unknown)}, which "
                 "Renovate does not recognise — most likely a misspelled key")
-        managers.append(Manager(
-            m.get("depNameTemplate", "?"),
-            [renovate_re(p) for p in pats],
-            [to_python_re(s) for s in strings],
-        ))
+        # An expression this cannot read is an ABSENT authority, not a permissive one. The
+        # translation raises where it fails, and the raise names a regex position rather than
+        # the manager it came from — so it is caught and re-stated. Refusing is the only safe
+        # answer: a manager whose rule cannot be applied vouches for nothing, and treating it
+        # as matching nothing would quietly widen the set of pins reported as unwatched while
+        # treating it as matching everything would hide them.
+        try:
+            file_res = [renovate_re(p) for p in pats]
+            match_res = [to_python_re(t) for t in strings]
+        except re.error as e:
+            die(f"{path}: the customManager for {name} carries an expression this cannot "
+                f"read ({e}). Renovate may still accept it, so the two would disagree about "
+                "which pins are watched, and this gate would be the one that is wrong.")
+        managers.append(Manager(m.get("depNameTemplate", "?"), file_res, match_res))
     return cfg, managers
 
 
