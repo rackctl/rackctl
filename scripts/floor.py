@@ -40,7 +40,15 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gatelib import blank_comment_body  # noqa: E402
+try:
+    from gatelib import blank_comment_body  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - a precondition, not a branch under test
+    # Named rather than raised. A ModuleNotFoundError exits non-zero and so never passes
+    # silently, but it reports a Python identifier where the fact is that this gate was
+    # separated from the helper it shares with the others.
+    print("floor: scripts/gatelib.py is not importable from beside this file; the "
+          "shared comment stripper is missing and no verdict was reached", file=sys.stderr)
+    sys.exit(2)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO, "scripts")
@@ -98,6 +106,27 @@ CRASH_MARKERS = (
 # reading "non-zero means it rejected" scores these as catches, and a gate whose tool went
 # missing then reports as the strictest gate in the suite.
 NOT_A_VERDICT = {126: "found but not executable", 127: "not found"}
+
+
+def unparseable(text):
+    """Why this text is not a workflow, or None.
+
+    Structural rather than a full parse: a YAML library is not a dependency this floor is
+    entitled to, and the question here is narrower than validity. A workflow declares its
+    triggers and its jobs at the left margin, and every line either is blank, is a comment,
+    or is indented under one of them. Garbage fails all three.
+    """
+    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    if not lines:
+        return "no content"
+    for key in ("on:", "jobs:"):
+        if not any(l.startswith(key) or l.startswith(key[:-1] + " ") for l in lines):
+            return f"no top-level {key!r}"
+    top = [l for l in lines if not l[0].isspace()]
+    for l in top:
+        if not re.match(r"^[A-Za-z_][\w-]*\s*:", l):
+            return f"top-level line is not a mapping key: {l.strip()[:40]!r}"
+    return None
 
 
 def crashed(out, rc=None):
@@ -212,8 +241,12 @@ def pins_fixtures(d):
            "actions/checkout@v4"
 
 
+# One violation per fixture, and the good one has to be genuinely clean — including of the
+# vacuity a gate is entitled to refuse. prose.py rejects a tree in which it scanned nothing
+# but gate scripts, so this fixture is repo content: a file at the fixture root, not under
+# scripts/.
 PROSE_GOOD = """\
-// Package x does a thing.
+// Package x does a thing, and `x.go` is where it does it.
 //
 // A value must fail rather than silently resolve: a fallback here would be reachable
 // exactly when the guarantee is absent.
@@ -298,13 +331,27 @@ def main():
     status |= self_check(d)
 
     # ── every gate is discovered, and every one must have a fixture pair ─────
+    # Asserted, not assumed. os.listdir on an absent directory raises FileNotFoundError,
+    # which exits non-zero and so never passes silently — but it names a Python identifier
+    # and a path, leaving the reader to work out that this floor was pointed somewhere with
+    # no gates in it. Exit 2 says which precondition failed.
+    if not os.path.isdir(SCRIPTS):
+        print(f"floor: {SCRIPTS} is not a directory — this floor has no gates to probe and "
+              "reached no verdict about any", file=sys.stderr)
+        sys.exit(2)
+
     discovered = sorted(
         f for f in os.listdir(SCRIPTS)
         if (f.endswith(".sh") or f.endswith(".py")) and f not in NOT_A_GATE
     )
-    if not discovered:
-        print("floor: no gates discovered — a walk that matches nothing reports success "
-              "over zero checks", file=sys.stderr)
+    # A floor, not a non-empty check. One gate discovered where there were four is the same
+    # silent pass as none, and it is the likelier accident: a rename, an extension change, an
+    # exemption added too broadly. Sized under the real count so normal growth needs no edit.
+    MIN_GATES = 2
+    if len(discovered) < MIN_GATES:
+        print(f"floor: {len(discovered)} gate(s) discovered, floor {MIN_GATES} — a walk that "
+              "matches nothing, or almost nothing, reports success over zero checks",
+              file=sys.stderr)
         sys.exit(1)
 
     for name, why in NOT_A_GATE.items():
@@ -313,6 +360,7 @@ def main():
                   "exist — an exemption cannot outlive what it excused", file=sys.stderr)
             status = 1
 
+    proven = 0
     for name in discovered:
         if name not in FIXTURES:
             print(f"floor: {name} has no known-good/known-bad fixture pair here. A gate is "
@@ -358,8 +406,23 @@ def main():
                   "violation that was planted", file=sys.stderr)
             status = 1
             continue
+        proven += 1
         print(f"floor: {name} accepted a known-good input and rejected a known-bad one, "
               f"naming {marker!r}")
+
+    # Counted at the END of the loop body, after rejection and name-the-mutation have both
+    # been checked, so this is cases PROVEN rather than gates SEEN. Those are different
+    # quantities: every path out of that loop that skips the proof sets status, but a summary
+    # counting gates would read the same whether every proof completed or none did. The floor
+    # is under the real number for the same reason every other floor here is.
+    MIN_PROVEN = 2
+    if proven < MIN_PROVEN:
+        print(f"floor: {proven} gate(s) completed a proof, floor {MIN_PROVEN}. The rest left "
+              "the loop without proving or failing anything, so this run licenses nothing.",
+              file=sys.stderr)
+        status = 1
+    elif status == 0:
+        print(f"floor: {proven} gate(s) proved they reject, each naming what it caught")
 
     # ── no workflow step may fail without failing the job ───────────────────
     #
@@ -371,8 +434,21 @@ def main():
     if not wfs:
         print(f"floor: no workflows under {wf_dir} — nothing was scanned", file=sys.stderr)
         status = 1
+    # A file this cannot READ must not be reported as one it CHECKED. Scanning line by line
+    # for soft-fail strings finds none in a broken file and reports it clean — while GitHub,
+    # which does parse it, would not run the workflow at all. Removing a workflow and
+    # MALFORMING one are different failures and only the first is obvious.
     for wf in wfs:
-        for n, raw in enumerate(open(os.path.join(wf_dir, wf)), 1):
+        path = os.path.join(wf_dir, wf)
+        text = open(path).read()
+        why = unparseable(text)
+        if why:
+            print(f"floor: {wf} is not a workflow this can read ({why}). Scanning it for "
+                  "soft-fail steps would report a file GitHub cannot run as one with no "
+                  "problems.", file=sys.stderr)
+            status = 1
+            continue
+        for n, raw in enumerate(text.splitlines(), 1):
             # Comment bodies blanked through the SHARED stripper: a commented-out
             # continue-on-error is not an active setting, and this check is looking for a
             # live one. Quote-aware, so a `|| true` inside a quoted string is not read as
@@ -384,6 +460,11 @@ def main():
                           file=sys.stderr)
                     status = 1
                     break
+    MIN_WORKFLOWS = 2
+    if wfs and len(wfs) < MIN_WORKFLOWS:
+        print(f"floor: {len(wfs)} workflow(s) scanned, floor {MIN_WORKFLOWS} — too few to be "
+              "the set this repository ships; the walk stopped reaching them", file=sys.stderr)
+        status = 1
     if wfs and status == 0:
         print(f"floor: {len(wfs)} workflow(s) scanned, no step soft-fails")
 

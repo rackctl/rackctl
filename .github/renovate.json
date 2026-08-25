@@ -102,6 +102,43 @@
       "depNameTemplate": "kubernetes",
       "datasourceTemplate": "endoflife-date",
       "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "terragrunt, installed in CI so the argv contract test reaches the real tool. An env: value in a workflow, which no native manager reads.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "TERRAGRUNT_VERSION:\\s*(?<currentValue>v[\\d.]+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "gruntwork-io/terragrunt"
+    },
+    {
+      "customType": "regex",
+      "description": "OpenTofu, the engine terragrunt drives. Pinned without the leading v because the release asset names embed the bare version.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "TOFU_VERSION:\\s*(?<currentValue>[\\d.]+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "opentofu/opentofu",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "goreleaser, installed in CI so the release config is built rather than only read. An env: value in a workflow, which no native manager reads.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "GORELEASER_VERSION:\\s*(?<currentValue>v[\\d.]+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "goreleaser/goreleaser"
     }
   ]
 }

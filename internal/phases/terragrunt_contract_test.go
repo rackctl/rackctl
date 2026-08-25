@@ -22,12 +22,20 @@ import (
 // worse than a rejection, because terragrunt then runs in the CURRENT directory against
 // whatever tree happens to be there.
 //
-// Skips when terragrunt is absent rather than failing: it is not a build dependency, and a
-// contract test that cannot reach its counterparty has nothing to say.
+// Skipping is allowed on a developer machine and FORBIDDEN where this gates. CI installs
+// terragrunt and sets RACKCTL_REQUIRE_TOOL_CONTRACTS, which turns the skip into a failure —
+// otherwise the one test that reaches the real tool would print a skip into a green job, and
+// nobody reads a green job. A contract test that never runs where it gates asserts nothing.
 func terragruntOrSkip(t *testing.T) string {
 	t.Helper()
 	bin, err := exec.LookPath("terragrunt")
 	if err != nil {
+		if os.Getenv("RACKCTL_REQUIRE_TOOL_CONTRACTS") != "" {
+			t.Fatal("terragrunt is not installed, and RACKCTL_REQUIRE_TOOL_CONTRACTS is set. " +
+				"This test asserts the real tool's flag contract; skipping it here would " +
+				"leave every terragrunt assertion in this repo checking only that rackctl " +
+				"agrees with itself.")
+		}
 		t.Skip("terragrunt is not installed; this test asserts the real tool's flag contract")
 	}
 	return bin
@@ -99,6 +107,12 @@ func TestTerragruntContract_TheOldWorkingDirFlagDoesNotSelectTheDirectory(t *tes
 	// It looked for a terragrunt.hcl in the CWD rather than in dir, which is the whole
 	// point: the old flag is not honoured, so the command silently acts on the wrong tree.
 	if !strings.Contains(string(out), elsewhere) {
+		// Not a skip where this gates: a version that stopped reporting the path is a
+		// version whose behaviour is unknown, and unknown must not read as green.
+		if os.Getenv("RACKCTL_REQUIRE_TOOL_CONTRACTS") != "" {
+			t.Fatalf("terragrunt did not report a path under the working directory, so the "+
+				"claim in tg() cannot be checked against this version:\n%s", out)
+		}
 		t.Skipf("terragrunt did not report a path under the working directory, so this "+
 			"version may honour the old flag — rackctl's ordering comment needs re-checking "+
 			"against it:\n%s", out)
