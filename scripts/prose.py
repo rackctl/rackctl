@@ -30,6 +30,12 @@ import tokenize
 
 REPO = os.environ.get("REPO_ROOT", ".")
 
+# Repo-hygiene checks — a dead exemption, a manager matching nothing — are findings about
+# THIS tree, not about whether the gate can reject. They run only against the default root.
+# A fixture built to exercise one rule carries neither, so asserting them there would make
+# every fixture fail and prove nothing about the gate.
+SCANNING_THE_REPO = "REPO_ROOT" not in os.environ
+
 SKIP_DIRS = {".git", "vendor", "node_modules", "dist", "bin"}
 PROSE_SUFFIXES = (".go", ".md", ".yml", ".yaml", ".sh", ".py")
 
@@ -275,6 +281,7 @@ def check(root, assert_exemptions=False):
                 for r, _ in EXEMPT:
                     if r.search(rel):
                         exempt_hits[r.pattern] += 1
+        # Repo hygiene, not gate behaviour — see the note in scripts/pins.py.
         for r, why in NOT_A_REPO_PATH:
             if path_exempt[r.pattern] == 0:
                 findings.append(("", 0, "dead-exemption", r.pattern,
@@ -397,7 +404,7 @@ def main():
     if "--controls-only" in sys.argv:
         return
 
-    scanned, findings, examined = check(REPO, assert_exemptions=True)
+    scanned, findings, examined = check(REPO, assert_exemptions=SCANNING_THE_REPO)
     if findings:
         print(f"prose: {len(findings)} violation(s) of the enforceable subset of "
               f"documentation-voice:", file=sys.stderr)

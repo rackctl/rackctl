@@ -57,13 +57,26 @@ jobs:
       # A check that cannot fail is worse than no check, because it reports success — and
       # both halves rot independently: a self-test nothing invokes, and a CI step that
       # never runs one. This step is the second half.
-      - name: gate self-tests
-        run: ./scripts/gates.sh
+      # The floor SUPPLIES a known-bad input to each gate and observes the exit status.
+      # Nothing a gate prints about itself is consulted: a four-line script that echoed
+      # "control: … rejected" and exited 0 passed the previous version of this step with
+      # zero checks behind it.
+      - name: gate floor
+        run: python3 ./scripts/floor.py
       # Every version the repo pins is matched by a Renovate manager. Asserted rather than
       # described: a comment claiming full coverage goes stale silently at the first edit
       # that adds a pin, while this fails the build.
       - name: renovate pin coverage
         run: python3 ./scripts/pins.py
+      # The config that watching depends on had never been validated. It is a fact about
+      # the commit — a malformed manager watches nothing and says nothing, so pins.py would
+      # report a pin covered by a rule Renovate silently discards.
+      #
+      # Its coverage is partial, and stating that is the point: it rejects an unknown
+      # configuration KEY, verified by planting one, but accepted a datasourceTemplate
+      # naming a datasource that does not exist. Schema validity, not semantic validity.
+      - name: renovate config
+        run: npx --yes --package renovate -- renovate-config-validator .github/renovate.json
       # The enforceable subset of documentation-voice: verification tallies, internal
       # issue/PR/ledger references, prose addressed to an agent, and unowned markers.
       # The rest of that standard is review — a gate claiming coverage it does not have is

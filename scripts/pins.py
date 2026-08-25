@@ -35,6 +35,12 @@ import tempfile
 
 REPO = os.environ.get("REPO_ROOT", ".")
 
+# Repo-hygiene checks — a dead exemption, a manager matching nothing — are findings about
+# THIS tree, not about whether the gate can reject. They run only against the default root.
+# A fixture built to exercise one rule carries neither, so asserting them there would make
+# every fixture fail and prove nothing about the gate.
+SCANNING_THE_REPO = "REPO_ROOT" not in os.environ
+
 # Version-shaped tokens that are NOT dependency pins. Each entry is asserted, not
 # described: if it stops matching anything, this gate fails, so an exemption cannot outlive
 # the thing it exempted.
@@ -250,11 +256,17 @@ def check(root, renovate_path, assert_exemptions=False):
             problems.append(f"{path}:{n}: no customManager in {renovate_path} matches this pin:\n"
                             f"      {raw.strip()}")
 
+    # Always. A manager matching nothing is a statement about whatever tree is being
+    # scanned, which for a control fixture is that fixture — gating it on the real repo
+    # would disable the control that proves this check works.
     for m in managers:
         if m.hits == 0:
             problems.append(f"{renovate_path}: the customManager for {m.dep} matches nothing in the tree — "
                             "a manager watching a pin that no longer exists is coverage on paper only")
 
+    # Repo hygiene, not gate behaviour: a fixture built to exercise one rule carries none
+    # of the shapes these exempt, so asserting them there would fail every fixture and
+    # prove nothing about the gate.
     for pat, why in NOT_A_PIN if assert_exemptions else []:
         if exempt_hits[pat] == 0:
             problems.append(f"the NOT_A_PIN exemption {pat!r} ({why}) matches nothing — "
@@ -418,7 +430,7 @@ def main():
         return
 
     counts, problems, managers = check(REPO, os.path.join(REPO, ".github", "renovate.json"),
-                                       assert_exemptions=True)
+                                       assert_exemptions=SCANNING_THE_REPO)
     if problems:
         print("pins: unwatched or unverifiable version pins:", file=sys.stderr)
         for p in problems:

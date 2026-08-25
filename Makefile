@@ -17,7 +17,7 @@ cover:
 
 # Every gate proves it can reject, then runs. A check that cannot fail reports success.
 gates:
-	./scripts/gates.sh
+	python3 ./scripts/floor.py
 	python3 ./scripts/pins.py
 	python3 ./scripts/prose.py
 

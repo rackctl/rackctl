@@ -211,8 +211,20 @@ self_test() {
   return "$ok"
 }
 
-# Controls first, always. --controls-only exists for the gate suite, which asserts every
-# gate has them; it is not how the gate is normally run.
+# --check-report <file> applies the floors to a `go tool cover -func` report the CALLER
+# supplies, without running the suite. The report, not the raw profile: it is exactly the
+# input the verdict logic reads, so the floor supplies the thing being judged rather than
+# something upstream of it. It exists so scripts/floor.py can feed this gate a known-bad input and
+# observe the exit status, rather than reading what the gate says about itself. A gate that
+# reports its own verdict is testimony; a gate handed a bad input and watched to exit
+# non-zero is evidence.
+if [ "${1:-}" = "--check-report" ]; then
+  [ -n "${2:-}" ] || { echo "coverage: --check-report needs a file" >&2; exit 2; }
+  check_report < "$2"
+  exit $?
+fi
+
+# Controls first, always.
 self_test || exit 1
 [ "${1:-}" = "--controls-only" ] && exit 0
 
