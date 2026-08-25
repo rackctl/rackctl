@@ -18,6 +18,11 @@
 # gate cannot drift from the workflow that calls it. That is not ceremony: the verdict here
 # is four awk expressions, and an awk expression that stops comparing reports a clean pass
 # forever.
+#
+# The controls here mutate a GENERATED report with sed and awk rather than constructing
+# each fixture from a literal the way scripts/pins.py does. That is a real difference in
+# assurance: a patch can apply and change nothing that matters, so this file carries the
+# landed/absent-before/present-after assertions that pins.py does not need.
 set -e
 
 PROFILE="${PROFILE:-coverage.out}"
@@ -112,9 +117,13 @@ self_test() {
   )"
 
   # A mutation counts as landed only when the text CHANGED, the marker it claimed to plant
-  # is present, and that marker was not already there. An edit can apply cleanly and change
-  # nothing that matters — a floor the tree already meets, a pattern that matched nothing —
-  # and the verdict alone records that as proof.
+  # is present AFTER, and was absent BEFORE. An edit can apply cleanly and change nothing
+  # that matters — a floor the fixture already meets, a pattern that matched nothing — and
+  # the verdict alone records that as proof.
+  #
+  # Markers are SYNTHETIC tokens that occur nowhere but in a mutation. A realistic-looking
+  # one may already be present, and then "present after" proves nothing: the surest place
+  # to find realistic syntax is the documentation of the gates that catch it.
   #
   # $1 name, $2 mutated report, $3 the marker the mutation claims to plant.
   expect_reject() {
@@ -151,15 +160,15 @@ self_test() {
   fi
 
   expect_reject "a total below the floor" \
-    "$(printf '%s\n' "$passing" | sed "s/(statements)\t${GLOBAL_FLOOR}.0%/(statements)\t1.0%/")" \
-    "1.0%"
+    "$(printf '%s\n' "$passing" | sed "s/(statements)\t${GLOBAL_FLOOR}.0%/(statements)\t13.37%/")" \
+    "13.37%"
 
   # awk rather than sed: BSD sed has no address 0, so a `0,/re/` range silently matches
   # nothing and the "mutated" report comes back identical — a self-test that proves the
   # gate accepts a report it was never actually asked about.
   expect_reject "a destructive-path function under 100%" \
-    "$(printf '%s\n' "$passing" | awk '!done && /orphanedNodes/ { sub(/100\.0%/, "99.9%"); done=1 } { print }')" \
-    "99.9%"
+    "$(printf '%s\n' "$passing" | awk '!done && /orphanedNodes/ { sub(/100\.0%/, "42.24%"); done=1 } { print }')" \
+    "42.24%"
 
   expect_reject "a destructive-path function missing from the profile" \
     "$(printf '%s\n' "$passing" | awk '!/orphanedNodes/')"
@@ -170,8 +179,8 @@ self_test() {
   # A same-named function in another file must not satisfy the entry it is not.
   expect_reject "a same-named function standing in from the wrong file" \
     "$(printf '%s\n' "$passing" \
-      | sed 's|rackctl/internal/reap/own.go:1:\tProves|rackctl/internal/elsewhere/other.go:1:\tProves|')" \
-    "internal/elsewhere/other.go"
+      | sed 's|rackctl/internal/reap/own.go:1:\tProves|rackctl/internal/rackctl-ctl-elsewhere/other.go:1:\tProves|')" \
+    "rackctl-ctl-elsewhere"
 
   [ "$ok" -eq 0 ] && echo "control: coverage gate can reject"
   return "$ok"

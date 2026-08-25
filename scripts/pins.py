@@ -146,7 +146,11 @@ def load_managers(path):
 # unwatched, so the enumeration errs toward finding too much and the NOT_A_PIN list
 # carries the justified exclusions — each of which is itself asserted.
 VERSION_SHAPED = re.compile(r"(@v?\d+(\.\d+)*|==\d+(\.\d+)*|[\"']?~>\s*v\d+|:\s*[\"']?v?\d+\.\d+)")
-USES = re.compile(r"^\s*-?\s*uses:\s*(\S+)")
+# [ \t] rather than \s throughout: \s matches a newline, so an anchored pattern applied to
+# joined text swallows the blanked lines above its target and reports the wrong line. The
+# matching below is per-line, which makes that latent rather than live — the anchor is what
+# would make it live, so it is written the safe way.
+USES = re.compile(r"^[ \t]*-?[ \t]*uses:[ \t]*(\S+)")
 SHA_PIN = re.compile(r"@[0-9a-f]{40}(\s|$)")
 VERSION_COMMENT = re.compile(r"#\s*v?\d+(\.\d+)*\s*$")
 
@@ -179,7 +183,7 @@ def discover(root):
     gomod = os.path.join(root, "go.mod")
     if os.path.isfile(gomod):
         for n, raw in enumerate(open(gomod), 1):
-            if re.match(r"^\s+\S+/\S+ v\d", raw):
+            if re.match(r"^[ \t]+\S+/\S+ v\d", raw):
                 pins.append(("gomod", "go.mod", n, raw.rstrip()))
 
     return pins, exempt_hits
@@ -295,6 +299,19 @@ CONTROLS = [
      "accept"),
 ]
 
+# Blanked comment lines above a violation must not shift the line it is reported at. An
+# anchored \s* would swallow them and cite the wrong line, and nothing about that failure
+# announces itself — the gate still rejects, at a line that was never the pin.
+LINE_FIDELITY = """\
+# RACKCTL-CTL-PADDING-A
+# RACKCTL-CTL-PADDING-B
+jobs:
+  build:
+    steps:
+      # RACKCTL-CTL-PADDING-C
+      - uses: actions/checkout@v4
+"""
+
 
 def run_controls():
     if not CONTROLS:
@@ -342,6 +359,21 @@ def run_controls():
         else:
             print(f"control: {name} was ACCEPTED — this gate cannot catch it", file=sys.stderr)
             failed = True
+    # Line fidelity, checked against a fixture whose violation sits at a line number no
+    # off-by-N could reach by accident.
+    lay(LINE_FIDELITY, CLEAN_RENOVATE)
+    _, problems = check(root, os.path.join(root, "renovate.json"))
+    mutable = [p for p in problems if "mutable tag" in p]
+    if len(mutable) != 1:
+        print(f"control: line fidelity — expected exactly one mutable-tag finding, got {mutable}", file=sys.stderr)
+        failed = True
+    elif ":7:" not in mutable[0]:
+        print(f"control: the violation is on line 7 and was reported elsewhere — blanked lines "
+              f"above it shifted the citation: {mutable[0]}", file=sys.stderr)
+        failed = True
+    else:
+        print("control: a violation under blanked comment lines is cited at its own line")
+
     if failed:
         sys.exit(1)
 

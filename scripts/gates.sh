@@ -20,6 +20,20 @@
 # This lives in scripts/ rather than inline in a workflow so the soft-fail scan is not its
 # own input: an inline grep matches the line that defines it and reports a finding against
 # itself, forever.
+#
+# WHAT THIS DOES NOT HOLD. Stated rather than rounded off, because a gate suite that
+# overstates its own coverage is the failure mode it exists to prevent:
+#
+#   - The harness cannot control itself. Three gates carry controls; this file, which
+#     asserts that they do, carries none — nothing here would notice if THIS check stopped
+#     rejecting. It is verified by hand, by mutation, and that verification is not
+#     re-executed on every run the way a gate's own controls are.
+#   - scripts/prose.py holds only the subset documentation-voice names as gate-holdable.
+#     Narration against an unstated past, rationale braided with process, and self-defence
+#     are review, and the standard says why: the same violation arrives in as many wordings
+#     as there are authors.
+#   - A gate is discovered by extension in scripts/. One written in another language, or
+#     placed elsewhere, is invisible to this floor.
 set -e
 
 WORKFLOWS="${WORKFLOWS:-.github/workflows}"

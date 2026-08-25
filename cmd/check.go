@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,7 +17,10 @@ import (
 	"github.com/rackctl/rackctl/internal/ui"
 )
 
-var checkConfig string
+var (
+	checkConfig string
+	checkOutput string
+)
 
 // check answers "is this platform in a state I can act on" — one command, whichever side of the
 // install you are standing on.
@@ -55,20 +59,31 @@ dashboards that never rendered, a node pool tuned to evict half the fleet at onc
 Read-only. It never fixes what it finds — a tool that mutates the account it is auditing
 cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if checkOutput != "text" && checkOutput != "json" {
+			return withExit(ExitConfig, fmt.Errorf("--output %q is not one of: text, json", checkOutput))
+		}
 		cfg, err := config.Load(checkConfig)
 		if err != nil {
-			return err
+			return withExit(ExitConfig, err)
 		}
 		ctx := cmd.Context()
+		// Under --output json the prose goes to stderr and stdout carries the document
+		// alone, so `rackctl check --output json | jq` works without the caller having to
+		// filter a banner out of its own input.
+		say := func(a ...any) {
+			if checkOutput == "text" {
+				fmt.Println(a...)
+			}
+		}
 
 		if err := exec.RequireTools("tofu", "terragrunt", "kubectl", "helm", "aws", "git", "gh"); err != nil {
-			fmt.Println(ui.Fail(err.Error()))
+			say(ui.Fail(err.Error()))
 			return err
 		}
 
-		fmt.Println(ui.Title(commandTitle("check", cfg)))
-		fmt.Println(ui.OK("required tools present"))
-		fmt.Println()
+		say(ui.Title(commandTitle("check", cfg)))
+		say(ui.OK("required tools present"))
+		say()
 
 		// The pre-spend set. Its runner discards output because the checks are queries and
 		// their verdict IS the output.
@@ -77,8 +92,12 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 			return err
 		}
 		results := preflight.Run(ctx, &preflight.Env{Cfg: cfg, Run: q})
-		printResults(results)
+		if checkOutput == "text" {
+			printResults(results)
+		}
 		failed := preflight.Failed(results)
+		var health []doctor.Result
+		clusterState := "not-asserted"
 
 		// The health set, only where it can mean anything. The probe reads the kubeconfig
 		// rather than calling `describe-cluster`, because the question is whether THIS shell
@@ -103,35 +122,94 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		// check is read-only, so it refuses rather than repointing. `rackctl destroy`
 		// repoints because it is about to act; a diagnostic must not rewrite the
 		// operator's kubeconfig as a side effect of being run.
-		fmt.Println()
+		say()
 		switch got, err := currentKubeCluster(ctx, run); {
 		case err != nil || got == "":
-			fmt.Println(ui.Step("no reachable cluster — platform health not asserted (nothing is provisioned yet, " +
+			clusterState = "unreachable"
+			say(ui.Step("no reachable cluster — platform health not asserted (nothing is provisioned yet, " +
 				"or this shell is not pointed at it)"))
 		case got != cfg.ClusterName():
-			fmt.Println(ui.Warn(fmt.Sprintf(
+			clusterState = "wrong-cluster"
+			say(ui.Warn(fmt.Sprintf(
 				"kubectl is pointed at %q but this config is for %q — platform health NOT asserted. "+
 					"Run `aws eks update-kubeconfig --name %s --region %s --profile %s` to check this one.",
 				got, cfg.ClusterName(), cfg.ClusterName(), cfg.Cloud.Region, cfg.Cloud.Profile)))
 			failed = true
 		default:
-			fmt.Println(ui.OK("cluster reachable — asserting platform health"))
-			health := doctor.Run(ctx, &doctor.Env{Cfg: cfg, Run: run})
-			printResults(health)
+			clusterState = "asserted"
+			say(ui.OK("cluster reachable — asserting platform health"))
+			health = doctor.Run(ctx, &doctor.Env{Cfg: cfg, Run: run})
+			if checkOutput == "text" {
+				printResults(health)
+			}
 			failed = failed || doctor.Failed(health)
 		}
 
-		fmt.Println()
+		if checkOutput == "json" {
+			if err := emitCheckJSON(cfg, clusterState, results, health, failed); err != nil {
+				return err
+			}
+		}
+
+		say()
 		if failed {
 			return fmt.Errorf("checks failed — clear the above before provisioning")
 		}
-		fmt.Println(ui.OK("all checks clear"))
+		say(ui.OK("all checks clear"))
 		return nil
 	},
 }
 
+// checkReport is the shape `rackctl check --output json` emits. It is a contract: fields
+// are added, never renamed or removed, and TestCheckJSON_ShapeIsStable pins it.
+type checkReport struct {
+	Cluster     string `json:"cluster"`
+	Environment string `json:"environment"`
+	Account     string `json:"account"`
+	Region      string `json:"region"`
+	// ClusterHealth is asserted, unreachable, wrong-cluster or not-asserted. It says
+	// whether the platform half of this report means anything, which a caller cannot infer
+	// from an empty results list — no findings and no look are the same document otherwise.
+	ClusterHealth string        `json:"clusterHealth"`
+	Passed        bool          `json:"passed"`
+	Preflight     []checkResult `json:"preflight"`
+	Platform      []checkResult `json:"platform"`
+}
+
+type checkResult struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+}
+
+func toCheckResults(in []doctor.Result) []checkResult {
+	out := make([]checkResult, 0, len(in))
+	for _, r := range in {
+		out = append(out, checkResult{Name: r.Name, Status: strings.ToLower(r.Status.String()), Detail: r.Detail})
+	}
+	return out
+}
+
+func emitCheckJSON(cfg *config.Config, clusterHealth string, pre, platform []doctor.Result, failed bool) error {
+	doc := checkReport{
+		Cluster:       cfg.ClusterName(),
+		Environment:   string(cfg.Environment),
+		Account:       cfg.Cloud.AccountID,
+		Region:        cfg.Cloud.Region,
+		ClusterHealth: clusterHealth,
+		Passed:        !failed,
+		Preflight:     toCheckResults(pre),
+		Platform:      toCheckResults(platform),
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(doc)
+}
+
 func init() {
 	checkCmd.Flags().StringVarP(&checkConfig, "config", "c", "rackctl.yaml", "path to rackctl.yaml")
+	checkCmd.Flags().StringVar(&checkOutput, "output", "text",
+		"output format: text, or json for a machine-readable report on stdout")
 }
 
 // currentKubeCluster reports the EKS cluster the ambient kubeconfig resolves to,

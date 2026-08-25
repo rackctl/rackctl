@@ -148,6 +148,42 @@ def walk(root):
                 continue
 
 
+# A repo-relative path named in prose is a claim about the tree. Verified rather than
+# trusted: a doc pointing at a file that was renamed reads as authoritative and sends the
+# reader nowhere, and nothing signals the drift.
+PATH_CLAIM = re.compile(r"""
+    \[[^\]]*\]\((?P<md>[^)#\s]+)\)      # a markdown link target
+  | `(?P<code>[\w./-]+/[\w./-]+|[\w-]+\.(?:go|md|ya?ml|sh|py|json|example))`
+""", re.X)
+
+# Path-shaped strings that name something outside this repo, or a pattern rather than a
+# file. Each is ASSERTED: one matching nothing fails the run.
+NOT_A_REPO_PATH = [
+    (re.compile(r"^https?://"), "an external URL"),
+    (re.compile(r"^(landing-zone|eks-gitops|eks-agent-platform|portal|eks-fleet|nanohype|operators)/"),
+     "a path in a sibling repo, which this tree does not contain"),
+    (re.compile(r"^[\d./]+$"), "a CIDR or a numeric literal, not a path"),
+    (re.compile(r"^rackctl\.yaml$"),
+     "the operator's own config, which they write and .gitignore keeps out of the tree"),
+    (re.compile(r"^(terraform|live|components|modules|charts|config|deploy)/"),
+     "a path inside a repo rackctl drives"),
+]
+
+
+def path_claims(root, rel, text):
+    """Yield (lineno, path) for each repo-relative path this file claims exists."""
+    if not rel.endswith(".md"):
+        return
+    for n, line in enumerate(text.splitlines(), 1):
+        for m in PATH_CLAIM.finditer(line):
+            cand = m.group("md") or m.group("code")
+            if not cand:
+                continue
+            if cand.startswith("./"):
+                cand = cand[2:]
+            yield n, cand
+
+
 def check(root, assert_exemptions=False):
     findings, scanned = [], 0
     exempt_hits = {r.pattern: 0 for r, _ in EXEMPT}
@@ -159,6 +195,26 @@ def check(root, assert_exemptions=False):
                 m = pattern.search(prose)
                 if m:
                     findings.append((rel, n, rule, m.group(0).strip(), remedy))
+
+    path_exempt = {r.pattern: 0 for r, _ in NOT_A_REPO_PATH}
+    for rel, text in walk(root):
+        for n, cand in path_claims(root, rel, text):
+            skip = False
+            for r, _ in NOT_A_REPO_PATH:
+                if r.search(cand):
+                    path_exempt[r.pattern] += 1
+                    skip = True
+            if skip:
+                continue
+            # A relative link resolves against the directory of the file that carries it,
+            # which is how a reader following it in a browser or an editor resolves it.
+            # Falling back to the root keeps a repo-rooted path working from anywhere.
+            here = os.path.normpath(os.path.join(root, os.path.dirname(rel), cand))
+            if not (os.path.exists(here) or os.path.exists(os.path.join(root, cand))):
+                findings.append((rel, n, "unresolved-path", cand,
+                                 "this path does not exist in the tree. A doc pointing at a "
+                                 "renamed or absent file reads as authoritative and sends the "
+                                 "reader nowhere"))
 
     if scanned == 0:
         findings.append(("", 0, "empty-enumeration", "",
@@ -173,6 +229,11 @@ def check(root, assert_exemptions=False):
                 for r, _ in EXEMPT:
                     if r.search(rel):
                         exempt_hits[r.pattern] += 1
+        for r, why in NOT_A_REPO_PATH:
+            if path_exempt[r.pattern] == 0:
+                findings.append(("", 0, "dead-exemption", r.pattern,
+                                 f"this path exemption ({why}) matches nothing — an exemption "
+                                 "that outlives what it exempted hides the next violation"))
         for r, why in EXEMPT:
             if exempt_hits[r.pattern] == 0:
                 findings.append(("", 0, "dead-exemption", r.pattern,
@@ -210,6 +271,15 @@ CONTROLS = [
      '\nvar e = "could not apply — see ledger O14"\n'),
 ]
 
+# Path controls run against a markdown fixture rather than the Go one.
+PATH_CONTROLS = [
+    ("a markdown link to a file that does not exist", "See [the runbook](docs/nope.md).\n", "reject"),
+    ("a code-span path that does not exist", "Read `internal/nope/nope.go` first.\n", "reject"),
+    ("a link to a file that does exist", "See [the source](x.go).\n", "accept"),
+    ("an external URL", "See [the spec](https://example.com/x.md).\n", "accept"),
+    ("a sibling-repo path", "Mirrors `landing-zone/components/aws/cluster/eks.tf`.\n", "accept"),
+]
+
 
 def run_controls():
     if not CONTROLS:
@@ -241,6 +311,25 @@ def run_controls():
         else:
             print(f"control: {name} was ACCEPTED — this gate cannot catch it", file=sys.stderr)
             failed = True
+
+    lay(CLEAN)
+    md = os.path.join(root, "doc.md")
+    for name, body, want in PATH_CONTROLS:
+        open(md, "w").write(body)
+        _, findings = check(root)
+        hit = [f for f in findings if f[2] == "unresolved-path"]
+        if want == "accept":
+            if hit:
+                print(f"control: {name} — reported a finding it should not have: {hit}", file=sys.stderr)
+                failed = True
+            else:
+                print(f"control: {name} correctly ignored")
+        elif hit:
+            print(f"control: {name} rejected")
+        else:
+            print(f"control: {name} was ACCEPTED — this gate cannot catch it", file=sys.stderr)
+            failed = True
+    os.remove(md)
 
     # The enumeration must fail on empty, not pass.
     empty = tempfile.mkdtemp()

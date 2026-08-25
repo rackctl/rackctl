@@ -95,7 +95,7 @@ the object rather than at the flag.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load(destroyConfig)
 		if err != nil {
-			return err
+			return withExit(ExitConfig, err)
 		}
 		// --force-buckets needs no dry-run guard: PermitBucketTeardown prints both acts
 		// and refuses where it must, so a dry-run is informative rather than dangerous.
@@ -118,7 +118,7 @@ the object rather than at the flag.`,
 		}
 		if !run.DryRun {
 			if err := confirmDestroy(cfg.ClusterName(), string(cfg.Environment)); err != nil {
-				return err
+				return withExit(ExitDeclined, err)
 			}
 		}
 		if destroyForceBuckets {
