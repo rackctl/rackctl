@@ -122,7 +122,7 @@ const (
 	// them, so from the second environment onwards finding them is expected.
 	scopeAccount
 	// scopeBackend: Terraform state. Created idempotently behind a head-bucket guard
-	// (landing-zone scripts/init-backend-aws.sh:12, phases/agentplatform.go:224), never deleted
+	// (landing-zone scripts/init-backend-aws.sh, phases/agentplatform.go), never deleted
 	// by rackctl, and shared across every environment in the account, differing only by key.
 	scopeBackend
 )
@@ -141,13 +141,13 @@ type plannedBucket struct {
 //
 // Composed from the components' own expressions rather than guessed:
 //
-//	agent-iam        artifacts.tf:50-52  <cluster>-<account>-<region>-{model-artifacts,eval-reports,access-logs}
-//	cluster-addons   main.tf:37 + s3.tf  <cluster>-<account>-<region>-{velero,loki,tempo,argo-workflows}
-//	model-import     main.tf:65          <environment>-<account>-<region>-model-import
-//	bedrock-account  main.tf:11,92,152   org-<account>-<region>-bedrock-{access-logs,invocations}
-//	cost-pipeline    main.tf:67,169,237,335
+//	agent-iam        artifacts.tf  <cluster>-<account>-<region>-{model-artifacts,eval-reports,access-logs}
+//	cluster-addons   main.tf + s3.tf  <cluster>-<account>-<region>-{velero,loki,tempo,argo-workflows}
+//	model-import     main.tf          <environment>-<account>-<region>-model-import
+//	bedrock-account  main.tf,92,152   org-<account>-<region>-bedrock-{access-logs,invocations}
+//	cost-pipeline    main.tf,169,237,335
 //	                                     org-<account>-<region>-cost-{access-logs,estimates,athena}-<account>
-//	backends         init-backend-aws.sh:9 / agentplatform.go:214
+//	backends         init-backend-aws.sh / agentplatform.go
 //
 // The last two used to be composed as <cluster>-bedrock-* and <cluster>-cost-*, which is the
 // shape eks-agent-platform had before it account-scoped both components. Those names are not
@@ -157,7 +157,7 @@ type plannedBucket struct {
 //
 // The account id appears twice in the cost names and once in the bedrock ones. That asymmetry
 // is upstream's, not a typo here: cost-pipeline suffixes each bucket with the caller's account
-// on top of a prefix that already carries it (main.tf:169), and bedrock-account does not.
+// on top of a prefix that already carries it (main.tf), and bedrock-account does not.
 //
 // Note what left with the rename: these five no longer contain cluster.name at all, so the
 // 63-character pressure that made cluster.name the fix for a too-long name is now confined to
@@ -234,7 +234,7 @@ const accountScopeToken = "org"
 //     cluster.name. This is the unrecoverable one and it must not read like the other two.
 //
 // Length is checked in the same pass. cluster-addons has an upstream precondition for its own
-// four (s3.tf:316) with one character of headroom at the worst case; agent-iam's and the
+// four (s3.tf) with one character of headroom at the worst case; agent-iam's and the
 // agent-platform tree's have none at all, and a 64-character name fails at create with an error
 // about naming rules rather than about cluster.name.
 func CheckBucketNames(ctx context.Context, env *Env) doctor.Result {

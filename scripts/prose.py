@@ -76,6 +76,13 @@ RULES = [
         "session narration. The reader was not in the room",
     ),
     (
+        "line-number-citation",
+        re.compile(r"\b[\w./-]+\.(?:go|tf|hcl|ya?ml|sh|py)\s*:\s*\d+(?:\s*-\s*\d+)?\b"),
+        "a citation by line number. It is stale at the next edit above it, in either this "
+        "repo or the one it names, and nothing signals when it drifts — name the symbol, "
+        "the file, or the behaviour instead",
+    ),
+    (
         "unowned-todo",
         re.compile(r"(?i)\b(?:TODO|FIXME|XXX|HACK)\b(?!\s*\([^)]+\))"),
         "a marker with no owner. Either do it, or state the constraint that makes the "
@@ -197,6 +204,8 @@ CONTROLS = [
     ("a health-ratio tally", CLEAN + "\n// The only reason a 44/44-healthy cluster survived.\n"),
     ("session narration", CLEAN + "\n// As discussed, this is kept here for future Claude.\n"),
     ("an unowned TODO", CLEAN + "\n// TODO: wire this up.\n"),
+    ("an in-repo line-number citation", CLEAN + "\n// The guard lives at phases/agentplatform.go:224.\n"),
+    ("a cross-repo line-number citation", CLEAN + "\n// Matches operators/platform_iam.go:177-190.\n"),
     ("a violation inside a shipped error string", CLEAN +
      '\nvar e = "could not apply — see ledger O14"\n'),
 ]

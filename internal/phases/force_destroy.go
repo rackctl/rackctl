@@ -50,8 +50,8 @@ func ForceDestroyBucketComponents(cfg *config.Config) []string {
 //
 // velero_backup_policy is the composition upstream documents as the safe order (copy
 // recovery points to the central vault first, then empty the local bucket). The variable
-// is declared on CLUSTER-ADDONS (variables.tf:36); its VALUE names a plan key defined in
-// the backup component's backup_plans (validation message, variables.tf:60). rackctl has
+// is declared on CLUSTER-ADDONS (variables.tf); its VALUE names a plan key defined in
+// the backup component's backup_plans (validation message, variables.tf). rackctl has
 // no field for it and does not apply backup, so the path is unreachable here; the note
 // says so rather than pretending --force-buckets preserves restore points.
 func PermitBucketTeardown(ctx context.Context, st *engine.State) error {
@@ -83,7 +83,7 @@ func PermitBucketTeardown(ctx context.Context, st *engine.State) error {
 	// After a partial teardown the cluster is gone, so agent-iam's `dependency "cluster"`
 	// resolves against state that no longer exists and terragrunt fails at parse:
 	//
-	//	live/aws/../_envcommon/aws/agent-iam.hcl:28: Unknown variable; There is no
+	//	live/aws/../_envcommon/aws/agent-iam.hcl: Unknown variable; There is no
 	//	variable named "dependency".
 	//
 	// That used to abort the whole destroy BEFORE the component loop — the third place a

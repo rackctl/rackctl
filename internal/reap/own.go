@@ -50,7 +50,7 @@ type Owner struct {
 //     the terragrunt substrate stamps via live/root.hcl's provider default_tags, and every
 //     Karpenter node, whose EC2NodeClass carries its own copy of the taxonomy.
 //   - ManagedBy is exactly "eks-agent-platform". This is the operator's own marker
-//     (platform_iam.go:182), and it is the channel the upstream IAM compromise runbook
+//     (platform_iam.go), and it is the channel the upstream IAM compromise runbook
 //     already prescribes for finding operator-minted roles that a path prefix misses.
 //
 // What this deliberately does NOT prove is which CLUSTER a resource belongs to. Nothing the

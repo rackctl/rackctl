@@ -49,7 +49,7 @@ func newFakeIAM() *fakeIAM {
 }
 
 // ownedTags is what eks-agent-platform's operator actually puts on a tenant role
-// (operators/internal/controller/platform_iam.go:177-190).
+// (operators/internal/controller/platform_iam.go).
 func ownedTags() map[string]string {
 	return map[string]string{
 		"ManagedBy":  "eks-agent-platform",

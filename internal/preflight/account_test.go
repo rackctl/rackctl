@@ -198,7 +198,7 @@ esac`)
 // a correctly built account; the test could not see it because both sides were stale together.
 //
 // It is now fed the name bedrock-account actually creates
-// (components/bedrock-account/main.tf:11,152 — prefix "${var.environment}-${account}-${region}
+// (components/bedrock-account/main.tf,152 — prefix "${var.environment}-${account}-${region}
 // -bedrock" with var.environment pinned to "org" by live/org/env.hcl), so the constant and the
 // fixture can no longer drift as a pair.
 func TestBedrockLogging_TheAccountScopedSingletonIsFineFromAnyEnvironment(t *testing.T) {

@@ -446,7 +446,7 @@ func CheckCatalogFork(ctx context.Context, env *Env) doctor.Result {
 // and cluster-bootstrap's own comment states the contract exactly: "the token comes from
 // the GITHUB_TOKEN environment variable. When tenants_repo_url is empty, owner is "" and
 // no github resources are created, so the provider is never called"
-// (components/aws/cluster-bootstrap/main.tf:170-172). Setting the repo is what calls it.
+// (components/aws/cluster-bootstrap/main.tf). Setting the repo is what calls it.
 //
 // Unauthenticated, that provider 401s during PHASE 5 — after the VPC, the EKS cluster and
 // every substrate component are built and billing. Cheap to know now, expensive to learn
@@ -571,7 +571,7 @@ func CheckVendFreshness(ctx context.Context, env *Env) doctor.Result {
 // curExportParams is the contract cost-pipeline resolves the Cost and Usage Report from.
 //
 // Read through unguarded `data "aws_ssm_parameter"` blocks
-// (eks-agent-platform/terraform/components/cost-pipeline/main.tf:53-63), so a missing
+// (eks-agent-platform/terraform/components/cost-pipeline/main.tf), so a missing
 // parameter is not a degraded feature — it is a plan-time failure of the whole root.
 var curExportParams = []string{
 	"/platform/org/cost/cur-export-bucket",

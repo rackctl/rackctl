@@ -48,11 +48,22 @@ def die(msg):
     sys.exit(1)
 
 
-def strip_yaml_comments(line):
-    """Remove a trailing YAML comment, respecting quotes.
+def blank_comment_body(line):
+    """Blank a trailing YAML comment's BODY, respecting quotes, keeping the '#'.
 
-    Naive splitting on '#' would cut a URL fragment or a quoted value in half, and leaving
-    comments in would let one satisfy a check that is looking for content.
+    One stripper, two views, chosen per check — reading one view for two purposes is how a
+    gate goes blind:
+
+      raw       when the thing being looked for IS an annotation. The `# v7.0.1` beside a
+                SHA is not decoration, it is what Renovate rewrites, so the version-comment
+                check reads the raw line.
+      blanked   when a comment must not be able to satisfy a check looking for content. A
+                commented-out `uses:` is not an action reference, and a customManager's
+                regex must match a real pin rather than prose mentioning one.
+
+    The body is blanked rather than the line deleted so the '#' survives and offsets stay
+    put, which keeps reported line numbers true. Naive splitting on '#' would also cut a
+    URL fragment or a quoted value in half, so quotes are respected.
     """
     out, quote = [], None
     i = 0
@@ -74,7 +85,7 @@ def strip_yaml_comments(line):
         else:
             out.append(c)
         i += 1
-    return "".join(out)
+    return "".join(out) + ("#" if quote is None and "#" in line[len("".join(out)):] else "")
 
 
 def to_python_re(pattern):
@@ -150,7 +161,7 @@ def discover(root):
                 continue
             path = os.path.join(".github", "workflows", name)
             for n, raw in enumerate(open(os.path.join(wf_dir, name)), 1):
-                line = strip_yaml_comments(raw).rstrip()
+                line = blank_comment_body(raw).rstrip()
                 if not line.strip():
                     continue
                 exempted = False
@@ -190,7 +201,7 @@ def check(root, renovate_path, assert_exemptions=False):
     counts = {"action": 0, "value": 0, "gomod": 0}
     for kind, path, n, raw in pins:
         counts[kind] += 1
-        line = strip_yaml_comments(raw)
+        line = blank_comment_body(raw)
 
         if kind == "gomod":
             if not gomod_watched:
@@ -276,6 +287,12 @@ CONTROLS = [
      lambda wf, rn: (wf, {k: v for k, v in rn.items() if k not in ("postUpdateOptions", "extends")})),
     ("an empty enumeration",
      lambda wf, rn: ("", rn)),
+    # The blanked view: a commented-out action reference is not an action reference. Read
+    # raw, this line would be counted as a pin and then rejected for the mutable tag it
+    # carries — a false finding, and evidence the gate is reading comments as content.
+    ("a commented-out action read as a real one",
+     lambda wf, rn: (wf + "      # - uses: actions/stale@v1\n", rn),
+     "accept"),
 ]
 
 
@@ -306,11 +323,21 @@ def run_controls():
     print("control: a clean tree passes")
 
     failed = False
-    for name, mutate in CONTROLS:
+    for entry in CONTROLS:
+        name, mutate = entry[0], entry[1]
+        want = entry[2] if len(entry) > 2 else "reject"
         wf, rnj = mutate(CLEAN_WORKFLOW, CLEAN_RENOVATE)
         rn = lay(wf, rnj)
         _, problems = check(root, rn)
-        if problems:
+        if want == "accept":
+            if problems:
+                print(f"control: {name} — the gate reported a finding it should not have:", file=sys.stderr)
+                for p in problems:
+                    print(f"    {p}", file=sys.stderr)
+                failed = True
+            else:
+                print(f"control: {name} correctly ignored")
+        elif problems:
             print(f"control: {name} rejected")
         else:
             print(f"control: {name} was ACCEPTED — this gate cannot catch it", file=sys.stderr)

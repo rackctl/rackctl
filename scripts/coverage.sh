@@ -111,7 +111,30 @@ self_test() {
     printf 'total:\t\t\t(statements)\t%s.0%%\n' "$GLOBAL_FLOOR"
   )"
 
+  # A mutation counts as landed only when the text CHANGED, the marker it claimed to plant
+  # is present, and that marker was not already there. An edit can apply cleanly and change
+  # nothing that matters — a floor the tree already meets, a pattern that matched nothing —
+  # and the verdict alone records that as proof.
+  #
+  # $1 name, $2 mutated report, $3 the marker the mutation claims to plant.
   expect_reject() {
+    if [ "$2" = "$passing" ]; then
+      echo "control: $1 did not change the fixture — the mutation did not land, so its rejection would prove nothing" >&2
+      ok=1
+      return
+    fi
+    if [ -n "$3" ]; then
+      if ! printf '%s\n' "$2" | grep -q -- "$3"; then
+        echo "control: $1 claims to plant $3 and the mutated fixture does not contain it" >&2
+        ok=1
+        return
+      fi
+      if printf '%s\n' "$passing" | grep -q -- "$3"; then
+        echo "control: $1 plants $3, which the CLEAN fixture already contains — the mutation changes nothing about the meaning" >&2
+        ok=1
+        return
+      fi
+    fi
     if printf '%s\n' "$2" | check_report >/dev/null 2>&1; then
       echo "control: $1 was ACCEPTED — this gate cannot reject" >&2
       ok=1
@@ -128,13 +151,15 @@ self_test() {
   fi
 
   expect_reject "a total below the floor" \
-    "$(printf '%s\n' "$passing" | sed "s/(statements)\t${GLOBAL_FLOOR}.0%/(statements)\t1.0%/")"
+    "$(printf '%s\n' "$passing" | sed "s/(statements)\t${GLOBAL_FLOOR}.0%/(statements)\t1.0%/")" \
+    "1.0%"
 
   # awk rather than sed: BSD sed has no address 0, so a `0,/re/` range silently matches
   # nothing and the "mutated" report comes back identical — a self-test that proves the
   # gate accepts a report it was never actually asked about.
   expect_reject "a destructive-path function under 100%" \
-    "$(printf '%s\n' "$passing" | awk '!done && /orphanedNodes/ { sub(/100\.0%/, "99.9%"); done=1 } { print }')"
+    "$(printf '%s\n' "$passing" | awk '!done && /orphanedNodes/ { sub(/100\.0%/, "99.9%"); done=1 } { print }')" \
+    "99.9%"
 
   expect_reject "a destructive-path function missing from the profile" \
     "$(printf '%s\n' "$passing" | awk '!/orphanedNodes/')"
@@ -145,7 +170,8 @@ self_test() {
   # A same-named function in another file must not satisfy the entry it is not.
   expect_reject "a same-named function standing in from the wrong file" \
     "$(printf '%s\n' "$passing" \
-      | sed 's|rackctl/internal/reap/own.go:1:\tProves|rackctl/internal/elsewhere/other.go:1:\tProves|')"
+      | sed 's|rackctl/internal/reap/own.go:1:\tProves|rackctl/internal/elsewhere/other.go:1:\tProves|')" \
+    "internal/elsewhere/other.go"
 
   [ "$ok" -eq 0 ] && echo "control: coverage gate can reject"
   return "$ok"

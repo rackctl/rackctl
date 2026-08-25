@@ -154,7 +154,7 @@ func tgEnvWith(base []string, cfg *config.Config) []string {
 		// enable_portal_reader mints the portal's read-only ServiceAccount and a DURABLE
 		// token, so the portal can register the cluster and watch Platform/Tenant CRs.
 		//
-		// It defaults to TRUE upstream (cluster-bootstrap/variables.tf:154) and no leaf pins
+		// It defaults to TRUE upstream (cluster-bootstrap/variables.tf) and no leaf pins
 		// it, so a portal-enabled install already got the reader — this injection does not
 		// fix an inert knob. What it does is the opposite, and deliberately: it turns the
 		// reader OFF when controlPlane.portal is false, because a durable cluster-read token

@@ -446,7 +446,7 @@ func TestApplyAgentPlatform_ApplyStillRequiresTheOutputs(t *testing.T) {
 // tree lands, or EvalSuite reports are silently discarded.
 //
 // The variable is opt-in upstream because it depends on eks-agent-platform's eval-runtime
-// component having written its SSM parameters (cluster-bootstrap/variables.tf:182). rackctl
+// component having written its SSM parameters (cluster-bootstrap/variables.tf). rackctl
 // applies cluster-bootstrap in the gitops phase, one phase BEFORE that tree exists — so the
 // flag cannot be set there, and if it is never set at all, bootstrap.tf never stamps
 // `eks-agent-platform/eval-reports-bucket` on the ArgoCD cluster Secret. The operator then

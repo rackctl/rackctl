@@ -352,7 +352,7 @@ func TestApplyDefaults_SystemNodesCompletesPerField(t *testing.T) {
 // never injected — so asking for exactly the shown list silently gets the component's list.
 func TestDefault_SystemNodeInstanceTypesMatchLandingZone(t *testing.T) {
 	got := Default().Cluster.SystemNodes.InstanceTypes
-	want := []string{"m7g.xlarge", "m6g.xlarge"} // components/aws/cluster/variables.tf:142
+	want := []string{"m7g.xlarge", "m6g.xlarge"} // components/aws/cluster/variables.tf
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v — see the comment on Default()", got, want)
 	}

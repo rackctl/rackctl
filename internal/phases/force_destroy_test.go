@@ -154,9 +154,9 @@ func druidCfg(t *testing.T, env config.Environment) *config.Config {
 // 94dff69 closed it, as the class rather than the instance: every teardown gate in a component
 // declaring force_destroy_buckets now resolves permissively on the lever-true branch and keeps
 // the leaf's pin otherwise. Verified end-to-end before this refusal was retired —
-// components/aws/druid/variables.tf:86 declares it, main.tf:24 passes it to the tenant module,
-// modules/tenant/variables.tf:58 receives it, and aurora.tf:20 folds it into
-// local.allow_teardown, which aurora.tf:105 uses for deletion_protection.
+// components/aws/druid/variables.tf declares it, main.tf passes it to the tenant module,
+// modules/tenant/variables.tf receives it, and aurora.tf folds it into
+// local.allow_teardown, which aurora.tf uses for deletion_protection.
 //
 // So the permitting apply now clears protection via ModifyDBCluster in the same act that lands
 // force_destroy, and act 2 reaches the buckets and the DB cluster together. This test is what

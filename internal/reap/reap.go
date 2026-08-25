@@ -211,7 +211,7 @@ type execer interface {
 //
 // One class of operator-minted role is NOT covered: the eventBridgeScheduler capability
 // mints `<cluster>-<platform>-scheduler-invoke` at the ROOT path with no Path set
-// (platform_capability_policy.go:270). The name filter below WOULD match it — upstream
+// (platform_capability_policy.go). The name filter below WOULD match it — upstream
 // 0546a92 re-keyed it from the environment to the cluster — but the path prefix excludes it
 // before the name is ever considered. It carries the tenant permissions boundary agent-iam
 // destroys, so a Platform declaring that capability whose finalizer did not complete can
@@ -220,7 +220,7 @@ type execer interface {
 // Widening the path is not the answer: enumerating IAM's root path means every role in the
 // account, and this sweep must stay scoped to one cluster. The channel upstream prescribes
 // is the tag sweep — 0546a92 tags these roles so a compromise sweep can pick them out of
-// the root path (platform_capability_policy.go:315-322) — or accepting that the finalizer
+// the root path (platform_capability_policy.go) — or accepting that the finalizer
 // owns the delete, which it does whenever the operator is healthy.
 // A third filter now sits after those two, and it is the one that makes the sweep provable
 // rather than merely narrow: every candidate's TAGS must establish that it is ours.
@@ -555,7 +555,7 @@ func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, 
 //
 // This function used to assert that "every dynamically provisioned volume is tagged
 // kubernetes.io/cluster/<name>=owned by the EBS CSI driver". That is not established. The
-// driver is an EKS MANAGED ADDON declared at landing-zone components/aws/cluster/eks.tf:92-105
+// driver is an EKS MANAGED ADDON declared at landing-zone components/aws/cluster/eks.tf
 // with no configuration_values block at all, so neither extraVolumeTags nor k8sTagClusterId is
 // set; and the gp3 StorageClass in eks-gitops sets no tagSpecification parameters. Without
 // one of those, a dynamically provisioned volume carries only the driver's provenance tags —

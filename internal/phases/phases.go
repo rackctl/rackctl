@@ -1052,10 +1052,10 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 	//
 	// This is a re-apply, and it is the only way the annotation can ever be stamped. The
 	// variable is opt-in upstream BECAUSE it depends on another component having run
-	// (cluster-bootstrap/variables.tf:182 — "Requires that component to have applied
+	// (cluster-bootstrap/variables.tf — "Requires that component to have applied
 	// first"), and rackctl runs cluster-bootstrap in the gitops phase, one phase before the
 	// agent-platform tree exists. Setting the flag there would fail the SSM read; leaving it
-	// unset means bootstrap.tf:397-400 never stamps
+	// unset means bootstrap.tf never stamps
 	// `eks-agent-platform/eval-reports-bucket` on the ArgoCD cluster Secret, the operator
 	// ApplicationSet renders evalReportsBucket empty, and every EvalSuite run completes with
 	// its reports going nowhere durable. Nothing errors — which is the whole problem.
