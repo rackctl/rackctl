@@ -34,7 +34,15 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from gatelib import blank_comment_body  # noqa: E402
+try:
+    from gatelib import blank_comment_body  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - a precondition, not a branch under test
+    # Named rather than raised. A ModuleNotFoundError exits non-zero and so never passes
+    # silently, but it reports a Python identifier where the fact is that this gate was
+    # separated from the helper it shares with the others.
+    print("pins: scripts/gatelib.py is not importable from beside this file; the "
+          "shared comment stripper is missing and no verdict was reached", file=sys.stderr)
+    sys.exit(2)
 import tempfile
 
 REPO = os.environ.get("REPO_ROOT", ".")
