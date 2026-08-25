@@ -358,7 +358,7 @@ func CheckHostedZone(ctx context.Context, env *Env) doctor.Result {
 	raw, err := env.Run.Capture(ctx, "aws", "route53", "list-hosted-zones",
 		"--query", "HostedZones[].[Name,Id,Config.PrivateZone]", "--output", "text")
 	if err != nil {
-		return warn(name, "could not list hosted zones")
+		return warn(name, "could not list hosted zones ("+truncate(err.Error(), 160)+")")
 	}
 
 	// The zones this run's own dns state already tracks. A zone terraform owns is not a
@@ -568,7 +568,7 @@ func CheckCostAllocationTags(ctx context.Context, env *Env) doctor.Result {
 		"--status", "Active", "--query", "CostAllocationTags[].TagKey",
 		"--region", "us-east-1", "--output", "text")
 	if err != nil {
-		return warn(name, "could not read cost allocation tags")
+		return warn(name, "could not read cost allocation tags ("+truncate(err.Error(), 160)+")")
 	}
 	active := map[string]bool{}
 	// A key may come back bare or carrying its CUR column prefix. Both forms are recorded so the
