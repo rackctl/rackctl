@@ -522,8 +522,20 @@ def main():
     own = {"scripts", "testdata"}
     outside = scanned_outside(REPO, own)
     measured = {"files outside": outside, **examined}
-    below = [f"{k} {v} < floor {FLOOR[k]}" for k, v in measured.items()
-             if SCANNING_THE_REPO and v < FLOOR[k]]
+    # Iterated over FLOOR, not over what was measured. Walking the measurements means a
+    # floor declared for a quantity nothing records is silently skipped — the comparison
+    # never happens, and a floor that does not apply is indistinguishable from one that
+    # passed. Absence gets its own branch and its own sentence rather than a default: a
+    # number chosen to fail is still a number, and it reports "too few" for something that
+    # was never counted at all.
+    unmeasured = sorted(k for k in FLOOR if k not in measured)
+    if unmeasured:
+        print(f"prose: FLOOR declares {unmeasured}, which nothing records. A floor on a "
+              "quantity that is never measured does not apply, and reads exactly like one "
+              "that passed.", file=sys.stderr)
+        sys.exit(1)
+    below = [f"{k} {measured[k]} < floor {FLOOR[k]}" for k in FLOOR
+             if SCANNING_THE_REPO and measured[k] < FLOOR[k]]
 
     if vacuous or outside == 0 or below:
         if vacuous:
