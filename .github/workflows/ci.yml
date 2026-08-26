@@ -187,7 +187,22 @@ jobs:
           # BASH_VERSION are checked — a shell named dash that is really bash would pass the
           # first test alone.
           readlink -f /bin/sh | grep -q dash
-          [ -z "$(/bin/sh -c 'echo ${BASH_VERSION-}')" ]
+          # The probe prints a SENTINEL, so an empty result cannot be read as a pass. Testing
+          # `-z "$(/bin/sh -c 'echo ${BASH_VERSION-}')"` alone treats a /bin/sh that could not
+          # run at all as proof that it is dash — emptiness is the passing value there. It
+          # held only because the readlink above exits non-zero first and ends the step, and
+          # A PROPERTY THAT DEPENDS ON LINE ORDER IS NOT A PROPERTY, it is an arrangement:
+          # reorder these two and the door opens with nothing failing.
+          probe=$(/bin/sh -c 'printf "ran:%s" "${BASH_VERSION-}"')
+          case "$probe" in
+            ran:) ;;
+            ran:*) echo "/bin/sh reports BASH_VERSION=${probe#ran:}; it is bash, not dash, so" >&2
+                   echo "this step would test bash-isms against bash and pass them" >&2
+                   exit 1 ;;
+            *)     echo "/bin/sh produced no sentinel, so it did not run; no verdict about" >&2
+                   echo "which shell this is was reached" >&2
+                   exit 2 ;;
+          esac
           # RUN, do not parse. `sh -n` is a syntax check: dash -n accepts [[ ]], mapfile,
           # `declare -A` and case-modification expansion. Only executing rejects them.
           /bin/sh ./scripts/install_test.sh
