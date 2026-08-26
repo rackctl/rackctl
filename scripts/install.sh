@@ -16,12 +16,38 @@ case "$ARCH" in
 esac
 
 if [ "$VERSION" = "latest" ]; then
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep '"tag_name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+  # The HTTP status is read, not just the body. A repository with no releases answers 404,
+  # and so does nothing else here — while a rate limit answers 403 and an outage answers 5xx.
+  # `curl -f` collapses all of those into exit 22, and the pipeline that used to parse this
+  # discarded even that: the status of `curl | grep | head | sed` is sed's, which always
+  # succeeds. An empty result then reached a fallback that read it as "this project ships no
+  # binaries" and installed from source WITHOUT the checksum verification below.
+  #
+  # Those are different worlds and the operator has to know which one they are in. A transient
+  # failure is a REFUSAL — retrying gets them the verified binary. Only a genuine 404 is a
+  # reason to build from source.
+  rc=0
+  body="$(curl -sSL -w '\n%{http_code}' "https://api.github.com/repos/${REPO}/releases/latest")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "could not reach the release API: curl exited $rc. This is a transient failure, not a" >&2
+    echo "missing release — retry rather than installing unverified. To build from source" >&2
+    echo "deliberately: go install github.com/${REPO}@latest" >&2
+    exit 2
+  fi
+  code="$(printf '%s\n' "$body" | tail -1)"
+  case "$code" in
+    200) VERSION="$(printf '%s\n' "$body" | grep '"tag_name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')" ;;
+    404) VERSION="" ;;
+    *)   echo "the release API answered HTTP $code. That is a transient failure, not a missing" >&2
+         echo "release — retry rather than installing unverified. To build from source" >&2
+         echo "deliberately: go install github.com/${REPO}@latest" >&2
+         exit 2 ;;
+  esac
 fi
 
 if [ -z "$VERSION" ]; then
-  echo "no release found — falling back to: go install github.com/${REPO}@latest" >&2
+  # Reached only when the API ANSWERED and this repository genuinely publishes no release.
+  echo "no release published — falling back to: go install github.com/${REPO}@latest" >&2
   exec go install "github.com/${REPO}@latest"
 fi
 
