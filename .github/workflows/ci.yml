@@ -38,7 +38,16 @@ jobs:
           go-version: "1.26"
           cache: true
       - name: gofmt
-        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+        # `test -z "$(gofmt -l .)"` reads an ABSENT gofmt as a clean tree: the substitution
+        # is empty either way, and empty is the passing value. The tool is required to
+        # produce an answer before the answer is believed.
+        run: |
+          command -v gofmt >/dev/null || { echo "gofmt is not installed; no verdict" >&2; exit 2; }
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "$out" >&2
+            exit 1
+          fi
       - run: go vet ./...
       # A step of `build` rather than a job of its own, deliberately: protect-main requires the
       # `build` context, so putting lint here makes it enforced immediately. A separate job would
@@ -152,10 +161,24 @@ jobs:
         # entitled to a bash-4 builtin. A #!/bin/bash script added later would need its own
         # check against the oldest bash it must run on — macOS ships 3.2.
         run: |
-          if grep -lE '^#!.*\bbash\b' scripts/*.sh; then
-            echo "a bash script was added; shellcheck does not check bash VERSIONS" >&2
-            exit 1
-          fi
+          # grep has FOUR answers — 0 match, 1 definite no-match, 2 unreadable file, 127 not
+          # installed — and an `if` has two. Written as `if grep …; then fail; fi`, every
+          # status above 1 lands in the no-match branch and the guard deletes itself: an
+          # absent grep or a single unreadable script would pass this step silently. Both
+          # were reproduced. So the DEFINITE outcome is required and anything else names its
+          # status.
+          rc=0
+          hits=$(grep -lE '^#!.*\bbash\b' scripts/*.sh) || rc=$?
+          case "$rc" in
+            0)
+              echo "a bash script was added; shellcheck does not check bash VERSIONS: $hits" >&2
+              exit 1 ;;
+            1) ;;
+            *)
+              echo "grep exited $rc scanning scripts/*.sh — not a definite no-match, so this" >&2
+              echo "step reached no verdict about bash scripts" >&2
+              exit 2 ;;
+          esac
       - name: posix shell
         run: |
           # /bin/sh on ubuntu-latest IS dash. Asserted rather than assumed: if the runner
