@@ -71,7 +71,7 @@ jobs:
         # itself and nothing more. RACKCTL_REQUIRE_TOOL_CONTRACTS on the test step
         # turns that skip into a failure, so this step cannot quietly stop covering it.
         env:
-          TERRAGRUNT_VERSION: v1.1.3
+          TERRAGRUNT_VERSION: v1.1.4
           TOFU_VERSION: 1.12.6
           GORELEASER_VERSION: v2.18.0
         run: |
