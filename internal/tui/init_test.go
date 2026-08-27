@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
@@ -95,15 +95,25 @@ func TestUpdateRecordsPhaseEventError(t *testing.T) {
 // Quitting mid-run is an abort, not a clean exit: the pipeline is part-way through
 // and the platform is left in whatever state the interrupted phase produced.
 func TestQuitWhileRunningMarksAborted(t *testing.T) {
-	for _, key := range []string{"q", "ctrl+c"} {
-		t.Run(key, func(t *testing.T) {
-			m := model{rows: []phaseRow{{title: "one"}}}
-			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
-			if key == "ctrl+c" {
-				next, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	for _, k := range []struct {
+		name string
+		msg  tea.KeyPressMsg
+	}{
+		{"q", tea.KeyPressMsg{Code: 'q', Text: "q"}},
+		{"ctrl+c", tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}},
+	} {
+		t.Run(k.name, func(t *testing.T) {
+			// The key is matched by its String(), so the construction above has to
+			// produce the spelling Update compares against rather than merely being a
+			// key of roughly the right shape.
+			if got := k.msg.String(); got != k.name {
+				t.Fatalf("key stringifies as %q, want %q — Update matches on this text, "+
+					"so a test built on a different spelling asserts nothing", got, k.name)
 			}
+			m := model{rows: []phaseRow{{title: "one"}}}
+			next, _ := m.Update(k.msg)
 			if !next.(model).aborted {
-				t.Errorf("quitting with %q mid-run did not set aborted", key)
+				t.Errorf("quitting with %q mid-run did not set aborted", k.name)
 			}
 		})
 	}
@@ -113,7 +123,7 @@ func TestQuitWhileRunningMarksAborted(t *testing.T) {
 // not turn a successful run into a non-zero exit.
 func TestQuitAfterFinishIsNotAnAbort(t *testing.T) {
 	m := model{rows: []phaseRow{{title: "one"}}, finished: true}
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	next, _ := m.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
 	if next.(model).aborted {
 		t.Error("quitting after the run finished was treated as an abort")
 	}
