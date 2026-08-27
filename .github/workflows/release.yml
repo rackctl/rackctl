@@ -31,7 +31,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26"
+          go-version: "1.27"
           # No module cache on the release path. This job publishes the binaries operators
           # install, and a poisoned cache entry restored from another workflow would reach
           # the artifact rather than just a test run. A cold build costs a minute.
