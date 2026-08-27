@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/ui"
@@ -162,7 +162,11 @@ func (m model) setRow(ev engine.Event) {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	// A key PRESS, not the tea.KeyMsg interface. That interface is satisfied by key
+	// releases as well, and on a terminal negotiating release reporting the same
+	// keystroke would arrive twice — quitting once and then aborting a run that had
+	// already finished quitting.
+	case tea.KeyPressMsg:
 		if s := msg.String(); s == "ctrl+c" || s == "q" {
 			// Only an abort if the pipeline is still running. Quitting the summary
 			// after it finished is just closing the view, and must not turn a
@@ -205,7 +209,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) View() string {
+func (m model) View() tea.View {
 	var b strings.Builder
 	b.WriteString(ui.Bold.Render(m.title) + "\n\n")
 	for _, r := range m.rows {
@@ -244,5 +248,5 @@ func (m model) View() string {
 		// though it were closing a window.
 		b.WriteString(ui.Gray.Render("  q aborts the run — the platform is left part-provisioned") + "\n")
 	}
-	return b.String()
+	return tea.NewView(b.String())
 }
