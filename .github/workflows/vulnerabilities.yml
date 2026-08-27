@@ -43,7 +43,7 @@ jobs:
       # reach; osv-scanner reads the whole module graph against the OSV database, which
       # catches what reachability analysis prunes but a transitive bump would fix.
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
       - name: osv-scanner
         uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
         with:

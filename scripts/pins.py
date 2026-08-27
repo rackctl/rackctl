@@ -34,10 +34,24 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from gatelib import blank_comment_body  # noqa: E402
+try:
+    from gatelib import blank_comment_body  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - a precondition, not a branch under test
+    # Named rather than raised. A ModuleNotFoundError exits non-zero and so never passes
+    # silently, but it reports a Python identifier where the fact is that this gate was
+    # separated from the helper it shares with the others.
+    print("pins: scripts/gatelib.py is not importable from beside this file; the "
+          "shared comment stripper is missing and no verdict was reached", file=sys.stderr)
+    sys.exit(2)
 import tempfile
 
 REPO = os.environ.get("REPO_ROOT", ".")
+
+# Floors on what was EXAMINED, set WELL UNDER the real counts. "Greater than zero"
+# catches a gate that reached nothing and misses one that reached almost nothing.
+# Sized to fire on "matched almost nothing", so normal growth needs no edit here.
+# Real counts when written: 9 action refs, 11 value pins, 28 modules, 10 files.
+FLOOR = {"action": 4, "value": 4, "gomod": 12, "files": 5}
 
 # Repo-hygiene checks — a dead exemption, a manager matching nothing — are findings about
 # THIS tree, not about whether the gate can reject. They run only against the default root.
@@ -128,11 +142,20 @@ def load_managers(path):
         if unknown:
             die(f"{path}: the customManager for {name} carries {sorted(unknown)}, which "
                 "Renovate does not recognise — most likely a misspelled key")
-        managers.append(Manager(
-            m.get("depNameTemplate", "?"),
-            [renovate_re(p) for p in pats],
-            [to_python_re(s) for s in strings],
-        ))
+        # An expression this cannot read is an ABSENT authority, not a permissive one. The
+        # translation raises where it fails, and the raise names a regex position rather than
+        # the manager it came from — so it is caught and re-stated. Refusing is the only safe
+        # answer: a manager whose rule cannot be applied vouches for nothing, and treating it
+        # as matching nothing would quietly widen the set of pins reported as unwatched while
+        # treating it as matching everything would hide them.
+        try:
+            file_res = [renovate_re(p) for p in pats]
+            match_res = [to_python_re(t) for t in strings]
+        except re.error as e:
+            die(f"{path}: the customManager for {name} carries an expression this cannot "
+                f"read ({e}). Renovate may still accept it, so the two would disagree about "
+                "which pins are watched, and this gate would be the one that is wrong.")
+        managers.append(Manager(m.get("depNameTemplate", "?"), file_res, match_res))
     return cfg, managers
 
 
@@ -444,6 +467,14 @@ def main():
         for p in problems:
             print(f"  {p}", file=sys.stderr)
         sys.exit(1)
+
+    if SCANNING_THE_REPO:
+        low = [f"{k} {counts.get(k, 0)} < floor {v}"
+               for k, v in FLOOR.items() if counts.get(k, 0) < v]
+        if low:
+            print(f"pins: {'; '.join(low)}. A gate that stopped reaching the tree reports "
+                  "the same clean line as one that found every pin watched.", file=sys.stderr)
+            sys.exit(1)
 
     print(f"pins: {counts['action']} action ref(s), {counts['value']} value pin(s), "
           f"{counts['gomod']} module(s) across {counts['files']} scanned file(s) — all watched")

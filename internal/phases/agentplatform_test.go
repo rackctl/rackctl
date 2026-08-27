@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -712,60 +713,126 @@ func TestAgentPlatformComponents_IsTheExactSet(t *testing.T) {
 	}
 }
 
-// And where a real checkout is available, every root must actually resolve.
+// Every root rackctl applies exists in the committed snapshot of the eks-agent-platform tree.
 //
-// This is the only assertion in the file that can catch upstream MOVING or DELETING a root,
-// which is a change to somebody else's repo that no rackctl commit accompanies. The first
-// symptom of one is the phase aborting before it applies anything, and `rackctl plan` cannot
-// surface it — a dry run only prints a note.
+// THIS RUNS EVERYWHERE, including on a runner. Its predecessor read a checkout resolved from
+// $HOME or an env var and skipped when it found none — and a runner never has one, so the
+// only assertion able to catch a root moving or being deleted upstream printed a skip into a
+// green job and asserted nothing in the one place it gates. It had never run at all: no
+// machine here has a checkout under ~/.rackctl either.
 //
-// Skips when no checkout is present rather than failing, since most machines running these tests
-// have never run an install. RACKCTL_AGENT_PLATFORM_CHECKOUT points it at a working clone.
-func TestAgentPlatformComponents_EveryRootResolvesInARealCheckout(t *testing.T) {
-	root := os.Getenv("RACKCTL_AGENT_PLATFORM_CHECKOUT")
-	if root == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			t.Skip("no home directory to look for a checkout in")
-		}
-		// rackctl clones to ~/.rackctl/<org>/eks-agent-platform; the org is not knowable here.
-		matches, _ := filepath.Glob(filepath.Join(home, ".rackctl", "*", "eks-agent-platform"))
-		for _, m := range matches {
-			if _, err := os.Stat(filepath.Join(m, "terraform", "live")); err == nil {
-				root = m
-				break
-			}
-		}
-	}
-	if root == "" {
-		t.Skip("no eks-agent-platform checkout found — set RACKCTL_AGENT_PLATFORM_CHECKOUT to run this")
-	}
-
+// The snapshot is a cache, not a second source of truth.
+// TestAgentPlatformRoots_SnapshotMatchesARealCheckout below compares it against a real tree
+// wherever one resolves, so it cannot drift unnoticed.
+func TestAgentPlatformRoots_EveryRootIsInTheSnapshot(t *testing.T) {
+	snap := loadRootSnapshot(t)
 	st, _ := apState(t)
-	// Check against the environments the checkout actually authors, so this does not fail on a
-	// tree that simply has not grown a staging leaf yet.
-	var envs []config.Environment
-	for _, e := range []config.Environment{config.EnvDev, config.EnvStaging, config.EnvProduction} {
-		if _, err := os.Stat(filepath.Join(root, "terraform", "live", string(e)+"-platform")); err == nil {
-			envs = append(envs, e)
-		}
-	}
-	if len(envs) == 0 {
-		t.Skipf("%s has no <environment>-platform roots; not a tree this test can check", root)
-	}
-
-	for _, env := range envs {
+	checked := 0
+	for _, env := range []config.Environment{config.EnvDev, config.EnvStaging, config.EnvProduction} {
 		st.Config.Environment = env
 		for _, c := range allAPComponents() {
 			dir := agentPlatformDir(st, c)
-			if _, err := os.Stat(filepath.Join(root, dir, "terragrunt.hcl")); err != nil {
-				t.Errorf("%s/terragrunt.hcl does not exist in %s.\n\n"+
+			checked++
+			if !snap[dir] {
+				t.Errorf("%s is not a root in the eks-agent-platform snapshot.\n\n"+
 					"rackctl lists %q, so assertAgentPlatformRoots collects it as missing and a "+
 					"non-dry run returns NoRollbackError — the phase aborts before applying "+
 					"ANYTHING. A dry run only prints a note, so `rackctl plan` would still look fine.",
-					dir, root, c.name)
+					dir, c.name)
 			}
 		}
+	}
+	// An empty snapshot would let every lookup above pass by never being consulted.
+	if checked == 0 || len(snap) == 0 {
+		t.Fatalf("checked %d dirs against %d snapshot entries; a walk that compares nothing "+
+			"reports success over zero checks", checked, len(snap))
+	}
+}
+
+// loadRootSnapshot reads the committed root list, failing rather than skipping if it is gone.
+func loadRootSnapshot(t *testing.T) map[string]bool {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "eks-agent-platform-roots.txt"))
+	if err != nil {
+		t.Fatalf("the eks-agent-platform root snapshot is unreadable: %v.\n\n"+
+			"It is committed precisely so this check does not depend on a checkout existing. "+
+			"A missing snapshot is a failure, never a skip.", err)
+	}
+	out := map[string]bool{}
+	for _, l := range strings.Split(string(b), "\n") {
+		if l = strings.TrimSpace(l); l != "" && !strings.HasPrefix(l, "#") {
+			out[l] = true
+		}
+	}
+	return out
+}
+
+// The snapshot equals what a real checkout authors.
+//
+// This one legitimately needs the external tree, and skips without it — but it now guards a
+// CACHE rather than being the only assertion. Upstream moving or deleting a root is caught
+// here on any machine with a checkout, and by the snapshot test above everywhere else.
+func TestAgentPlatformRoots_SnapshotMatchesARealCheckout(t *testing.T) {
+	root := os.Getenv("RACKCTL_AGENT_PLATFORM_CHECKOUT")
+	if root == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			// rackctl clones to ~/.rackctl/<org>/eks-agent-platform; the org is not knowable here.
+			matches, _ := filepath.Glob(filepath.Join(home, ".rackctl", "*", "eks-agent-platform"))
+			for _, m := range matches {
+				if _, err := os.Stat(filepath.Join(m, "terraform", "live")); err == nil {
+					root = m
+					break
+				}
+			}
+		}
+	}
+	if root == "" {
+		t.Skip("no eks-agent-platform checkout found — set RACKCTL_AGENT_PLATFORM_CHECKOUT to " +
+			"compare the snapshot against a real tree. The snapshot itself is checked by " +
+			"TestAgentPlatformRoots_EveryRootIsInTheSnapshot, which needs no checkout.")
+	}
+
+	var live []string
+	base := filepath.Join(root, "terraform", "live")
+	envs, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatalf("%s is not a tree this test can read: %v", base, err)
+	}
+	for _, e := range envs {
+		if !e.IsDir() {
+			continue
+		}
+		comps, err := os.ReadDir(filepath.Join(base, e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, c := range comps {
+			if !c.IsDir() {
+				continue
+			}
+			rel := filepath.Join("terraform", "live", e.Name(), c.Name())
+			if _, err := os.Stat(filepath.Join(root, rel, "terragrunt.hcl")); err == nil {
+				live = append(live, rel)
+			}
+		}
+	}
+	if len(live) == 0 {
+		t.Fatalf("%s holds no roots with a terragrunt.hcl; comparing against nothing would "+
+			"pass whatever the snapshot says", base)
+	}
+
+	snap := loadRootSnapshot(t)
+	sort.Strings(live)
+	for _, r := range live {
+		if !snap[r] {
+			t.Errorf("%s exists in the checkout and is MISSING from the snapshot — regenerate it", r)
+		}
+		delete(snap, r)
+	}
+	for r := range snap {
+		t.Errorf("%s is in the snapshot and NOT in the checkout — a root was moved or deleted "+
+			"upstream, and rackctl would abort the phase before applying anything", r)
 	}
 }
 

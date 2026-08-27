@@ -84,7 +84,22 @@ check_report() {
     # than one is itself the finding: the entry no longer names exactly one function.
     matches="$(printf '%s\n' "$report" \
       | awk -v f="/$file:" -v n="$func" '$0 ~ f && $(NF-1) == n { gsub(/%/,"",$NF); print $NF }')"
+    # `grep -c .` exits 1 on zero lines, which is a legitimate count of nothing — hence the
+    # `|| true`. But it also exits 127 when grep is absent, and that swallows the difference:
+    # the substitution is then EMPTY rather than a number, `[ "" -gt 1 ]` exits 2 with
+    # "integer expression expected", and an exit of 2 inside an `if` reads as FALSE. The
+    # comparison does not evaluate false; it never happens, and the skip looks like a pass.
+    #
+    # So an operand that is not a number is a REFUSAL. The direction matters more than the
+    # check: defaulting the indeterminate case to 0 would write the defect into the fix,
+    # because 0 reads as a clean count and is exactly the value an absent tool resembles.
     count="$(printf '%s' "$matches" | grep -c . || true)"
+    case "$count" in
+      "" | *[!0-9]*)
+        echo "coverage: could not count profile entries for $file:$func (got ${count:-empty}) — no verdict was reached about whether the entry names exactly one function" >&2
+        status=1
+        continue ;;
+    esac
     if [ "$count" -gt 1 ]; then
       echo "coverage: $file:$func matches $count entries in the profile ($(printf '%s' "$matches" | tr '\n' ' ')) — the entry no longer names exactly one function, so which one is measured is arbitrary" >&2
       status=1
@@ -162,11 +177,25 @@ self_test() {
         return
       fi
     fi
-    if printf '%s\n' "$2" | check_report >/dev/null 2>&1; then
+    # The output is KEPT, not discarded. A rejection for an unrelated reason exits non-zero
+    # exactly like the right one, so a control reading only the status scores any failure as
+    # a catch — including a crash. Requiring the rejection to NAME what was planted closes
+    # the gap between "it failed" and "it found the thing".
+    # What the rejection must NAME is not always what the mutation PLANTED. A mutation that
+    # works by removal — moving an entry out of the gate's view — is caught by the gate
+    # naming what went MISSING, and that string is necessarily in the clean fixture, so it
+    # cannot double as the planted marker. $4 names it where the two differ.
+    expect="${4:-$3}"
+    out="$(printf '%s\n' "$2" | check_report 2>&1)" && rejected=0 || rejected=1
+    if [ "$rejected" = "0" ]; then
       echo "control: $1 was ACCEPTED — this gate cannot reject" >&2
       ok=1
+    elif [ -n "$expect" ] && ! printf '%s\n' "$out" | grep -q -- "$expect"; then
+      echo "control: $1 rejected WITHOUT naming $expect — a rejection for an unrelated reason, or a crash, looks identical here" >&2
+      printf '%s\n' "$out" >&2
+      ok=1
     else
-      echo "control: $1 rejected"
+      echo "control: $1 rejected, naming $expect"
     fi
   }
 
@@ -199,13 +228,14 @@ self_test() {
   expect_reject "an entry matching more than one function" \
     "$(printf '%s\n' "$passing" \
       | awk '$(NF-1) == "Proves" && !done { print; sub(/100\.0%/, "31.41%"); done=1 } { print }')" \
-    "31.41%"
+    "31.41"
 
   # A same-named function in another file must not satisfy the entry it is not.
   expect_reject "a same-named function standing in from the wrong file" \
     "$(printf '%s\n' "$passing" \
       | sed 's|rackctl/internal/reap/own.go:1:\tProves|rackctl/internal/rackctl-ctl-elsewhere/other.go:1:\tProves|')" \
-    "rackctl-ctl-elsewhere"
+    "rackctl-ctl-elsewhere" \
+    "internal/reap/own.go:Proves"
 
   [ "$ok" -eq 0 ] && echo "control: coverage gate can reject"
   return "$ok"
@@ -227,6 +257,13 @@ fi
 # Controls first, always.
 self_test || exit 1
 [ "${1:-}" = "--controls-only" ] && exit 0
+
+# Preconditions asserted before anything is run, so a failure names what is missing rather
+# than surfacing as whatever the tool says about it. `go test` in a directory with no module
+# reports "directory prefix . does not contain main module", which is a true sentence about
+# go and tells the reader nothing about this gate.
+command -v go >/dev/null 2>&1 || { echo "coverage: go is not installed; no verdict was reached" >&2; exit 2; }
+[ -f go.mod ] || { echo "coverage: no go.mod here; this gate measures THIS module and was run somewhere else" >&2; exit 2; }
 
 go test -coverprofile="$PROFILE" -covermode=set ./... >/dev/null
 

@@ -38,7 +38,16 @@ jobs:
           go-version: "1.27"
           cache: true
       - name: gofmt
-        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+        # `test -z "$(gofmt -l .)"` reads an ABSENT gofmt as a clean tree: the substitution
+        # is empty either way, and empty is the passing value. The tool is required to
+        # produce an answer before the answer is believed.
+        run: |
+          command -v gofmt >/dev/null || { echo "gofmt is not installed; no verdict" >&2; exit 2; }
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "$out" >&2
+            exit 1
+          fi
       - run: go vet ./...
       # A step of `build` rather than a job of its own, deliberately: protect-main requires the
       # `build` context, so putting lint here makes it enforced immediately. A separate job would
@@ -53,9 +62,66 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.12.2
+          version: v2.13.1
       - run: go build ./...
-      - run: go test -race ./...
+      - name: terragrunt, opentofu and goreleaser
+        # Installed so the argv contract test RUNS here. Without them it skips, and a skip
+        # prints into a green job: every other terragrunt assertion in this repo checks the
+        # argv rackctl produces against a fake on PATH, which proves rackctl agrees with
+        # itself and nothing more. RACKCTL_REQUIRE_TOOL_CONTRACTS on the test step
+        # turns that skip into a failure, so this step cannot quietly stop covering it.
+        env:
+          TERRAGRUNT_VERSION: v1.1.3
+          TOFU_VERSION: 1.12.6
+          GORELEASER_VERSION: v2.18.0
+        run: |
+          # Verified against the publishers' own SHA256SUMS, not merely pinned by version.
+          # These write executables onto PATH, and a tag can be moved. Read from the
+          # published sums file rather than a hash committed here, so a Renovate bump does
+          # not have to carry a hash it cannot compute.
+          # Downloaded under the names the sums files use. `sha256sum -c` reads the NAME out
+          # of each line and opens that path, so renaming on the way down makes it look for a
+          # file that is not there — a failure that reads like a bad checksum.
+          tg=terragrunt_linux_amd64
+          tofu_zip=tofu_${TOFU_VERSION}_linux_amd64.zip
+
+          base=https://github.com/gruntwork-io/terragrunt/releases/download/$TERRAGRUNT_VERSION
+          curl -fsSL -o "$tg" "$base/$tg"
+          curl -fsSL -o tg.sums "$base/SHA256SUMS"
+          grep " $tg\$" tg.sums | sha256sum -c -
+          sudo install -m 0755 "$tg" /usr/local/bin/terragrunt
+
+          base=https://github.com/opentofu/opentofu/releases/download/v$TOFU_VERSION
+          curl -fsSL -o "$tofu_zip" "$base/$tofu_zip"
+          curl -fsSL -o tofu.sums "$base/tofu_${TOFU_VERSION}_SHA256SUMS"
+          grep " $tofu_zip\$" tofu.sums | sha256sum -c -
+          unzip -q "$tofu_zip" tofu
+          sudo install -m 0755 tofu /usr/local/bin/tofu
+
+          # goreleaser the same way, and NOT via its action: the action publishes runtime
+          # artifacts, which makes the module cache this job restores a poisoning path into
+          # a release. `go install` is not open either — that module needs a newer Go than
+          # this job pins, and the toolchain pin is deliberate.
+          gr=goreleaser_Linux_x86_64.tar.gz
+          base=https://github.com/goreleaser/goreleaser/releases/download/$GORELEASER_VERSION
+          curl -fsSL -o "$gr" "$base/$gr"
+          curl -fsSL -o gr.sums "$base/checksums.txt"
+          grep " $gr\$" gr.sums | sha256sum -c -
+          tar -xzf "$gr" goreleaser
+          sudo install -m 0755 goreleaser /usr/local/bin/goreleaser
+
+          rm -f "$tg" tg.sums tofu "$tofu_zip" tofu.sums "$gr" gr.sums goreleaser
+          terragrunt --version
+          tofu version
+          goreleaser --version
+      - name: test
+        env:
+          # A tool-contract test may not SKIP here. Skipping prints into a green job, and
+          # the terragrunt contract test is the only one in this repo that reaches the real
+          # tool — every other terragrunt assertion checks rackctl against a fake on PATH,
+          # which proves rackctl agrees with itself. See terragrunt_contract_test.go.
+          RACKCTL_REQUIRE_TOOL_CONTRACTS: "1"
+        run: go test -race ./...
       # A coverage floor that nothing gates on is a number, not a guarantee: it falls
       # silently, and it falls fastest in the code least pleasant to test — which here is
       # the code that terminates instances and deletes roles. Runs as a step of `build`
@@ -95,10 +161,24 @@ jobs:
         # entitled to a bash-4 builtin. A #!/bin/bash script added later would need its own
         # check against the oldest bash it must run on — macOS ships 3.2.
         run: |
-          if grep -lE '^#!.*\bbash\b' scripts/*.sh; then
-            echo "a bash script was added; shellcheck does not check bash VERSIONS" >&2
-            exit 1
-          fi
+          # grep has FOUR answers — 0 match, 1 definite no-match, 2 unreadable file, 127 not
+          # installed — and an `if` has two. Written as `if grep …; then fail; fi`, every
+          # status above 1 lands in the no-match branch and the guard deletes itself: an
+          # absent grep or a single unreadable script would pass this step silently. Both
+          # were reproduced. So the DEFINITE outcome is required and anything else names its
+          # status.
+          rc=0
+          hits=$(grep -lE '^#!.*\bbash\b' scripts/*.sh) || rc=$?
+          case "$rc" in
+            0)
+              echo "a bash script was added; shellcheck does not check bash VERSIONS: $hits" >&2
+              exit 1 ;;
+            1) ;;
+            *)
+              echo "grep exited $rc scanning scripts/*.sh — not a definite no-match, so this" >&2
+              echo "step reached no verdict about bash scripts" >&2
+              exit 2 ;;
+          esac
       - name: posix shell
         run: |
           # /bin/sh on ubuntu-latest IS dash. Asserted rather than assumed: if the runner
@@ -107,11 +187,59 @@ jobs:
           # BASH_VERSION are checked — a shell named dash that is really bash would pass the
           # first test alone.
           readlink -f /bin/sh | grep -q dash
-          [ -z "$(/bin/sh -c 'echo ${BASH_VERSION-}')" ]
+          # The probe prints a SENTINEL, so an empty result cannot be read as a pass. Testing
+          # `-z "$(/bin/sh -c 'echo ${BASH_VERSION-}')"` alone treats a /bin/sh that could not
+          # run at all as proof that it is dash — emptiness is the passing value there. It
+          # held only because the readlink above exits non-zero first and ends the step, and
+          # A PROPERTY THAT DEPENDS ON LINE ORDER IS NOT A PROPERTY, it is an arrangement:
+          # reorder these two and the door opens with nothing failing.
+          probe=$(/bin/sh -c 'printf "ran:%s" "${BASH_VERSION-}"')
+          case "$probe" in
+            ran:) ;;
+            ran:*) echo "/bin/sh reports BASH_VERSION=${probe#ran:}; it is bash, not dash, so" >&2
+                   echo "this step would test bash-isms against bash and pass them" >&2
+                   exit 1 ;;
+            *)     echo "/bin/sh produced no sentinel, so it did not run; no verdict about" >&2
+                   echo "which shell this is was reached" >&2
+                   exit 2 ;;
+          esac
           # RUN, do not parse. `sh -n` is a syntax check: dash -n accepts [[ ]], mapfile,
           # `declare -A` and case-modification expansion. Only executing rejects them.
           /bin/sh ./scripts/install_test.sh
           /bin/sh ./scripts/coverage.sh --controls-only
+      - name: release config
+        env:
+          NO_COLOR: "1"
+        # The release path was config-read-only: nothing ever ran goreleaser, so a config
+        # that had stopped producing binaries would surface at tag time.
+        #
+        # `check` is not run bare, because it exits 2 on a deprecation this repo takes
+        # deliberately — `brews` over `homebrew_casks`, since casks are macOS-only and this
+        # binary ships for Linux too. A gate permanently red for a decision already made
+        # teaches people to bypass it. So the DEPRECATED set is compared against the one
+        # entry that is expected: a NEW deprecation fails, and `brews` being REMOVED
+        # upstream fails too, which is exactly the trigger .goreleaser.yaml says to revisit
+        # this on.
+        run: |
+          goreleaser build --snapshot --clean --single-target
+          # In an `if` condition, so a non-zero status does not end the step under `set -e`
+          # and does not need a soft-fail idiom to survive. The status is not the verdict
+          # here — the set of deprecations is.
+          if goreleaser check > check.out 2>&1; then
+            echo "goreleaser check exited 0; the deprecation set below decides this step"
+          fi
+          # ANSI stripped before matching. goreleaser colours its output on a runner even
+          # though it is not a terminal, so the word this looks for arrives wrapped in escape
+          # sequences and a pattern anchored on DEPRECATED: followed by a letter matches
+          # nothing. NO_COLOR is set as well; the strip is what makes this independent of
+          # whether the tool honours it.
+          got=$(tr -d '\033' < check.out | sed 's/\[[0-9;]*m//g' \
+                | grep -oE 'DEPRECATED:[[:space:]]+[a-z_]+' | awk '{print $2}' | sort -u | tr '\n' ' ')
+          if [ "$got" != "brews " ]; then
+            echo "goreleaser check reported deprecations [$got], expected [brews ]" >&2
+            cat check.out >&2
+            exit 1
+          fi
       - name: gate floor
         run: python3 ./scripts/floor.py
       # Every version the repo pins is matched by a Renovate manager. Asserted rather than

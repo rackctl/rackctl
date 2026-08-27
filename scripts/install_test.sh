@@ -32,6 +32,15 @@ if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum 
 # curl stub: -o NAME URL serves the basename out of $WORK/serve.
 cat > "$WORK/stub/curl" <<'STUB'
 #!/bin/sh
+# The release API is answered from API_STATUS/API_BODY so the `latest` path can be driven
+# through each of its outcomes. API_STATUS empty means "not being tested" and the API is not
+# consulted at all.
+case "$*" in
+  *api.github.com*)
+    [ -n "$API_CURL_RC" ] && exit "$API_CURL_RC"
+    printf '%s\n%s\n' "$API_BODY" "$API_STATUS"
+    exit 0 ;;
+esac
 out=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -65,7 +74,14 @@ echo "install_test: a valid release installs and reports its version"
 rm -f "$WORK/bin/rackctl"
 cp "$TARBALL" "$WORK/good.tar.gz"
 printf 'tampered' >> "$TARBALL"
-cmp -s "$TARBALL" "$WORK/good.tar.gz" && fail "control 2: the tamper did not change the tarball"
+# Sizes, not `cmp`. `cmp -s A B && fail ...` fails OPEN: with cmp absent the command exits
+# 127, the && short-circuits, and the check that the tamper LANDED is silently skipped —
+# which is the exact failure this line was added to catch, since a mutation that does not
+# mutate makes control 2 pass having tampered with nothing. Compared this way an absent `wc`
+# leaves both sides empty, the inequality is false, and the guard fires.
+before="$(wc -c < "$WORK/good.tar.gz")"
+after="$(wc -c < "$TARBALL")"
+[ "$before" != "$after" ] || fail "control 2: the tamper did not change the tarball (before=$before after=$after)"
 if run_installer; then cat "$WORK/out" >&2; fail "control 2: a tampered tarball INSTALLED"; fi
 grep -q "checksum verification failed" "$WORK/out" || { cat "$WORK/out" >&2; fail "control 2: rejected without naming the checksum"; }
 [ ! -e "$WORK/bin/rackctl" ] || fail "control 2: rejected but installed anyway"
@@ -81,4 +97,54 @@ if run_installer; then cat "$WORK/out" >&2; fail "control 3: an empty checksums.
 grep -q "checksum verification failed" "$WORK/out" || { cat "$WORK/out" >&2; fail "control 3: rejected for the wrong reason"; }
 echo "install_test: an absent checksum line is rejected rather than read as a match"
 
-echo "install_test: 3 controls passed under $SELF_SHELL"
+# --- the `latest` path: four outcomes, three of which are not "a release exists" ---
+#
+# Every control above pins RACKCTL_VERSION, so none of them ever reached the block that
+# resolves `latest`. That is how a transient fetch failure came to be read as "this project
+# publishes no binaries", downgrading the operator to an unverified source build with exit 0.
+latest() {
+  rm -f "$WORK/bin/rackctl"
+  # Status captured explicitly. Under `set -e`, dash aborts a function called inside a
+  # command substitution the moment a command fails, so `rc=$?` on the next line never runs
+  # and the control that EXPECTS a failure never gets to see it — while bash reaches it. The
+  # controls below all expect non-zero, so on dash the harness died at the first one.
+  rc=0
+  API_CURL_RC="$2" API_STATUS="$3" API_BODY="$4" \
+  PATH="$WORK/stub:$PATH" RACKCTL_INSTALL_DIR="$WORK/bin" \
+    "$SELF_SHELL" ./scripts/install.sh > "$WORK/out" 2>&1 || rc=$?
+  echo "$rc"
+}
+
+# Control 3 emptied checksums.txt to test the absent-entry branch and each control owns its
+# own setup, so it is regenerated here rather than left for the next control to trip over.
+( cd "$WORK/serve" && $SHA ./*.tar.gz | sed 's| \./| |' > checksums.txt )
+
+export SERVE
+printf '#!/bin/sh\necho "SOURCE BUILD" >&2\nexit 0\n' > "$WORK/stub/go"
+chmod +x "$WORK/stub/go"
+
+# 4: the API answers 200 and names a tag -> that release installs, checksum path reached
+rc=$(latest "" "" "200" "{\"tag_name\": \"v0.0.0-test\"}")
+[ "$rc" = "0" ] || { cat "$WORK/out" >&2; fail "control 4: a 200 with a tag did not install"; }
+grep -q "verifying checksum" "$WORK/out" || { cat "$WORK/out" >&2; fail "control 4: the checksum path was not reached"; }
+echo "install_test: a resolvable latest release installs, reaching the checksum path"
+
+# 5: the API answers 404 -> this repo genuinely publishes nothing, source build is correct
+rc=$(latest "" "" "404" "{\"message\": \"Not Found\"}")
+grep -q "SOURCE BUILD" "$WORK/out" || { cat "$WORK/out" >&2; fail "control 5: a genuine 404 did not fall back to source"; }
+echo "install_test: a 404 falls back to a source build, which is the one case that warrants it"
+
+# 6: the API answers 403 -> a RATE LIMIT is transient and must NOT downgrade
+rc=$(latest "" "" "403" "{\"message\": \"rate limit exceeded\"}")
+[ "$rc" != "0" ] || { cat "$WORK/out" >&2; fail "control 6: a rate-limited API exited 0"; }
+grep -q "SOURCE BUILD" "$WORK/out" && { cat "$WORK/out" >&2; fail "control 6: a rate limit DOWNGRADED the operator to an unverified source build"; }
+grep -qi "transient" "$WORK/out" || { cat "$WORK/out" >&2; fail "control 6: rejected without telling the operator the failure is transient"; }
+echo "install_test: a rate-limited API refuses rather than downgrading, and says it is transient"
+
+# 7: curl itself fails -> offline or DNS, same requirement
+rc=$(latest "" "6" "" "")
+[ "$rc" != "0" ] || { cat "$WORK/out" >&2; fail "control 7: an unreachable API exited 0"; }
+grep -q "SOURCE BUILD" "$WORK/out" && { cat "$WORK/out" >&2; fail "control 7: an unreachable API DOWNGRADED the operator to an unverified source build"; }
+echo "install_test: an unreachable API refuses rather than downgrading"
+
+echo "install_test: 7 controls passed under $SELF_SHELL"
