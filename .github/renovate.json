@@ -1,144 +1,19 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "config:recommended"
+  "description": [
+    "Extends the org preset, which carries the release-age floor, the automerge stance, the CVE opt-out and the shared grouping rules. Only what is specific to this repository stays here.",
+    "Rules here are appended AFTER the preset's and later rules win, so nothing below may set automerge or minimumReleaseAge without meaning to override the org posture for every package it matches."
   ],
-  "labels": [
-    "dependencies"
-  ],
-  "postUpdateOptions": [
-    "gomodTidy"
-  ],
-  "packageRules": [
-    {
-      "description": "Action pins are SHAs. Renovate reads the adjacent version comment to know what the SHA currently is, and rewrites both together.",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "pinDigests": true
-    },
-    {
-      "description": "The Go toolchain moves as one. go.mod, both workflows and the toolchain directive have to agree, or a clean local run stops predicting a clean CI run.",
-      "matchPackageNames": [
-        "go",
-        "golang"
-      ],
-      "groupName": "go toolchain"
-    }
-  ],
+  "extends": ["github>rackctl/.github"],
+  "postUpdateOptions": ["gomodTidy"],
   "customManagers": [
     {
       "description": "The Go version both workflows install. Native managers do not read setup-go's input, so without this the CI toolchain silently diverges from go.mod. Scoped to any workflow rather than one filename: a manager pinned to a single file stops watching the moment the step it covers moves, which is silent.",
       "customType": "regex",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "go-version:\\s*\"(?<currentValue>\\d+\\.\\d+(\\.\\d+)?)\""
-      ],
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": ["go-version:\\s*\"(?<currentValue>\\d+\\.\\d+(\\.\\d+)?)\""],
       "depNameTemplate": "go",
-      "datasourceTemplate": "golang-version",
-      "versioningTemplate": "npm"
-    },
-    {
-      "description": "golangci-lint's own version, which is an input to the action rather than the action's tag. Pinned to what Homebrew ships so a clean local run means a clean CI run \u2014 and that only holds while something watches it. Scoped to any workflow rather than one filename: a manager pinned to a single file stops watching the moment the step it covers moves, which is silent.",
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "version:\\s*(?<currentValue>v\\d+\\.\\d+\\.\\d+)\\s*$"
-      ],
-      "depNameTemplate": "golangci/golangci-lint",
-      "datasourceTemplate": "github-releases"
-    },
-    {
-      "description": "govulncheck, pinned in a `go run` line. No manager reads an inline module@version in a shell command. Scoped to any workflow rather than one filename: a manager pinned to a single file stops watching the moment the step it covers moves, which is silent.",
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "golang\\.org/x/vuln/cmd/govulncheck@(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
-      ],
-      "depNameTemplate": "golang.org/x/vuln",
-      "datasourceTemplate": "go"
-    },
-    {
-      "description": "zizmor, pinned in the pip install that provides the workflow audit. An unwatched security gate is one that stops catching what its newer rules would. Scoped to any workflow rather than one filename: a manager pinned to a single file stops watching the moment the step it covers moves, which is silent.",
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "zizmor==(?<currentValue>\\d+\\.\\d+\\.\\d+)"
-      ],
-      "depNameTemplate": "zizmor",
-      "datasourceTemplate": "pypi"
-    },
-    {
-      "description": "goreleaser's own version constraint, an input to the action rather than its tag. Scoped to any workflow rather than one filename: a manager pinned to a single file stops watching the moment the step it covers moves, which is silent.",
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "version:\\s*\"~>\\s*(?<currentValue>v\\d+)\""
-      ],
-      "depNameTemplate": "goreleaser/goreleaser",
-      "datasourceTemplate": "github-releases",
-      "versioningTemplate": "loose"
-    },
-    {
-      "description": "The Kubernetes version rackctl defaults to and the example config shows. A minor goes EOL on a schedule nobody in this repo controls, and an installer defaulting to an EOL version is a version-currency no-eol-runtimes reject \u2014 so it is watched rather than left to be noticed.",
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^examples/rackctl\\.ya?ml$/",
-        "/^internal/config/config\\.go$/"
-      ],
-      "matchStrings": [
-        "(?:cluster_)?[Vv]ersion:?\\s*[\"'](?<currentValue>\\d+\\.\\d+)[\"']"
-      ],
-      "depNameTemplate": "kubernetes",
-      "datasourceTemplate": "endoflife-date",
-      "versioningTemplate": "loose"
-    },
-    {
-      "customType": "regex",
-      "description": "terragrunt, installed in CI so the argv contract test reaches the real tool. An env: value in a workflow, which no native manager reads.",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "TERRAGRUNT_VERSION:\\s*(?<currentValue>v[\\d.]+)"
-      ],
-      "datasourceTemplate": "github-releases",
-      "depNameTemplate": "gruntwork-io/terragrunt"
-    },
-    {
-      "customType": "regex",
-      "description": "OpenTofu, the engine terragrunt drives. Pinned without the leading v because the release asset names embed the bare version.",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "TOFU_VERSION:\\s*(?<currentValue>[\\d.]+)"
-      ],
-      "datasourceTemplate": "github-releases",
-      "depNameTemplate": "opentofu/opentofu",
-      "extractVersionTemplate": "^v(?<version>.*)$"
-    },
-    {
-      "customType": "regex",
-      "description": "goreleaser, installed in CI so the release config is built rather than only read. An env: value in a workflow, which no native manager reads.",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "GORELEASER_VERSION:\\s*(?<currentValue>v[\\d.]+)"
-      ],
-      "datasourceTemplate": "github-releases",
-      "depNameTemplate": "goreleaser/goreleaser"
+      "datasourceTemplate": "golang-version"
     }
   ]
 }
