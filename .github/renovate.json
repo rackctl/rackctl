@@ -1,30 +1,15 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "config:recommended"
+  "description": [
+    "Extends the org preset, which carries the release-age floor, the automerge stance, the CVE opt-out and the shared grouping rules. Only what is specific to this repository stays here.",
+    "ORDERING HAZARD: rules here are appended AFTER the preset's and later rules win, so nothing below may set automerge or minimumReleaseAge without meaning to override the org posture for every package it matches.",
+    "The custom managers are load-bearing rather than decorative: `renovate pin coverage` asserts that every version pin in a workflow has a manager watching it, and fails naming the file and line when one does not. A pin no manager matches is a version that silently stops being updated."
   ],
-  "labels": [
-    "dependencies"
+  "extends": [
+    "github>rackctl/.github"
   ],
   "postUpdateOptions": [
     "gomodTidy"
-  ],
-  "packageRules": [
-    {
-      "description": "Action pins are SHAs. Renovate reads the adjacent version comment to know what the SHA currently is, and rewrites both together.",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "pinDigests": true
-    },
-    {
-      "description": "The Go toolchain moves as one. go.mod, both workflows and the toolchain directive have to agree, or a clean local run stops predicting a clean CI run.",
-      "matchPackageNames": [
-        "go",
-        "golang"
-      ],
-      "groupName": "go toolchain"
-    }
   ],
   "customManagers": [
     {
