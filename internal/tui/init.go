@@ -135,7 +135,11 @@ func abort(cancel context.CancelFunc, events chan engine.Event, done chan error)
 	}()
 
 	select {
-	case <-done:
+	case err := <-done:
+		// After the cancel above, Run's error describes the interruption, not the
+		// platform. ErrAborted is what tells the operator the platform's state and
+		// what to run next, so the engine's error is dropped here.
+		_ = err
 	case <-time.After(abortGrace):
 	}
 	return ErrAborted
