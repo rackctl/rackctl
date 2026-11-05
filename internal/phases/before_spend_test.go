@@ -170,6 +170,32 @@ func TestUnmappedKeys_EveryLevelAndKeysOnly(t *testing.T) {
 	}
 }
 
+// A queue's tuning reaches the variable under the names var.tenants declares. Without a
+// mapping the keys passed through in camelCase and the queue was built with the defaults.
+func TestToSnake_AQueueKeepsItsTuning(t *testing.T) {
+	d := map[string]any{
+		"kind": "queue",
+		"queue": map[string]any{
+			"fifo":                     true,
+			"visibilityTimeoutSeconds": 120,
+			"messageRetentionSeconds":  86400,
+			"maxReceiveCount":          5,
+		},
+	}
+	if got := unmappedKeys(d, "spec.datastores[0]"); got != nil {
+		t.Fatalf("every queue key is mapped, but these were reported: %v", got)
+	}
+	q, _ := toSnake(d)["queue"].(map[string]any)
+	for k, want := range map[string]any{
+		"fifo": true, "visibility_timeout_seconds": 120,
+		"message_retention_seconds": 86400, "max_receive_count": 5,
+	} {
+		if q[k] != want {
+			t.Errorf("queue.%s = %v, want %v (got %v)", k, q[k], want, q)
+		}
+	}
+}
+
 // The outputs phase 6 cannot run without are asserted where they are produced. Found in
 // phase 6, a missing one cost the substrate and the GitOps phases first.
 func TestClusterPhase_AMissingRequiredOutputFailsWhereItIsProduced(t *testing.T) {
