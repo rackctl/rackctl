@@ -52,7 +52,7 @@ var componentGateRemedy = map[string]string{
 // missing root is added upstream. Statting what is actually there keeps working either
 // way.
 //
-// Every failure is wrapped in engine.NoRollbackError, and that is load-bearing rather
+// Every failure is a refusal (engine.Refuse, a NoRollbackError), and that is load-bearing rather
 // than defensive. This guard's entire premise is that NOTHING has been provisioned yet,
 // so there is nothing for a rollback to reclaim — but the engine's teardown is not a
 // no-op on an empty run. It runs `kubectl delete platforms|tenants|nodeclaims|pvc --all -A`
@@ -109,14 +109,14 @@ func assertComponentRoots(st *engine.State) error {
 	regionRoot := filepath.Join(st.Repos.LandingZone, "live", "aws",
 		"workload-"+string(st.Config.Environment), st.Config.Cloud.Region)
 	if _, err := os.Stat(regionRoot); err != nil {
-		return &engine.NoRollbackError{Err: fmt.Errorf(
+		return engine.Refuse(fmt.Errorf(
 			"landing-zone's live tree carries no roots at all for %s / %s:\n  %s\n\n"+
 				"Every component would fail, starting with %q. landing-zone authors its live tree per "+
 				"account, region and environment, and this combination has no leaves — so this is a "+
 				"cloud.region (or environment) that landing-zone does not yet cover, not a component "+
 				"problem. Either point cloud.region at a region the tree carries, or add the tree upstream. "+
 				"Nothing has been provisioned, and nothing will be torn down",
-			st.Config.Environment, st.Config.Cloud.Region, regionRoot, c)}
+			st.Config.Environment, st.Config.Cloud.Region, regionRoot, c))
 	}
 
 	remedy, gated := componentGateRemedy[c]
@@ -129,7 +129,7 @@ func assertComponentRoots(st *engine.State) error {
 			c, st.Repos.LandingZone)
 	}
 
-	return &engine.NoRollbackError{Err: fmt.Errorf(
+	return engine.Refuse(fmt.Errorf(
 		"landing-zone has no live root for the %q component in the %s environment (%s):\n  %s\n\n"+
 			"rackctl applies that component with `terragrunt --working-dir <path> init`, and terragrunt exits 1 "+
 			"immediately on a directory with no terragrunt.hcl. That failure would land in the substrate phase — "+
@@ -137,7 +137,7 @@ func assertComponentRoots(st *engine.State) error {
 			"then tear both back down, so a missing live root costs a full provision AND a full teardown. It is "+
 			"caught here instead, one phase after the clone and before anything is provisioned.\n\n%s",
 		c, st.Config.Environment, st.Config.Cloud.Region,
-		filepath.Join(st.Repos.LandingZone, componentDir(st, c), "terragrunt.hcl"), tail)}
+		filepath.Join(st.Repos.LandingZone, componentDir(st, c), "terragrunt.hcl"), tail))
 }
 
 // missingRoots returns the components with no terragrunt.hcl under the checkout, in

@@ -20,7 +20,15 @@ package engine
 //
 // A phase returning this says: the cloud is provisioned, something on it has not
 // settled, leave it standing and let `rackctl check` say what.
-type NoRollbackError struct{ Err error }
+//
+// BeforeSpend says more: the phase refused before anything was provisioned. The run touched
+// nothing, so the outcome is a refusal rather than a platform left up, whether or not a
+// platform was standing when the run began and whether or not the run could tell. Refuse
+// builds one.
+type NoRollbackError struct {
+	Err         error
+	BeforeSpend bool
+}
 
 func (e *NoRollbackError) Error() string { return e.Err.Error() }
 func (e *NoRollbackError) Unwrap() error { return e.Err }

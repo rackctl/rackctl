@@ -87,7 +87,7 @@ that returns `engine.NoRollbackError` is opting into this; anything else rolls b
 - [`docs/runbook.md`](docs/runbook.md) — what to do when an install, check or teardown goes
   wrong: whether the rollback ran, the failures that recur, and what rackctl deliberately
   leaves behind
-- [`docs/exit-codes.md`](docs/exit-codes.md) — the nine exit statuses and the
+- [`docs/exit-codes.md`](docs/exit-codes.md) — the eleven exit statuses and the
   `check --output json` shape
 - [`.env.example`](.env.example) — every environment variable rackctl reads
 - [`examples/rackctl.yaml`](examples/rackctl.yaml) — the full config surface, annotated

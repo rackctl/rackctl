@@ -164,6 +164,10 @@ func TestAssertComponentRoots_FailureMustNotRollBack(t *testing.T) {
 			"failure sweeps account-wide IAM roles and kubectl-deletes every Platform on whatever "+
 			"cluster the kubeconfig points at, none of which this run created; got %T", err)
 	}
+	if !noRollback.BeforeSpend {
+		t.Error("the guard fires before anything is provisioned and must say so, or a first install " +
+			"that stops here exits platform-left-standing over a platform that does not exist")
+	}
 }
 
 // A region landing-zone has no live tree for is a different diagnosis from a component

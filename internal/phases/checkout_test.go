@@ -84,6 +84,9 @@ func TestPinnedCheckoutRefusesToDiscardLocalEdits(t *testing.T) {
 	var noRollback *engine.NoRollbackError
 	if !errors.As(err, &noRollback) {
 		t.Errorf("err = %T, want NoRollbackError — a dirty checkout is not a reason to tear down cloud", err)
+	} else if !noRollback.BeforeSpend {
+		t.Error("the refusal fires before anything is spent and must say so, or a first install that " +
+			"stops here exits platform-left-standing over a platform that does not exist")
 	}
 	if got, _ := os.ReadFile(edit); string(got) != "operator's unblocking fix\n" {
 		t.Errorf("the operator's edit was destroyed: %q", got)

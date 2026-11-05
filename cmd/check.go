@@ -13,6 +13,7 @@ import (
 
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/doctor"
+	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/preflight"
 	"github.com/rackctl/rackctl/internal/ui"
@@ -138,41 +139,98 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		// repoints because it is about to act; a diagnostic must not rewrite the
 		// operator's kubeconfig as a side effect of being run.
 		say()
-		switch got, err := currentKubeCluster(ctx, run); {
-		case err != nil || got == "":
-			clusterState = "unreachable"
-			say(ui.Step("no reachable cluster — platform health not asserted (nothing is provisioned yet, " +
-				"or this shell is not pointed at it)"))
-		case got != cfg.ClusterName():
+		// Three verdicts, kept apart because they call for different next moves: the
+		// platform is unhealthy or its health could not be asserted against a cluster that
+		// exists, the install would not succeed, or check could not find out.
+		preflightFailed := failed
+		var unhealthy, undetermined bool
+		// Whether EKS has this config's cluster, when check had to ask: "absent", "present"
+		// or "unknown". A reachable cluster is "present" without asking.
+		var clusterExists string
+		exists := func() engine.PlatformState {
+			st := engine.PlatformExists(ctx, &engine.State{Config: cfg, Runner: run})
+			clusterExists = existsToken(st)
+			return st
+		}
+		switch entry, err := currentKubeCluster(ctx, run); {
+		case err != nil || entry == "":
+			// A shell with no kubeconfig entry for the cluster cannot tell "nothing is
+			// provisioned yet" from "this shell is not pointed at it". EKS can, so it is
+			// asked, and only the first is a pass.
+			switch exists() {
+			case engine.PlatformAbsent:
+				clusterState = "unreachable"
+				say(ui.Step("no cluster named " + cfg.ClusterName() + " in EKS yet — platform health not asserted"))
+			case engine.PlatformPresent:
+				clusterState = "unreachable"
+				unhealthy = true
+				say(ui.Fail(fmt.Sprintf(
+					"%s exists in EKS but this shell cannot reach it — platform health NOT asserted. "+
+						"Run `aws eks update-kubeconfig --name %s --region %s --profile %s` to check it.",
+					cfg.ClusterName(), cfg.ClusterName(), cfg.Cloud.Region, cfg.Cloud.Profile)))
+			default:
+				clusterState = "not-asserted"
+				undetermined = true
+				say(ui.Warn("no reachable cluster, and EKS could not say whether " + cfg.ClusterName() +
+					" exists — platform health NOT asserted. Fix the credentials or connectivity and re-run."))
+			}
+		case kubeClusterMismatch(entry, cfg) != "":
 			clusterState = "wrong-cluster"
+			unhealthy = true
+			exists()
 			say(ui.Warn(fmt.Sprintf(
-				"kubectl is pointed at %q but this config is for %q — platform health NOT asserted. "+
+				"%s — platform health NOT asserted. "+
 					"Run `aws eks update-kubeconfig --name %s --region %s --profile %s` to check this one.",
-				got, cfg.ClusterName(), cfg.ClusterName(), cfg.Cloud.Region, cfg.Cloud.Profile)))
-			failed = true
+				kubeClusterMismatch(entry, cfg), cfg.ClusterName(), cfg.Cloud.Region, cfg.Cloud.Profile)))
 		default:
 			clusterState = "asserted"
+			clusterExists = existsToken(engine.PlatformPresent)
 			say(ui.OK("cluster reachable — asserting platform health"))
 			health = doctor.Run(ctx, &doctor.Env{Cfg: cfg, Run: run})
 			if checkOutput == "text" {
 				printResults(health)
 			}
-			failed = failed || doctor.Failed(health)
+			unhealthy = doctor.Failed(health)
 		}
+		failed = preflightFailed || unhealthy || undetermined
 
 		if checkOutput == "json" {
-			if err := emitCheckJSON(cfg, clusterState, results, health, failed); err != nil {
+			doc := newCheckReport(cfg, clusterState, results, health, failed)
+			doc.ClusterExists = clusterExists
+			if err := writeCheckReport(doc); err != nil {
 				return err
 			}
 		}
 
 		say()
-		if failed {
-			return fmt.Errorf("checks failed — clear the above before provisioning")
+		switch {
+		case unhealthy:
+			return withExit(ExitUnhealthy, fmt.Errorf(
+				"checks failed — the platform is unhealthy, or its health could not be asserted from this shell; clear the above"))
+		case preflightFailed:
+			return withExit(ExitPreflight, fmt.Errorf("checks failed — this install would not succeed; clear the above before provisioning"))
+		case undetermined:
+			return fmt.Errorf("check could not establish whether %s exists, so platform health was not asserted", cfg.ClusterName())
+		}
+		if clusterState == "unreachable" {
+			say(ui.OK("pre-spend checks clear — platform health NOT asserted (no cluster yet)"))
+			return nil
 		}
 		say(ui.OK("all checks clear"))
 		return nil
 	},
+}
+
+// existsToken is the clusterExists value for a platform state.
+func existsToken(s engine.PlatformState) string {
+	switch s {
+	case engine.PlatformAbsent:
+		return "absent"
+	case engine.PlatformPresent:
+		return "present"
+	default:
+		return "unknown"
+	}
 }
 
 // checkReport is the shape `rackctl check --output json` emits. It is a contract: fields
@@ -194,6 +252,11 @@ type checkReport struct {
 	// a run that finished. Such a report carries clusterHealth "not-asserted" and passed
 	// false, so a caller never mistakes a check that did not run for one that found nothing.
 	Error string `json:"error,omitempty"`
+	// ClusterExists is whether EKS has this config's cluster: absent, present or unknown.
+	// It separates the two meanings of an unreachable cluster — nothing provisioned yet,
+	// which passes, and a cluster this shell cannot reach, which does not. Absent on a run
+	// that stopped before it could ask.
+	ClusterExists string `json:"clusterExists,omitempty"`
 }
 
 type checkResult struct {
@@ -208,10 +271,6 @@ func toCheckResults(in []doctor.Result) []checkResult {
 		out = append(out, checkResult{Name: r.Name, Status: strings.ToLower(r.Status.String()), Detail: r.Detail})
 	}
 	return out
-}
-
-func emitCheckJSON(cfg *config.Config, clusterHealth string, pre, platform []doctor.Result, failed bool) error {
-	return writeCheckReport(newCheckReport(cfg, clusterHealth, pre, platform, failed))
 }
 
 // newCheckReport builds the document. A nil cfg — a config that did not load — leaves the
@@ -261,15 +320,47 @@ func init() {
 		"output format: text, or json for a machine-readable report on stdout")
 }
 
-// currentKubeCluster reports the EKS cluster the ambient kubeconfig resolves to,
-// without changing it.
+// currentKubeCluster reports the cluster entry the ambient kubeconfig resolves to,
+// without changing it. For an EKS cluster that is its full ARN, which is what lets the
+// caller compare the account and the region as well as the name.
 func currentKubeCluster(ctx context.Context, run *exec.Runner) (string, error) {
 	out, err := run.Capture(ctx, "kubectl", "config", "view", "--minify",
 		"-o", "jsonpath={.clusters[0].name}")
 	if err != nil {
 		return "", err
 	}
-	return eksClusterName(strings.TrimSpace(out)), nil
+	return strings.TrimSpace(out), nil
+}
+
+// kubeClusterMismatch says why a kubeconfig cluster entry is not this config's cluster, or
+// returns "" when it is.
+//
+// A name is not an identity. Cluster names are unique per account and region, so the same
+// name in a sibling account or another region is a different cluster, and asserting its
+// health under this config's title reports on a platform nobody asked about. An EKS ARN
+// carries the region and the account, so both are compared. Anything that is not an EKS
+// ARN is compared as itself, so a kind or minikube context is refused rather than parsed
+// into something that happens to match.
+func kubeClusterMismatch(entry string, cfg *config.Config) string {
+	parts := strings.SplitN(entry, ":", 6)
+	if len(parts) != 6 || parts[0] != "arn" || parts[2] != "eks" || !strings.HasPrefix(parts[5], "cluster/") {
+		if entry == cfg.ClusterName() {
+			return ""
+		}
+		return fmt.Sprintf("kubectl is pointed at %q but this config is for %q", entry, cfg.ClusterName())
+	}
+	region, account, name := parts[3], parts[4], eksClusterName(entry)
+	switch {
+	case name != cfg.ClusterName():
+		return fmt.Sprintf("kubectl is pointed at %q but this config is for %q", name, cfg.ClusterName())
+	case region != cfg.Cloud.Region:
+		return fmt.Sprintf("kubectl is pointed at %s in region %s, but this config is for region %s",
+			name, region, cfg.Cloud.Region)
+	case account != cfg.Cloud.AccountID:
+		return fmt.Sprintf("kubectl is pointed at %s in account %s, but this config is for account %s",
+			name, account, cfg.Cloud.AccountID)
+	}
+	return ""
 }
 
 // eksClusterName pulls the cluster name out of a kubeconfig cluster entry. EKS

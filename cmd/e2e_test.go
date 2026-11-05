@@ -69,9 +69,12 @@ func TestCheckJSON_EndToEnd(t *testing.T) {
 		t.Fatalf("stdout is not a bare JSON document (%v):\n%s", err, stdout.String())
 	}
 
-	if doc["clusterHealth"] != "unreachable" {
-		t.Errorf("clusterHealth = %v, want \"unreachable\" — every tool fails here, so nothing "+
-			"could have been asserted about the platform", doc["clusterHealth"])
+	// kubectl reaches nothing and EKS cannot be asked either, so check cannot tell "no
+	// cluster yet" from "a cluster this shell cannot reach" and does not claim either one.
+	if doc["clusterHealth"] != "not-asserted" || doc["clusterExists"] != "unknown" {
+		t.Errorf("clusterHealth = %v, clusterExists = %v, want not-asserted and unknown — every "+
+			"tool fails here, so nothing could have been asserted about the platform",
+			doc["clusterHealth"], doc["clusterExists"])
 	}
 	if doc["passed"] != false {
 		t.Errorf("passed = %v, want false", doc["passed"])
@@ -93,7 +96,8 @@ func TestCheckJSON_EndToEnd(t *testing.T) {
 			"find out what rackctl already knew:\n%s", stdout.String())
 	}
 
-	// Human prose goes to stderr, and the failed run classifies rather than exiting 1.
+	// Human prose goes to stderr, and the failed run classifies: preflight failed, and that
+	// is the definite finding, so it exits preflight rather than the generic failure.
 	if !strings.Contains(stderr.String(), "rackctl check") {
 		t.Errorf("the banner did not reach stderr:\n%s", stderr.String())
 	}
@@ -104,8 +108,8 @@ func TestCheckJSON_EndToEnd(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected error type: %v", runErr)
 	}
-	if got := ee.ExitCode(); got != ExitFailure {
-		t.Errorf("exit %d, want %d — docs/exit-codes.md publishes these", got, ExitFailure)
+	if got := ee.ExitCode(); got != ExitPreflight {
+		t.Errorf("exit %d, want %d — docs/exit-codes.md publishes these", got, ExitPreflight)
 	}
 }
 

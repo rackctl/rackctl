@@ -381,7 +381,13 @@ func captureOutputs(ctx context.Context, st *engine.State, component string) {
 // --- Phase 0: preflight ---
 type preflight struct{ base }
 
-func (preflight) Run(ctx context.Context, st *engine.State) error {
+// Run refuses rather than fails: everything it checks is checked before anything is spent,
+// so a failure here touched nothing and must not read as a rollback.
+func (p preflight) Run(ctx context.Context, st *engine.State) error {
+	return engine.Refuse(p.check(ctx, st))
+}
+
+func (preflight) check(ctx context.Context, st *engine.State) error {
 	if err := exec.RequireTools("tofu", "terragrunt", "kubectl", "helm", "aws", "git", "gh"); err != nil {
 		return err
 	}
@@ -507,10 +513,10 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir, ref string) 
 	// a platform from HEAD while the config, the logs and the operator all said
 	// otherwise — the exact failure a pin exists to remove.
 	if _, err := st.Runner.Capture(ctx, "git", "rev-parse", "--verify", ref+"^{commit}"); err != nil {
-		return &engine.NoRollbackError{Err: fmt.Errorf(
+		return engine.Refuse(fmt.Errorf(
 			"%s has no ref %q. versions pins this repo to that ref, and rackctl will not fall "+
 				"back to the default branch — a pin that silently tracks HEAD is worse than no "+
-				"pin. Check the tag exists on the remote, or remove the entry from versions", name, ref)}
+				"pin. Check the tag exists on the remote, or remove the entry from versions", name, ref))
 	}
 	// --force discards uncommitted work without a word. That is the opposite of the
 	// rule the unpinned path above states for this same directory — rackctl owns it,
@@ -529,10 +535,10 @@ func cloneOrUpdate(ctx context.Context, st *engine.State, url, dir, ref string) 
 	// there with the operator's work.
 	if !fresh {
 		if dirty, err := st.Runner.Capture(ctx, "git", "status", "--porcelain"); err == nil && strings.TrimSpace(dirty) != "" {
-			return &engine.NoRollbackError{Err: fmt.Errorf(
+			return engine.Refuse(fmt.Errorf(
 				"%s has uncommitted changes and versions pins it to %q, which needs a clean tree "+
 					"to check out:\n%s\nCommit them, `git stash` them, or `git checkout .` in %s to "+
-					"discard them — rackctl will not decide that for you", name, ref, dirty, dir)}
+					"discard them — rackctl will not decide that for you", name, ref, dirty, dir))
 		}
 	}
 	if err := st.Runner.Run(ctx, "git", "-c", "advice.detachedHead=false", "checkout", "--force", ref); err != nil {

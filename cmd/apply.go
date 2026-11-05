@@ -115,7 +115,7 @@ func runPipeline(ctx context.Context, write bool) error {
 	if applyTUI {
 		// CleanOnFail must match the non-TUI construction below — hardcoding it here
 		// meant --no-clean-on-failure was silently ignored under --tui.
-		return classifyRun(tui.RunInit(ctx, title, st, phases.All(), !applyNoClean))
+		return classifyRun(ctx, tui.RunInit(ctx, title, st, phases.All(), !applyNoClean))
 	}
 
 	fmt.Println(ui.Title(title))
@@ -123,7 +123,7 @@ func runPipeline(ctx context.Context, write bool) error {
 		fmt.Println(ui.Warn("plan — nothing is created or changed. `rackctl apply` provisions for real"))
 	}
 	eng := &engine.Engine{Phases: phases.All(), Out: os.Stdout, CleanOnFail: !applyNoClean}
-	return classifyRun(eng.Run(ctx, st))
+	return classifyRun(ctx, eng.Run(ctx, st))
 }
 
 // runPreflightGate asserts the install can succeed before it starts spending. It is
