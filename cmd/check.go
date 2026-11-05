@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -64,7 +65,7 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		}
 		cfg, err := config.Load(checkConfig)
 		if err != nil {
-			return withExit(ExitConfig, err)
+			return earlyCheckExit(nil, nil, withExit(ExitConfig, err))
 		}
 		ctx := cmd.Context()
 		// Under --output json the prose goes to STDERR and stdout carries the document
@@ -86,7 +87,7 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 
 		if err := exec.RequireTools("tofu", "terragrunt", "kubectl", "helm", "aws", "git", "gh"); err != nil {
 			say(ui.Fail(err.Error()))
-			return err
+			return earlyCheckExit(cfg, nil, err)
 		}
 
 		say(ui.Title(commandTitle("check", cfg)))
@@ -97,7 +98,8 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		// their verdict IS the output.
 		q := exec.New(io.Discard)
 		if _, err := bindIdentity(ctx, cfg, q); err != nil {
-			return err
+			say(ui.Fail("could not resolve the identity to check as: " + err.Error()))
+			return earlyCheckExit(cfg, nil, err)
 		}
 		results := preflight.Run(ctx, &preflight.Env{Cfg: cfg, Run: q})
 		if checkOutput == "text" {
@@ -121,7 +123,8 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		// halves of one command must not ask AWS as different principals. Bound rather than
 		// copied so both re-resolve from the one session cache.
 		if _, err := bindIdentity(ctx, cfg, run); err != nil {
-			return err
+			say(ui.Fail("could not resolve the identity to check the platform as: " + err.Error()))
+			return earlyCheckExit(cfg, results, err)
 		}
 
 		// Reachability is not enough — the cluster has to be the RIGHT one. `kubectl get
@@ -186,6 +189,11 @@ type checkReport struct {
 	Passed        bool          `json:"passed"`
 	Preflight     []checkResult `json:"preflight"`
 	Platform      []checkResult `json:"platform"`
+	// Error is why the check could not run to the end, on a run that stopped early: a
+	// missing tool, an identity that did not resolve, a config that did not load. Absent on
+	// a run that finished. Such a report carries clusterHealth "not-asserted" and passed
+	// false, so a caller never mistakes a check that did not run for one that found nothing.
+	Error string `json:"error,omitempty"`
 }
 
 type checkResult struct {
@@ -203,19 +211,48 @@ func toCheckResults(in []doctor.Result) []checkResult {
 }
 
 func emitCheckJSON(cfg *config.Config, clusterHealth string, pre, platform []doctor.Result, failed bool) error {
+	return writeCheckReport(newCheckReport(cfg, clusterHealth, pre, platform, failed))
+}
+
+// newCheckReport builds the document. A nil cfg — a config that did not load — leaves the
+// identifying fields empty rather than inventing them.
+func newCheckReport(cfg *config.Config, clusterHealth string, pre, platform []doctor.Result, failed bool) checkReport {
 	doc := checkReport{
-		Cluster:       cfg.ClusterName(),
-		Environment:   string(cfg.Environment),
-		Account:       cfg.Cloud.AccountID,
-		Region:        cfg.Cloud.Region,
 		ClusterHealth: clusterHealth,
 		Passed:        !failed,
 		Preflight:     toCheckResults(pre),
 		Platform:      toCheckResults(platform),
 	}
+	if cfg != nil {
+		doc.Cluster = cfg.ClusterName()
+		doc.Environment = string(cfg.Environment)
+		doc.Account = cfg.Cloud.AccountID
+		doc.Region = cfg.Cloud.Region
+	}
+	return doc
+}
+
+func writeCheckReport(doc checkReport) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(doc)
+}
+
+// earlyCheckExit ends a check that stopped before it could finish. Under --output json it
+// still writes the document — clusterHealth not-asserted, passed false, whatever preflight
+// results were gathered and the reason — because a caller piping stdout into a parser
+// otherwise gets an empty stream and has to tell "nothing ran" from a crash by itself. The
+// error is returned unchanged, so the exit status is the one it already carried.
+func earlyCheckExit(cfg *config.Config, pre []doctor.Result, err error) error {
+	if checkOutput != "json" {
+		return err
+	}
+	doc := newCheckReport(cfg, "not-asserted", pre, nil, true)
+	doc.Error = err.Error()
+	if werr := writeCheckReport(doc); werr != nil {
+		return errors.Join(err, werr)
+	}
+	return err
 }
 
 func init() {

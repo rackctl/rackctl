@@ -531,7 +531,7 @@ func TestOperatorRoles_RefusesARoleThatCannotBeProvedOurs(t *testing.T) {
 			tags: map[string]string{
 				"Project":    "landing-zone",
 				"ManagedBy":  "opentofu",
-				"Repository": "stxkxs/landing-zone",
+				"Repository": "otherorg/landing-zone",
 			},
 			why: "Project=landing-zone and ManagedBy=opentofu are shared across estates in this " +
 				"account; only Repository discriminates, and this one is not ours",

@@ -64,3 +64,10 @@ same way. Checks for disabled features reported `ok` before `skip` existed; they
 `clusterHealth` is `asserted`, `unreachable`, `wrong-cluster` or `not-asserted`. It is
 load-bearing: an empty `platform` list means "no findings" only when `clusterHealth` is
 `asserted` — otherwise it means nobody looked, and the two are the same document without it.
+
+`not-asserted` is a check that stopped before it could finish — a required tool missing from
+`PATH`, an identity that did not resolve, a config that did not load. The document is still
+written, so a pipe into a parser never receives an empty stream: `passed` is `false`, the
+result lists hold whatever ran (often nothing), and an `error` field carries the reason.
+`error` is present only on such a run. The exit status is the one the failure already
+carried — `2` for a config that did not load, `1` otherwise.

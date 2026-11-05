@@ -32,7 +32,7 @@ JSON
   exit 0
 fi
 if [ "$2" = "get-caller-identity" ]; then
-  echo "arn:aws:sts::351619759866:assumed-role/rackctl-deploy/rackctl-development"
+  echo "arn:aws:sts::123456789012:assumed-role/rackctl-deploy/rackctl-development"
   exit 0
 fi
 exit 0
@@ -64,7 +64,7 @@ func stsCalls(t *testing.T, logPath string) []string {
 
 func cfgWithRole(ar *config.AssumeRole) *config.Config {
 	c := config.Default()
-	c.Cloud.Profile = "stxkxs"
+	c.Cloud.Profile = "workload-development"
 	c.Cloud.Region = "us-west-2"
 	c.Environment = config.EnvDev
 	c.Cloud.AssumeRole = ar
@@ -92,7 +92,7 @@ func TestEnvWithoutARoleIsTheProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := envMap(env)
-	if m["AWS_PROFILE"] != "stxkxs" || m["AWS_REGION"] != "us-west-2" {
+	if m["AWS_PROFILE"] != "workload-development" || m["AWS_REGION"] != "us-west-2" {
 		t.Errorf("env = %v, want the profile and region", env)
 	}
 	if calls := stsCalls(t, logPath); len(calls) != 0 {
@@ -105,7 +105,7 @@ func TestEnvWithoutARoleIsTheProfile(t *testing.T) {
 // one wins is a detail of whichever tool happens to be reading.
 func TestEnvWithARoleIsSessionCredentialsAndNoProfile(t *testing.T) {
 	run, _ := fakeSTS(t, time.Hour)
-	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::351619759866:role/rackctl-deploy"}), run)
+	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::123456789012:role/rackctl-deploy"}), run)
 
 	env, err := id.Env(context.Background())
 	if err != nil {
@@ -131,7 +131,7 @@ func TestEnvWithARoleIsSessionCredentialsAndNoProfile(t *testing.T) {
 // per invocation would be both slow and a throttling risk on a long apply.
 func TestEnvReusesALiveSession(t *testing.T) {
 	run, logPath := fakeSTS(t, time.Hour)
-	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::351619759866:role/rackctl-deploy"}), run)
+	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::123456789012:role/rackctl-deploy"}), run)
 
 	for i := 0; i < 5; i++ {
 		if _, err := id.Env(context.Background()); err != nil {
@@ -149,7 +149,7 @@ func TestEnvReusesALiveSession(t *testing.T) {
 // possible moment.
 func TestEnvReassumesBeforeExpiry(t *testing.T) {
 	run, logPath := fakeSTS(t, time.Hour)
-	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::351619759866:role/rackctl-deploy"}), run)
+	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::123456789012:role/rackctl-deploy"}), run)
 
 	if _, err := id.Env(context.Background()); err != nil {
 		t.Fatal(err)
@@ -170,7 +170,7 @@ func TestEnvReassumesBeforeExpiry(t *testing.T) {
 func TestAssumePresentsTheExternalIDAndSessionName(t *testing.T) {
 	run, logPath := fakeSTS(t, time.Hour)
 	id := New(cfgWithRole(&config.AssumeRole{
-		RoleARN:         "arn:aws:iam::351619759866:role/rackctl-deploy",
+		RoleARN:         "arn:aws:iam::123456789012:role/rackctl-deploy",
 		ExternalID:      "fleet-vend-secret",
 		SessionName:     "custom-session",
 		DurationSeconds: 7200,
@@ -184,7 +184,7 @@ func TestAssumePresentsTheExternalIDAndSessionName(t *testing.T) {
 		"--external-id fleet-vend-secret",
 		"--role-session-name custom-session",
 		"--duration-seconds 7200",
-		"--role-arn arn:aws:iam::351619759866:role/rackctl-deploy",
+		"--role-arn arn:aws:iam::123456789012:role/rackctl-deploy",
 	} {
 		if !strings.Contains(call, want) {
 			t.Errorf("sts call missing %q\ngot: %s", want, call)
@@ -197,7 +197,7 @@ func TestAssumePresentsTheExternalIDAndSessionName(t *testing.T) {
 // principal in CloudTrail, which defeats the reason for assuming a role at all.
 func TestDefaultSessionNameIdentifiesTheEnvironment(t *testing.T) {
 	run, logPath := fakeSTS(t, time.Hour)
-	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::351619759866:role/rackctl-deploy"}), run)
+	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::123456789012:role/rackctl-deploy"}), run)
 
 	if _, err := id.Env(context.Background()); err != nil {
 		t.Fatal(err)
@@ -211,7 +211,7 @@ func TestDefaultSessionNameIdentifiesTheEnvironment(t *testing.T) {
 // the banner witnesses the assume instead of restating the request.
 func TestWhoamiReportsTheResolvedIdentity(t *testing.T) {
 	run, _ := fakeSTS(t, time.Hour)
-	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::351619759866:role/rackctl-deploy"}), run)
+	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::123456789012:role/rackctl-deploy"}), run)
 
 	got, err := id.Whoami(context.Background())
 	if err != nil {
@@ -227,7 +227,7 @@ func TestWhoamiReportsTheResolvedIdentity(t *testing.T) {
 func TestDryRunStillAssumes(t *testing.T) {
 	run, logPath := fakeSTS(t, time.Hour)
 	run.DryRun = true
-	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::351619759866:role/rackctl-deploy"}), run)
+	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::123456789012:role/rackctl-deploy"}), run)
 
 	env, err := id.Env(context.Background())
 	if err != nil {

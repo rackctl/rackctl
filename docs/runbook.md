@@ -10,7 +10,7 @@ the tool already removed them.
 `rackctl apply` and `rackctl destroy` print a banner first:
 
 ```
-rackctl destroy — acme · 477165397189 · acme-production · us-east-1 · production
+rackctl destroy — acme · 123456789012 · acme-production · us-east-1 · production
                   ↑ org   ↑ account      ↑ profile         ↑ region   ↑ environment
 ```
 
@@ -169,7 +169,7 @@ different cluster rather than reporting the wrong one's.
 
 ```sh
 rackctl check -c rackctl.yaml
-rackctl check -c rackctl.yaml --output json | jq '.results[] | select(.status=="fail")'
+rackctl check -c rackctl.yaml --output json | jq '(.preflight + .platform)[] | select(.status=="fail")'
 ```
 
 Exit status distinguishes the outcomes — see `docs/exit-codes.md`.
