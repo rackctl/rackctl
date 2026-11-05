@@ -63,3 +63,26 @@ exit 0
 		t.Errorf("a parsed empty list is a real answer and earns the tick:\n%s", buf.String())
 	}
 }
+
+// A document with no items key parses cleanly into an empty list, and an empty list would
+// certify the disarm. `{}` and `null` examined no Application, so neither earns the tick.
+func TestDisarmWithholdsItsTickWhenTheListCarriesNoItems(t *testing.T) {
+	for _, body := range []string{`{}`, `null`, `{"kind":"Status"}`} {
+		dir := t.TempDir()
+		script := "#!/bin/sh\ncase \"$*\" in\n  *\"get applications -o jsonpath\"*) ;;\n  *\"get applications -o json\"*) echo '" + body + "' ;;\nesac\nexit 0\n"
+		if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake kubectl: %v", err)
+		}
+		t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		var buf bytes.Buffer
+		disarmArgoCD(context.Background(), exec.New(&buf), &buf)
+
+		if strings.Contains(buf.String(), "ArgoCD is passive") {
+			t.Errorf("%s examined no Application and certified the disarm:\n%s", body, buf.String())
+		}
+		if !strings.Contains(buf.String(), "could not confirm") {
+			t.Errorf("%s: an unverifiable disarm must say so:\n%s", body, buf.String())
+		}
+	}
+}

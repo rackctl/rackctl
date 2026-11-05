@@ -31,11 +31,22 @@ import (
 // check here" — CheckSessionLifetime reads an unreadable expiry as "no expiring
 // credentials", and appending an exit status to a healthy verdict is noise rather than
 // diagnosis.
+//
+// It walks internal/doctor too. doctor's checks end in the same verdict helpers over
+// kubectl reads whose error carries kubectl's stderr, and a doctor verdict that drops it
+// costs the operator the same search.
 func TestChecks_AVerdictOnAFailureCarriesItsReason(t *testing.T) {
 	fset := token.NewFileSet()
-	files, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatalf("glob: %v", err)
+	var files []string
+	for _, pattern := range []string{"*.go", filepath.Join("..", "doctor", "*.go")} {
+		matched, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("glob %s: %v", pattern, err)
+		}
+		if len(matched) == 0 {
+			t.Fatalf("%s matched nothing — a package this test is meant to cover is not being read", pattern)
+		}
+		files = append(files, matched...)
 	}
 
 	var scanned, verdicts int

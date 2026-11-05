@@ -102,11 +102,15 @@ func TestCheckApplicationSets_PassesWhenAllGenerate(t *testing.T) {
 
 // An unreadable cluster is a warning, never a pass: "I could not look" and "there is
 // nothing wrong" are the two answers a health check must never merge.
-func TestCheckApplicationSets_UnreadableIsAWarningNotAPass(t *testing.T) {
+//
+// It FAILS, as an unreadable Application list does: an erroring ApplicationSet is the one
+// failure the Application list cannot show, so a read that did not happen leaves it wholly
+// unasserted.
+func TestCheckApplicationSets_UnreadableFails(t *testing.T) {
 	env := kubectlEnv(t, nil)
 
-	if got := CheckApplicationSets(t.Context(), env); got.Status != Warn {
-		t.Fatalf("an unreadable ApplicationSet list must warn, not pass; got %v", got.Status)
+	if got := CheckApplicationSets(t.Context(), env); got.Status != Fail {
+		t.Fatalf("an unreadable ApplicationSet list must fail, not pass; got %v", got.Status)
 	}
 }
 
@@ -205,7 +209,7 @@ func TestCheckKarpenter_QuietOnAMeteredPool(t *testing.T) {
 
 // No Karpenter is not a failure — plenty of clusters do not run it.
 func TestCheckKarpenter_SkippedWhenNotInstalled(t *testing.T) {
-	env := kubectlEnv(t, nil)
+	env := kubectlReturning(t, `echo 'error: the server doesn'"'"'t have a resource type "nodepools"' >&2; exit 1`)
 
 	if got := CheckKarpenter(t.Context(), env); got.Status != Skip {
 		t.Fatalf("an absent Karpenter must skip, not fail; got %v: %s", got.Status, got.Detail)

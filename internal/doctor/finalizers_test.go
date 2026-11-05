@@ -15,9 +15,10 @@ import (
 )
 
 // fakeKubectl puts a `kubectl` on PATH that answers `get <kind> -A -o json` from a table
-// of canned responses, keyed by the kind. Anything not in the table returns an error, so
-// an uninstalled CRD is exercised too — the agent platform is optional and its absence
-// must not be a failure.
+// of canned responses, keyed by the kind. A core kind not in the table reads as an empty
+// list, and any other kind answers the way kubectl does for an uninstalled CRD, so that
+// case is exercised too — the agent platform is optional and its absence must not be a
+// failure.
 //
 // The Runner shells out by name, so this is the seam: the test exercises the real
 // argument-building and JSON decoding, not a stub of them.
@@ -26,13 +27,18 @@ func fakeKubectl(t *testing.T, byKind map[string]string) *Env {
 	dir := t.TempDir()
 
 	var cases strings.Builder
+	for _, core := range []string{"pvc", "namespaces"} {
+		if _, ok := byKind[core]; !ok {
+			fmt.Fprintf(&cases, "  %q) echo '{\"items\":[]}' ;;\n", core)
+		}
+	}
 	for kind, body := range byKind {
 		fmt.Fprintf(&cases, "  %q) cat <<'JSON'\n%s\nJSON\n  ;;\n", kind, body)
 	}
 	script := fmt.Sprintf(`#!/bin/sh
 # args: get <kind> -A -o json
 case "$2" in
-%s  *) exit 1 ;;
+%s  *) echo "error: the server doesn't have a resource type \"$2\"" >&2; exit 1 ;;
 esac
 exit 0
 `, cases.String())

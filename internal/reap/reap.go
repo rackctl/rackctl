@@ -790,8 +790,11 @@ func armedApplications(ctx context.Context, run *exec.Runner) ([]string, error) 
 	if err != nil {
 		return nil, err
 	}
+	// Items is a pointer so a document with no items key — `{}`, `null`, a response of some
+	// other kind — is told apart from a list that is genuinely empty. Both decode cleanly
+	// into a plain slice, and the first would then certify a disarm nothing examined.
 	var list struct {
-		Items []struct {
+		Items *[]struct {
 			Metadata struct {
 				Name string `json:"name"`
 			} `json:"metadata"`
@@ -805,8 +808,11 @@ func armedApplications(ctx context.Context, run *exec.Runner) ([]string, error) 
 	if err := json.Unmarshal([]byte(out), &list); err != nil {
 		return nil, fmt.Errorf("no readable Application list: %w", err)
 	}
+	if list.Items == nil {
+		return nil, fmt.Errorf("the Application list carries no items, so no Application was examined")
+	}
 	var armed []string
-	for _, it := range list.Items {
+	for _, it := range *list.Items {
 		if len(it.Spec.SyncPolicy.Automated) > 0 {
 			armed = append(armed, it.Metadata.Name)
 		}
