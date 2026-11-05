@@ -447,3 +447,45 @@ func TestValidate_MalformedHubRoleIsStillRejected(t *testing.T) {
 		t.Errorf("the message must offer the derived value as the remedy:\n%v", err)
 	}
 }
+
+// A model family reaches an IAM policy as a Resource glob and helm as a --set list. A bare
+// `*` is an unscoped grant, an empty entry is dropped silently, and a comma or brace splits
+// or nests the value in the chart while the policy holds the original.
+func TestValidate_RefusesModelFamiliesThatWidenOrCorruptTheGrant(t *testing.T) {
+	for _, bad := range []string{"*", "**", ".*", "*.*", "", "  ", "anthropic,meta", "{anthropic}", "meta llama"} {
+		c := valid()
+		c.AgentPlatform.BedrockModelFamilies = []string{"anthropic", bad}
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("bedrockModelFamilies entry %q must be refused", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "agentPlatform.bedrockModelFamilies[1]") {
+			t.Errorf("the refusal must name the field and the entry: %v", err)
+		}
+	}
+	for _, good := range []string{"anthropic", "amazon-nova", "meta.llama3-*", "cohere.*"} {
+		c := valid()
+		c.AgentPlatform.BedrockModelFamilies = []string{good}
+		if err := c.Validate(); err != nil {
+			t.Errorf("%q is a scoped family and must validate: %v", good, err)
+		}
+	}
+}
+
+// An account id is twelve digits. Twelve characters of anything else used to validate and
+// reached the state bucket name and every ARN before preflight said otherwise.
+func TestValidate_AccountIDIsTwelveDigits(t *testing.T) {
+	for _, bad := range []string{"11112222333a", "1111-2222-33", "11112222333", "1111222233334"} {
+		c := valid()
+		c.Cloud.AccountID = bad
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "cloud.accountId") {
+			t.Errorf("accountId %q must be refused by name, got %v", bad, err)
+		}
+	}
+	c := valid()
+	c.Cloud.AccountID = "012345678901"
+	if err := c.Validate(); err != nil {
+		t.Errorf("a leading zero is a valid account id: %v", err)
+	}
+}

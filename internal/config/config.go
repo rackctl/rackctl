@@ -27,6 +27,9 @@ var stsSessionName = regexp.MustCompile(`^[a-zA-Z0-9=,.@-]{2,64}$`)
 // segment: arn:<partition>:iam::<account>:role/<path...><name>.
 var iamRoleARN = regexp.MustCompile(`^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$`)
 
+// awsAccountID is an AWS account id: twelve digits, leading zeros kept.
+var awsAccountID = regexp.MustCompile(`^[0-9]{12}$`)
+
 // defaultVPCCIDR is the literal CIDR a create-mode VPC uses when it is not drawn from an
 // IPAM pool. It doubles as the sentinel for "unset" in the ipamPoolId ⇄ vpcCidr mutual
 // exclusion: an IPAM-allocated VPC leaves vpcCidr at this default (the CIDR comes from the
@@ -187,11 +190,38 @@ func (c *Config) HasDNS() bool {
 	return c.DNS != nil && c.DNS.HostedZone != ""
 }
 
+// validateModelFamilies refuses a bedrockModelFamilies entry that would widen or corrupt
+// the grant it becomes.
+//
+// Each entry reaches an IAM policy as a Resource glob and helm as a --set list, so it is
+// checked here rather than trusted there. A bare `*`, or an entry of nothing but `*` and
+// `.`, is the unscoped grant BedrockModelIDGlobs exists to avoid. An empty entry is a typo
+// that the mapping drops silently. A comma, `{` or `}` is helm's own list syntax, which
+// splits or nests one family into several in the chart while the policy holds the original.
+func validateModelFamilies(fams []string) []string {
+	var errs []string
+	for i, f := range fams {
+		switch {
+		case strings.TrimSpace(f) == "":
+			errs = append(errs, fmt.Sprintf("agentPlatform.bedrockModelFamilies[%d] is empty — remove it, "+
+				"or name a model family such as \"anthropic\"", i))
+		case strings.Trim(f, "*.") == "":
+			errs = append(errs, fmt.Sprintf("agentPlatform.bedrockModelFamilies[%d] %q grants every Bedrock "+
+				"model — name the families this platform may invoke, such as \"anthropic\" or \"amazon-nova\"", i, f))
+		case strings.ContainsAny(f, ",{} \t"):
+			errs = append(errs, fmt.Sprintf("agentPlatform.bedrockModelFamilies[%d] %q must not contain a comma, "+
+				"a brace or whitespace — helm reads the list through --set, where those split or nest a value", i, f))
+		}
+	}
+	return errs
+}
+
 // BedrockModelIDGlobs maps agentPlatform.bedrockModelFamilies onto the IAM resource
 // globs agent-iam's bedrock_allowed_model_ids expects (e.g. "anthropic" → "anthropic.*",
 // "amazon-nova" → "amazon.nova-*"). Families that already look like globs (contain `*`
-// or `.`) pass through unchanged. Unknown families get a trailing `.*` so a typo is
-// still a scoped grant rather than a silent Resource="*".
+// or `.`) pass through unchanged; Validate refuses one that is nothing but `*` and `.`,
+// which would pass through as Resource="*". Unknown families get a trailing `.*` so a typo
+// is still a scoped grant.
 //
 // The default families ["anthropic", "amazon-nova"] map to landing-zone's own default
 // ["anthropic.*", "amazon.nova-*"], so a default-valued config injects nothing and the
@@ -726,12 +756,11 @@ func (c *Config) Validate() error {
 	if c.Cloud.Provider != ProviderAWS {
 		errs = append(errs, fmt.Sprintf("cloud.provider must be %q (v1 supports AWS only)", ProviderAWS))
 	}
-	switch len(c.Cloud.AccountID) {
-	case 0:
+	switch {
+	case c.Cloud.AccountID == "":
 		errs = append(errs, "cloud.accountId is required")
-	case 12:
-	default:
-		errs = append(errs, "cloud.accountId must be a 12-digit AWS account id")
+	case !awsAccountID.MatchString(c.Cloud.AccountID):
+		errs = append(errs, fmt.Sprintf("cloud.accountId %q must be a 12-digit AWS account id", c.Cloud.AccountID))
 	}
 	if c.Cloud.Region == "" {
 		errs = append(errs, "cloud.region is required")
@@ -866,6 +895,7 @@ func (c *Config) Validate() error {
 			errs = append(errs, "cluster.network.centralizedEgress requires cluster.network.transitGatewayId — there is nothing to route the private default egress to without a transit gateway")
 		}
 	}
+	errs = append(errs, validateModelFamilies(c.AgentPlatform.BedrockModelFamilies)...)
 	switch c.Observability.Tier {
 	case TierFloor, TierFull:
 	default:
