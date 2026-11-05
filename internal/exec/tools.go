@@ -178,14 +178,25 @@ func (r *Runner) interruptGrace() time.Duration {
 	return DefaultInterruptGrace
 }
 
-// children is every mutating child still running, keyed by its process group, and whether
-// ForceStop has been called. Start and registration happen under one lock, so ForceStop
-// either sees a child or the child is never started.
+// children is every mutating child still running, keyed by its process group, whether one
+// has ever started, and whether ForceStop has been called. Start and registration happen
+// under one lock, so ForceStop either sees a child or the child is never started.
 var children = struct {
 	sync.Mutex
 	groups  map[int]bool
+	mutated bool
 	stopped bool
 }{groups: map[int]bool{}}
+
+// MutationStarted reports whether this process has ever started a mutating child, through
+// Run or Reconcile. Until it has, nothing this process did can have changed the cloud: a
+// dry-run spawns no mutation and a read is never one, so an exit forced before then leaves
+// nothing behind.
+func MutationStarted() bool {
+	children.Lock()
+	defer children.Unlock()
+	return children.mutated
+}
 
 // ErrForceStopped is what a tool call returns once ForceStop has run.
 var ErrForceStopped = errors.New("not started: rackctl was forced to exit")
@@ -205,6 +216,7 @@ func runChild(cmd *exec.Cmd, grouped bool) error {
 	pgid := cmd.Process.Pid
 	if grouped {
 		children.groups[pgid] = true
+		children.mutated = true
 	}
 	children.Unlock()
 	err := cmd.Wait()

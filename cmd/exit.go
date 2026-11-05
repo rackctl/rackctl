@@ -39,15 +39,16 @@ const (
 	ExitRolledBack = 6
 	// ExitStranded means a phase failed AND the rollback could not finish, or a teardown
 	// ended with a backstop that guards billable or blocking resources failed or not run.
-	// A second interrupt, which forces exit before the unwind finishes, exits this too.
+	// A second interrupt, which forces exit before the unwind finishes, exits this too once a
+	// tool that can change the cloud has started; before then it exits ExitAborted.
 	// This is the one that needs a human: resources this run created may still exist.
 	// docs/runbook.md covers what to look for.
 	ExitStranded = 7
 	// ExitAborted means the operator interrupted (Ctrl-C, SIGTERM, or the first q under
 	// --tui), and whatever unwind the run owed has finished. An interrupted run whose unwind
-	// did not finish, or that a second interrupt or q forced to exit, exits ExitStranded
-	// instead: the more urgent cloud state wins, and the message still says it was
-	// interrupted.
+	// did not finish, that a second interrupt forced to exit after a mutating tool started,
+	// or that a second q forced to exit, exits ExitStranded instead: the more urgent cloud
+	// state wins, and the message still says it was interrupted.
 	ExitAborted = 8
 	// ExitRefused means a command refused before it touched anything: an apply that refused
 	// before any spend, or a destroy that refused before any destroy. Nothing changed.

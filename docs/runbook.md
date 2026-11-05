@@ -112,6 +112,8 @@ before it is killed; rackctl prints `waiting up to 2m0s for <tool> to release st
 it does. Then the rollback runs. **The second Ctrl-C forces exit**: rackctl kills every tool
 it started, process group and all, starts nothing more, and exits `7`, because the unwind
 did not finish and what the run built may remain. Use it only if the unwind itself has hung.
+A second Ctrl-C before any tool that can change the cloud started, at the `destroy` prompt or
+during `check` or `plan`, exits `8` instead and says nothing was touched.
 
 Under `--tui`, `q` does the same, and the footer says so before you press it. The first `q`
 stops the run and keeps the view up while the rollback runs to its end, each phase it undoes

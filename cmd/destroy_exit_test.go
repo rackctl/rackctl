@@ -234,3 +234,49 @@ func TestDestroy_ADryRunReadsThroughATemporaryKubeconfig(t *testing.T) {
 		t.Errorf("the dry-run must preview the in-cluster reap:\n%s", out)
 	}
 }
+
+// A second interrupt before anything mutating started touched nothing, so it is aborted,
+// not resources-may-remain. At the confirmation prompt the first Ctrl-C only cancels the
+// context, which the prompt does not read, so the operator presses it again; that sent a
+// script to a human, and told the operator to destroy, over a command that changed nothing.
+func TestDestroy_ASecondInterruptAtThePromptIsAborted(t *testing.T) {
+	cmd := destroyCommand(t, map[string]string{})
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stdin.Close() }()
+	out, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = out.Close() }()
+	cmd.Stdout, cmd.Stderr = out, out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if b, _ := os.ReadFile(out.Name()); strings.Contains(string(b), "Type the cluster name to confirm") {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatal("the prompt never appeared")
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	code := exitStatus(cmd.Wait())
+	b, _ := os.ReadFile(out.Name())
+	if code != ExitAborted {
+		t.Fatalf("want exit %d, got %d\n%s", ExitAborted, code, b)
+	}
+	if !strings.Contains(string(b), "nothing was touched") || strings.Contains(string(b), "rackctl destroy` to remove") {
+		t.Errorf("the message must say nothing was touched, and send nobody to destroy:\n%s", b)
+	}
+}

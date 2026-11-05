@@ -64,14 +64,32 @@ func forwardInterrupts(sigs <-chan os.Signal, cancel context.CancelFunc, force f
 	force()
 }
 
-// forceExit is the second interrupt. Whatever unwind the first one started has not
-// finished, so what this run built may remain, and the status says so.
+// exit is os.Exit, a variable so a test can read the status a forced exit chooses.
+var exit = os.Exit
+
+// forceExit is the second interrupt. Every running tool is killed and nothing more starts.
+//
+// What that leaves depends on whether anything mutating ever ran. Once a mutation has
+// started, whatever unwind the first interrupt began has not finished, so what this run
+// built may remain and the status says so. Before then nothing was touched: a second Ctrl-C
+// at the destroy prompt, or over a slow read in `check` or `plan`, is an interrupt like any
+// other and must not send a script to a human over a command that changed nothing.
 func forceExit() {
 	rackexec.ForceStop()
-	fmt.Fprintf(os.Stderr, "%s (exit %d): forced exit on a second interrupt — every running tool "+
-		"was killed and the unwind did not finish, so what this run built may remain. Run `rackctl "+
-		"check`, then `rackctl destroy` to remove it\n", exitCodeName(ExitStranded), ExitStranded)
-	os.Exit(ExitStranded)
+	code, msg := forcedExit(rackexec.MutationStarted())
+	fmt.Fprintf(os.Stderr, "%s (exit %d): %s\n", exitCodeName(code), code, msg)
+	exit(code)
+}
+
+// forcedExit chooses a forced exit's status and message from whether a mutation started.
+func forcedExit(mutated bool) (int, string) {
+	if !mutated {
+		return ExitAborted, "forced exit on a second interrupt — nothing had been started that changes " +
+			"the cloud, so nothing was touched"
+	}
+	return ExitStranded, "forced exit on a second interrupt — every running tool was killed and the " +
+		"unwind did not finish, so what this run built may remain. Run `rackctl check`, then `rackctl " +
+		"destroy` to remove it"
 }
 
 func init() {

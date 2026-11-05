@@ -149,3 +149,40 @@ func TestForceStop_KillsEveryChildAndRefusesTheNext(t *testing.T) {
 		t.Fatalf("a call after ForceStop must not start: %v", err)
 	}
 }
+
+// Only a mutating child counts as a mutation: a read, a dry-run and a refused start do
+// not, so a forced exit before one can say that nothing was touched.
+func TestMutationStarted_CountsOnlyAMutatingChild(t *testing.T) {
+	children.Lock()
+	prev := children.mutated
+	children.mutated = false
+	children.Unlock()
+	t.Cleanup(func() {
+		children.Lock()
+		children.mutated = prev
+		children.Unlock()
+	})
+	fakeTool(t, "tofu", "exit 0\n")
+	ctx := context.Background()
+	r := New(&syncWriter{w: &bytes.Buffer{}})
+	if _, err := r.Capture(ctx, "tofu", "state", "list"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Query(ctx, "tofu", "output"); err != nil {
+		t.Fatal(err)
+	}
+	r.DryRun = true
+	if err := r.Run(ctx, "tofu", "apply"); err != nil {
+		t.Fatal(err)
+	}
+	if MutationStarted() {
+		t.Fatal("a read or a dry-run was counted as a mutation")
+	}
+	r.DryRun = false
+	if err := r.Run(ctx, "tofu", "apply"); err != nil {
+		t.Fatal(err)
+	}
+	if !MutationStarted() {
+		t.Fatal("a mutating child was not counted")
+	}
+}

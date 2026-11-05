@@ -374,3 +374,13 @@ func TestCheckJSON_ShapeIsStable(t *testing.T) {
 		t.Errorf("status must be the lowercase machine token, got %v", first["status"])
 	}
 }
+
+// A forced exit is resources-may-remain only once something mutating has started.
+func TestForcedExit_IsResourcesMayRemainOnlyAfterAMutation(t *testing.T) {
+	if code, msg := forcedExit(false); code != ExitAborted || !strings.Contains(msg, "nothing was touched") {
+		t.Errorf("before any mutation: got %d %q, want %d", code, msg, ExitAborted)
+	}
+	if code, msg := forcedExit(true); code != ExitStranded || !strings.Contains(msg, "may remain") {
+		t.Errorf("after a mutation: got %d %q, want %d", code, msg, ExitStranded)
+	}
+}
