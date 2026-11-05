@@ -155,29 +155,110 @@ func CheckIdentity(ctx context.Context, env *Env) doctor.Result {
 
 // ─────────────────────────── quota ───────────────────────────
 
+// vcpuQuotaCode is the Service Quotas code for EC2's standard on-demand vCPU limit.
+const vcpuQuotaCode = "L-1216C47A"
+
+// QuotaRequest is an increase of the vCPU quota that AWS has not yet decided.
+type QuotaRequest struct {
+	ID           string  `json:"Id"`
+	CaseID       string  `json:"CaseId"`
+	Status       string  `json:"Status"`
+	DesiredValue float64 `json:"DesiredValue"`
+}
+
+// Describe names the request the way an operator quotes it to AWS support: the case id when
+// one is open, and the request id always, because a request that is still PENDING has no
+// case yet.
+func (q QuotaRequest) Describe() string {
+	s := "request " + q.ID
+	if q.CaseID != "" {
+		s += " (case " + q.CaseID + ")"
+	}
+	return fmt.Sprintf("%s for %d vCPU is %s", s, int(q.DesiredValue), q.Status)
+}
+
+// VCPUQuota reads the account's applied standard on-demand vCPU quota.
+func VCPUQuota(ctx context.Context, env *Env) (float64, error) {
+	out, err := env.aws(ctx, "service-quotas", "get-service-quota",
+		"--service-code", "ec2", "--quota-code", vcpuQuotaCode, "--query", "Quota.Value")
+	if err != nil {
+		return 0, err
+	}
+	have, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
+	if err != nil {
+		return 0, fmt.Errorf("unreadable quota value %q", truncate(out, 40))
+	}
+	return have, nil
+}
+
+// PendingVCPURequest returns the vCPU increase AWS is still deciding, or nil when there is
+// none. Only PENDING and CASE_OPENED are open: every other status is a decision, and a
+// request that was decided is not one to wait on.
+func PendingVCPURequest(ctx context.Context, env *Env) (*QuotaRequest, error) {
+	raw, err := env.Run.Capture(ctx, "aws", "service-quotas",
+		"list-requested-service-quota-change-history-by-quota",
+		"--service-code", "ec2", "--quota-code", vcpuQuotaCode,
+		"--region", env.Cfg.Cloud.Region, "--output", "json")
+	if err != nil {
+		return nil, err
+	}
+	var hist struct {
+		RequestedQuotas []QuotaRequest `json:"RequestedQuotas"`
+	}
+	if err := json.Unmarshal([]byte(raw), &hist); err != nil {
+		return nil, fmt.Errorf("reading the vCPU quota request history: %w", err)
+	}
+	for _, q := range hist.RequestedQuotas {
+		if q.Status == "PENDING" || q.Status == "CASE_OPENED" {
+			return &q, nil
+		}
+	}
+	return nil, nil
+}
+
+// VCPUIncreaseCommand is the command that files the increase by hand.
+func VCPUIncreaseCommand(cfg *config.Config) string {
+	return fmt.Sprintf("aws service-quotas request-service-quota-increase --service-code ec2 "+
+		"--quota-code %s --desired-value %d --region %s", vcpuQuotaCode, cfg.Quotas.VCPU, cfg.Cloud.Region)
+}
+
 // CheckQuota asserts there is vCPU headroom for the cluster the config asks for.
 //
 // A quota shortfall does not fail fast. Karpenter provisions, the fleet request is
 // throttled, and pods sit Pending while every rackctl phase reports success.
+//
+// The check reads and never files. When the quota is short it says whether an increase is
+// already waiting on AWS, and names it, so the operator knows whether there is anything to
+// do but wait. `rackctl apply` with quotas.autoRequest files the increase itself, in a step
+// of its own before this gate runs; without autoRequest the remedy is the command to file it.
 func CheckQuota(ctx context.Context, env *Env) doctor.Result {
 	const name = "vcpu quota"
 
-	out, err := env.aws(ctx, "service-quotas", "get-service-quota",
-		"--service-code", "ec2", "--quota-code", "L-1216C47A", "--query", "Quota.Value")
+	have, err := VCPUQuota(ctx, env)
 	if err != nil {
 		return warn(name, "could not read the EC2 vCPU quota ("+truncate(err.Error(), 160)+") — provisioning may throttle")
 	}
-	have, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
-	if err != nil {
-		return warn(name, "unreadable quota value: "+out)
-	}
 	want := env.Cfg.Quotas.VCPU
-	if want > 0 && int(have) < want {
-		return fail(name, fmt.Sprintf(
-			"standard on-demand vCPU quota is %d, config asks for %d — nodes will sit Pending "+
-				"while every phase reports success", int(have), want))
+	if want <= 0 || int(have) >= want {
+		return ok(name, fmt.Sprintf("%d standard on-demand vCPU available", int(have)))
 	}
-	return ok(name, fmt.Sprintf("%d standard on-demand vCPU available", int(have)))
+	short := fmt.Sprintf("standard on-demand vCPU quota is %d, config asks for %d — nodes will sit "+
+		"Pending while every phase reports success", int(have), want)
+
+	pending, perr := PendingVCPURequest(ctx, env)
+	switch {
+	case pending != nil:
+		return fail(name, short+". Increase "+pending.Describe()+"; re-run once AWS grants it")
+	case !env.Cfg.Quotas.AutoRequestEnabled():
+		return fail(name, short+". quotas.autoRequest is false, so file the increase yourself: "+
+			VCPUIncreaseCommand(env.Cfg))
+	case perr != nil:
+		return fail(name, short+". Whether an increase is already pending could not be read ("+
+			truncate(perr.Error(), 120)+"). `rackctl apply` files one when none is pending")
+	default:
+		return fail(name, short+". No increase is pending; `rackctl apply` files one before "+
+			"provisioning and refuses until AWS grants it")
+	}
 }
 
 // ─────────────────────────── stale state ───────────────────────────

@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/rackctl/rackctl/internal/config"
+	"github.com/rackctl/rackctl/internal/doctor"
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/phases"
@@ -100,6 +101,11 @@ func runPipeline(ctx context.Context, write bool) error {
 	// --skip-preflight exists because a check can be wrong and must never be the thing that
 	// stands between an operator and their own cloud — but it has to be asked for.
 	if write && !applySkipPreflight {
+		// The quota increase is filed before the gate judges the quota, because the gate
+		// would otherwise refuse for want of a request nothing had filed yet.
+		if err := requestQuota(ctx, cfg, base, os.Stdout); err != nil {
+			return err
+		}
 		if err := runPreflightGate(ctx, cfg, base); err != nil {
 			return withExit(ExitPreflight, err)
 		}
@@ -126,15 +132,39 @@ func runPipeline(ctx context.Context, write bool) error {
 	return classifyRun(ctx, eng.Run(ctx, st))
 }
 
-// runPreflightGate asserts the install can succeed before it starts spending. It is
-// deliberately quiet on success — the operator asked to provision, not to read an audit.
+// runPreflightGate asserts the install can succeed before it starts spending. It is quiet
+// only when every check is ok: a warning or a skip is a question the gate did not answer
+// well, and an operator who is about to spend should see each one before the spend starts.
+// Display only — a warning never refuses.
 func runPreflightGate(ctx context.Context, cfg *config.Config, env []string) error {
 	q := exec.New(io.Discard) // the checks are queries; their verdict is the output
 	q.Env = env
+	return reportPreflightGate(preflight.Run(ctx, &preflight.Env{Cfg: cfg, Run: q}))
+}
 
-	results := preflight.Run(ctx, &preflight.Env{Cfg: cfg, Run: q})
+// reportPreflightGate prints the gate's verdict and returns the refusal, if any.
+func reportPreflightGate(results []doctor.Result) error {
 	if !preflight.Failed(results) {
-		fmt.Println(ui.OK("preflight clear"))
+		var warns, skips int
+		var shown []doctor.Result
+		for _, r := range results {
+			switch r.Status {
+			case doctor.Warn:
+				warns++
+			case doctor.Skip:
+				skips++
+			default:
+				continue
+			}
+			shown = append(shown, r)
+		}
+		if len(shown) == 0 {
+			fmt.Println(ui.OK("preflight clear"))
+			return nil
+		}
+		fmt.Println(ui.Warn(fmt.Sprintf("preflight passed — %d warning(s), %d skipped", warns, skips)))
+		printResults(shown)
+		fmt.Println()
 		return nil
 	}
 

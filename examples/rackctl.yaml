@@ -77,7 +77,7 @@ cluster:
     # centralizedEgress: true         # private default route via the TGW to a central egress VPC, zero local NAT gateways; requires transitGatewayId
 
 quotas:
-  autoRequest: true               # file L-1216C47A (EC2 vCPU) etc. before provisioning
+  autoRequest: true               # apply files the L-1216C47A (EC2 vCPU) increase before its gate, then refuses until AWS grants it
   vcpu: 256
 
 observability:
