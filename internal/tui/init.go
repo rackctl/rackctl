@@ -177,9 +177,10 @@ func forceExit(events chan engine.Event, done chan error) error {
 	}()
 
 	select {
-	case <-done:
+	case err := <-done:
 		// The engine's error describes a run the operator abandoned; ErrForced says what
-		// that left and what to run next.
+		// that left and what to run next, so it is what is returned.
+		_ = err
 	case <-time.After(abortGrace):
 	}
 	return ErrForced

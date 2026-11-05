@@ -43,9 +43,11 @@ const (
 	// This is the one that needs a human: resources this run created may still exist.
 	// docs/runbook.md covers what to look for.
 	ExitStranded = 7
-	// ExitAborted means the operator interrupted, and whatever unwind the run owed has
-	// finished. An interrupted run whose unwind did not finish exits ExitStranded instead:
-	// the more urgent cloud state wins, and the message still says it was interrupted.
+	// ExitAborted means the operator interrupted (Ctrl-C, SIGTERM, or the first q under
+	// --tui), and whatever unwind the run owed has finished. An interrupted run whose unwind
+	// did not finish, or that a second interrupt or q forced to exit, exits ExitStranded
+	// instead: the more urgent cloud state wins, and the message still says it was
+	// interrupted.
 	ExitAborted = 8
 	// ExitRefused means a command refused before it touched anything: an apply that refused
 	// before any spend, or a destroy that refused before any destroy. Nothing changed.
