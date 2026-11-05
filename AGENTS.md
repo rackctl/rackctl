@@ -36,8 +36,10 @@ engine records each failure's outcome in a typed `engine.RunError`; classify on 
 
 **A dry-run queries for real.** `plan` and `destroy --dry-run` make read-only AWS calls
 deliberately: the sweeps that delete resources outside Terraform's state enumerate live and
-print exactly what they would select. A dry-run that queried nothing could only restate its
-own filter back.
+print exactly what they would select, and a plan asks EKS whether an apply would roll back.
+The in-cluster preview reads through a temporary kubeconfig aimed at the cluster by name,
+removed on exit; a dry-run never writes the operator's own. A dry-run that queried nothing
+could only restate its own filter back.
 
 ## The shape of the repo
 

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -75,6 +76,16 @@ they would refuse to delete because nothing proves it belongs to this run. That 
 the point of the dry-run: in an account holding more than this platform, "the sweep
 is correctly scoped" is a claim worth checking rather than asserting, and a dry-run
 that queried nothing could only ever restate its own filter back.
+
+A dry-run previews the in-cluster reap the same way. It writes a TEMPORARY kubeconfig
+aimed at this cluster by name, removed on exit and never your own kubeconfig, and reads
+through it for real: the armed ArgoCD Applications, the Platforms, Tenants, NodeClaims and
+PVCs it would delete, the workloads it would scale down first, and the eks-fleet spokes
+that would make the destroy refuse.
+
+With controlPlane.eksFleet on, a destroy refuses when the spoke clusters this hub may
+have vended cannot be listed. There is no override: a wrong guess that there are none
+strands real clusters that bill forever, often in another account.
 
 Outside development, several S3 buckets (agent-iam artifacts, cluster-addons
 velero/loki/tempo, model-import staging, druid deepstorage) refuse a destroy
@@ -160,7 +171,11 @@ the object rather than at the flag.`,
 		// after a teardown that already deleted it. There is nothing in it to reap, and
 		// recording the reap as not run would hold every such re-run unclean for good.
 		clusterGone := false
-		if err := reap.PointAt(ctx, run, cfg.ClusterName()); err != nil {
+		// Under --dry-run the repoint writes a temporary kubeconfig, removed on return, and
+		// the in-cluster preview and the spoke check read through it; the operator's own
+		// kubeconfig is never written.
+		release, err := reap.PointAt(ctx, run, cfg.ClusterName(), cfg.Cloud.Region)
+		if err != nil {
 			reaping, pointErr = false, err
 			clusterGone = reap.ClusterGone(ctx, run, cfg.ClusterName(), cfg.Cloud.Region)
 			if clusterGone {
@@ -168,49 +183,19 @@ the object rather than at the flag.`,
 			} else {
 				fmt.Println(ui.Warn(fmt.Sprintf(
 					"could not point kubectl at %s (%v) — skipping the in-cluster reap. The component "+
-						"teardown still runs, and terraform state is scoped by state key, so nothing "+
-						"belonging to another cluster can be touched. But a Platform or PVC left behind "+
-						"here may stop that teardown on a DeleteConflict or an in-use security group; "+
-						"if so, fix the kubeconfig and re-run.", cfg.ClusterName(), err)))
+						"teardown still runs, and terraform state is scoped by state key, so no other "+
+						"cluster's Terraform-managed resources can be touched. But a Platform or PVC left "+
+						"behind here may stop that teardown on a DeleteConflict or an in-use security "+
+						"group; if so, fix the kubeconfig and re-run.", cfg.ClusterName(), err)))
 			}
+		} else {
+			defer release()
 		}
 
-		// REFUSE before anything destructive if this hub has vended spoke clusters.
-		//
-		// An eks-fleet Cluster CR is not a Kubernetes object with a Kubernetes-shaped blast
-		// radius: the composition hands it to provider-opentofu, which applies a whole
-		// landing-zone module — a real EKS control plane, its VPC, its NAT gateways — and
-		// the ClusterProviderConfig vends CROSS-ACCOUNT by design. This hub is the only
-		// thing that knows those clusters exist, so destroying it orphans every one of
-		// them: the control plane that could delete them is gone, their terraform state is
-		// in a bucket rackctl never touches, and no rackctl command will enumerate them
-		// again. They bill forever, in accounts this config does not even name.
-		//
-		// rackctl will not delete them either — tearing down someone else's cluster as a
-		// side effect of tearing down this one is not a decision an installer gets to make.
-		// So it stops and says what is there.
-		//
-		// A refusal: nothing has been destroyed, so it exits refused rather than as a
-		// teardown that stopped partway. The one thing that did change is the kubeconfig,
-		// which the repoint above aimed at this cluster, and the message says so.
-		if reaping {
-			if spokes := reap.FleetSpokes(ctx, run); len(spokes) > 0 {
-				return withExit(ExitRefused, fmt.Errorf(
-					"this cluster is an eks-fleet hub with %d spoke cluster(s) still vended:\n\n"+
-						"    %s\n\n"+
-						"Each one is a real EKS cluster — its own control plane, VPC and NAT gateways, "+
-						"provisioned by provider-opentofu and often in another AWS account. This hub is "+
-						"the only place they are tracked. Destroying it would strand them: Crossplane "+
-						"goes with the cluster, their terraform state stays in the eks-fleet state "+
-						"bucket, and nothing rackctl runs would ever find them again.\n\n"+
-						"Delete the spokes first and let Crossplane tear them down:\n"+
-						"    kubectl delete clusters.fleet.nanohype.dev --all -A --wait\n\n"+
-						"Watch them go (a spoke takes as long as any EKS teardown), then re-run this "+
-						"destroy. rackctl does not delete them for you — that is a different cluster's "+
-						"lifecycle, and often a different account's bill.\n\n"+
-						"Nothing was destroyed. kubectl's current context now points at %s",
-					len(spokes), strings.Join(spokes, "\n    "), cfg.ClusterName()))
-			}
+		// REFUSE before anything destructive if this hub has, or may have, vended spoke
+		// clusters. See spokeGuard.
+		if err := spokeGuard(ctx, run, cfg, reaping, clusterGone, pointErr); err != nil {
+			return withExit(ExitRefused, err)
 		}
 
 		// The last point at which nothing has been destroyed. An interrupt that landed before
@@ -433,6 +418,76 @@ the object rather than at the flag.`,
 		fmt.Println(ui.OK("platform destroyed"))
 		return nil
 	},
+}
+
+// spokeGuard refuses a destroy while this cluster may be an eks-fleet hub with spoke
+// clusters vended, before anything is destroyed. It returns nil when the destroy may go on.
+//
+// An eks-fleet Cluster CR is not a Kubernetes object with a Kubernetes-shaped blast radius:
+// the composition hands it to provider-opentofu, which applies a whole landing-zone module —
+// a real EKS control plane, its VPC, its NAT gateways — and the ClusterProviderConfig vends
+// CROSS-ACCOUNT by design. This hub is the only thing that knows those clusters exist, so
+// destroying it orphans every one of them: the control plane that could delete them is gone,
+// their terraform state is in a bucket rackctl never touches, and no rackctl command will
+// enumerate them again. They bill forever, in accounts this config does not even name.
+//
+// rackctl will not delete them either — tearing down someone else's cluster as a side effect
+// of tearing down this one is not a decision an installer gets to make. So it stops and says
+// what is there.
+//
+// And with controlPlane.eksFleet on, a spoke set it could not read is a refusal too, with no
+// override. An RBAC denial, a timeout, or a hub this host cannot reach all used to read as "no
+// spokes", which is the one answer that lets the destroy proceed; a wrong guess there strands
+// clusters that bill forever, so unknown is treated as the dangerous answer. A cluster that is
+// already gone has no hub left to read, and does not block the re-run that finishes the
+// teardown. With eksFleet off, an unreadable answer is said and the destroy goes on.
+//
+// A refusal: nothing has been destroyed, so it exits refused rather than as a teardown that
+// stopped partway. On a real run the repoint aimed kubectl at this cluster, and the message
+// says so; a dry-run read through a temporary kubeconfig and changed nothing.
+func spokeGuard(ctx context.Context, run *exec.Runner, cfg *config.Config, reaping, clusterGone bool, pointErr error) error {
+	cluster := cfg.ClusterName()
+	changed := "Nothing was destroyed. kubectl's current context now points at " + cluster
+	if run.DryRun {
+		changed = "Nothing was destroyed, and your kubeconfig is untouched: the dry-run read through a " +
+			"temporary one"
+	}
+	fix := "Make the hub's API reachable from this host and re-run, so the spokes can be listed; " +
+		"rackctl does not guess that there are none, because a wrong guess strands clusters that bill " +
+		"forever, often in another account."
+	if !reaping {
+		if !cfg.ControlPlane.EKSFleet || clusterGone {
+			return nil
+		}
+		return fmt.Errorf("controlPlane.eksFleet is on, and kubectl could not be pointed at %s (%v), so the "+
+			"spoke clusters this hub may have vended cannot be listed. %s\n\nNothing was destroyed", cluster, pointErr, fix)
+	}
+	spokes, err := reap.FleetSpokes(ctx, run)
+	switch {
+	case err != nil && cfg.ControlPlane.EKSFleet:
+		return fmt.Errorf("controlPlane.eksFleet is on, and the spoke clusters this hub may have vended could "+
+			"not be listed (%v). %s\n\n%s", err, fix, changed)
+	case err != nil:
+		fmt.Println(ui.Warn("could not list eks-fleet spoke clusters (" + err.Error() + ") — controlPlane.eksFleet " +
+			"is off, so this is not treated as a hub"))
+		return nil
+	case len(spokes) == 0:
+		return nil
+	}
+	return fmt.Errorf(
+		"this cluster is an eks-fleet hub with %d spoke cluster(s) still vended:\n\n"+
+			"    %s\n\n"+
+			"Each one is a real EKS cluster — its own control plane, VPC and NAT gateways, "+
+			"provisioned by provider-opentofu and often in another AWS account. This hub is "+
+			"the only place they are tracked. Destroying it would strand them: Crossplane "+
+			"goes with the cluster, their terraform state stays in the eks-fleet state "+
+			"bucket, and nothing rackctl runs would ever find them again.\n\n"+
+			"Delete the spokes first and let Crossplane tear them down:\n"+
+			"    kubectl delete clusters.fleet.nanohype.dev --all -A --wait\n\n"+
+			"Watch them go (a spoke takes as long as any EKS teardown), then re-run this "+
+			"destroy. rackctl does not delete them for you — that is a different cluster's "+
+			"lifecycle, and often a different account's bill.\n\n%s",
+		len(spokes), strings.Join(spokes, "\n    "), changed)
 }
 
 // confirmDestroy blocks until a human types the cluster name, or --yes was passed.

@@ -182,3 +182,55 @@ func processAlive(pid int) bool {
 	f := strings.Fields(string(stat))
 	return len(f) < 3 || f[2] != "Z"
 }
+
+// A dry-run shows the refusal the real run would hit, because it reads the hub for real
+// through a temporary kubeconfig. It used to read nothing, so a rehearsal never refused.
+func TestDestroy_ADryRunShowsTheSpokeRefusal(t *testing.T) {
+	out, err := destroyCommand(t, map[string]string{
+		"kubectl": "case \"$*\" in *clusters.fleet*) echo 'fleet/spoke-a' ;; esac\nexit 0\n",
+	}, "--dry-run").CombinedOutput()
+	if code := exitStatus(err); code != ExitRefused {
+		t.Fatalf("want exit %d, got %d\n%s", ExitRefused, code, out)
+	}
+	if !strings.Contains(string(out), "fleet/spoke-a") || !strings.Contains(string(out), "your kubeconfig is untouched") {
+		t.Errorf("the dry-run refusal must name the spoke and say nothing changed:\n%s", out)
+	}
+}
+
+// A dry-run writes a temporary kubeconfig, reads the cluster through it, and removes it on
+// exit; the operator's own kubeconfig is never written.
+func TestDestroy_ADryRunReadsThroughATemporaryKubeconfig(t *testing.T) {
+	dir := t.TempDir()
+	seen := filepath.Join(dir, "seen")
+	cmd := destroyCommand(t, map[string]string{
+		"aws":     "case \"$*\" in *update-kubeconfig*--kubeconfig*) echo \"$*\" >> " + seen + " ;; *update-kubeconfig*) echo REPOINTED >> " + seen + " ;; esac\nexit 0\n",
+		"kubectl": "echo \"KUBECONFIG=$KUBECONFIG\" >> " + seen + "\nexit 0\n",
+	}, "--dry-run")
+	out, err := cmd.CombinedOutput()
+	if code := exitStatus(err); code != 0 {
+		t.Fatalf("want exit 0, got %d\n%s", code, out)
+	}
+	b, _ := os.ReadFile(seen)
+	got := string(b)
+	if strings.Contains(got, "REPOINTED") {
+		t.Fatalf("a dry-run repointed the operator's kubeconfig:\n%s", got)
+	}
+	var tmp string
+	for _, l := range strings.Split(got, "\n") {
+		if v, ok := strings.CutPrefix(l, "KUBECONFIG="); ok {
+			if v == "" {
+				t.Fatalf("kubectl read the ambient kubeconfig in a dry-run:\n%s", got)
+			}
+			tmp = v
+		}
+	}
+	if tmp == "" || !strings.Contains(got, "--kubeconfig "+tmp) {
+		t.Fatalf("kubectl must read the temporary kubeconfig the dry-run wrote:\n%s", got)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Errorf("the temporary kubeconfig %s survived the dry-run", tmp)
+	}
+	if !strings.Contains(string(out), "would delete 0 persistentvolumeclaims") {
+		t.Errorf("the dry-run must preview the in-cluster reap:\n%s", out)
+	}
+}

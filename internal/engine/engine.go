@@ -444,7 +444,25 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []int) []
 		if st.Config != nil {
 			region = st.Config.Cloud.Region
 		}
-		st.Backstops = append(st.Backstops, reap.All(ctx, st.Runner, e.Out, st.KubeconfigCluster, region))
+		// A plan never repointed the operator's kubeconfig, so its in-cluster preview reads
+		// through a temporary one aimed at the cluster by name, removed when the walk is done.
+		// Without it the preview would read whatever the operator's context points at.
+		pinned := true
+		if st.Runner.DryRun {
+			release, err := reap.PointAt(ctx, st.Runner, st.KubeconfigCluster, region)
+			if err != nil {
+				pinned = false
+				e.print(ui.Warn("plan only: could not point a temporary kubeconfig at " + st.KubeconfigCluster +
+					" (" + err.Error() + ") — the in-cluster preview was skipped"))
+				st.Backstops = append(st.Backstops, reap.Backstop{Name: "in-cluster reap", Outcome: reap.NotRun,
+					Detail: "(dry-run) no temporary kubeconfig for " + st.KubeconfigCluster + ": " + err.Error()})
+			} else {
+				defer release()
+			}
+		}
+		if pinned {
+			st.Backstops = append(st.Backstops, reap.All(ctx, st.Runner, e.Out, st.KubeconfigCluster, region))
+		}
 
 		// Force-delete the operator-minted IAM roles the finalizer may not have. A rollback
 		// is the worst case for that finalizer — it runs against a half-built cluster where
@@ -457,8 +475,10 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []int) []
 			org = st.Config.Org.Name
 		}
 		st.Backstops = append(st.Backstops,
-			reap.OperatorRoles(ctx, st.Runner, e.Out, reap.Owner{Org: org, Cluster: st.KubeconfigCluster}),
-			reap.UnstickTerminating(ctx, st.Runner, e.Out))
+			reap.OperatorRoles(ctx, st.Runner, e.Out, reap.Owner{Org: org, Cluster: st.KubeconfigCluster}))
+		if pinned {
+			st.Backstops = append(st.Backstops, reap.UnstickTerminating(ctx, st.Runner, e.Out))
+		}
 
 		// And backstop the NodeClaim reap: a rollback runs against a half-built cluster,
 		// which is exactly the case where Karpenter is not alive to honour a finalizer.

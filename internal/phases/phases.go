@@ -1417,7 +1417,13 @@ func (fleet) Teardown(ctx context.Context, st *engine.State) error {
 	// holds because of the current phase ORDER is one accident away from not holding, and the
 	// accident — adding a required phase after fleet — is invisible at the place it is made.
 	// Making it structural costs one read-only query.
-	if spokes := reap.FleetSpokes(ctx, st.Runner); len(spokes) > 0 {
+	spokes, err := reap.FleetSpokes(ctx, st.Runner)
+	if err != nil {
+		return fmt.Errorf("refusing to tear down the eks-fleet control plane: the spoke clusters it may "+
+			"have vended could not be listed (%w), and a wrong guess that there are none strands real "+
+			"clusters that bill forever. Make the hub's API reachable and re-run", err)
+	}
+	if len(spokes) > 0 {
 		return fmt.Errorf(
 			"refusing to tear down the eks-fleet control plane: %d spoke cluster(s) are still vended "+
 				"(%s). Each is a real EKS cluster — its own control plane, VPC and NAT gateways — often "+

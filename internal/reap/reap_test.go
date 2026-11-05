@@ -472,7 +472,10 @@ func TestPointAt_RefusesABlankCluster(t *testing.T) {
 // only place they are tracked, so a teardown that does not see them strands them past the
 // point of recovery.
 func TestFleetSpokes_NamesEveryVendedCluster(t *testing.T) {
-	got := fleetSpokes(context.Background(), &spokeExecer{out: "team-a/orders  team-b/analytics "})
+	got, err := fleetSpokes(context.Background(), &spokeExecer{out: "team-a/orders  team-b/analytics "})
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []string{"team-a/orders", "team-b/analytics"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -484,16 +487,30 @@ func TestFleetSpokes_NamesEveryVendedCluster(t *testing.T) {
 	}
 }
 
-// No CRD installed (fleet was never enabled) and no reachable cluster both mean the same
-// thing: there is no hub, so there is nothing to strand. Neither may block a teardown.
+// No CRD installed means fleet was never enabled: there is no hub, so there is nothing to
+// strand, and it must not block a teardown.
 func TestFleetSpokes_EmptyWhenThereIsNoHub(t *testing.T) {
 	noCRD := &spokeExecer{err: errors.New(`error: the server doesn't have a resource type "clusters"`)}
-	if got := fleetSpokes(context.Background(), noCRD); len(got) != 0 {
-		t.Fatalf("got %v, want none — an absent CRD must not block a teardown", got)
+	if got, err := fleetSpokes(context.Background(), noCRD); len(got) != 0 || err != nil {
+		t.Fatalf("got %v, %v, want none — an absent CRD must not block a teardown", got, err)
 	}
 }
 
-// spokeExecer answers the one Capture FleetSpokes makes.
+// Anything else leaves the spoke set unknown, and unknown is not empty. An RBAC denial, a
+// timeout or an API that does not answer all read as "no spokes" before, which let a
+// destroy take down a hub whose spokes then billed forever in other accounts.
+func TestFleetSpokes_AnyOtherFailureIsUnknownNotEmpty(t *testing.T) {
+	for _, msg := range []string{
+		`Error from server (Forbidden): clusters.fleet.nanohype.dev is forbidden`,
+		`Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout`,
+	} {
+		if _, err := fleetSpokes(context.Background(), &spokeExecer{err: errors.New(msg)}); err == nil {
+			t.Errorf("%q read as an empty spoke set", msg)
+		}
+	}
+}
+
+// spokeExecer answers the one read FleetSpokes makes.
 type spokeExecer struct {
 	out string
 	err error
@@ -670,6 +687,7 @@ printf '%%s\n' "$*" >> %q
 case "$*" in
   *"get applications -o jsonpath"*) echo cilium; echo app-of-apps ;;
   *"get applications -o json"*) echo '{"items":[]}' ;;
+  *"get statefulsets,deployments"*) echo '{"items":[]}' ;;
 esac
 exit 0
 `, logPath)

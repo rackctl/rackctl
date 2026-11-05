@@ -271,11 +271,55 @@ exit 0
 	}
 }
 
-func TestAll_DryRunDescribes(t *testing.T) {
-	run := exec.New(&bytes.Buffer{})
+// A dry-run previews the reap by reading the cluster for real and deleting nothing: the
+// armed Applications, each kind it would delete, what it would scale down first and the
+// spokes. It used to print its own commands back, which a cluster could never contradict.
+func TestAll_ADryRunReadsTheClusterForReal(t *testing.T) {
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> ` + calls + `
+case "$*" in
+  *"get applications -o json"*) echo '{"items":[{"metadata":{"name":"loki"},"spec":{"syncPolicy":{"automated":{}}}}]}' ;;
+  *"get platforms.platform.nanohype.dev"*) echo platform/a; echo platform/b ;;
+  *"get tenants.platform.nanohype.dev"*) echo "error: the server doesn't have a resource type \"tenants\"" >&2; exit 1 ;;
+  *"get persistentvolumeclaims"*) echo pvc/data-loki-0 ;;
+  *"get statefulsets,deployments"*) echo '{"items":[{"kind":"StatefulSet","metadata":{"name":"loki","namespace":"loki"},"spec":{"volumeClaimTemplates":[{}]}}]}' ;;
+  *clusters.fleet*) echo 'fleet/spoke-a' ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	run := exec.New(&out)
 	run.DryRun = true
-	if b := All(context.Background(), run, &bytes.Buffer{}, "c", "r"); b.Outcome != Acted || !strings.Contains(b.Detail, "dry-run") {
-		t.Fatalf("got %s: %s", b.Outcome, b.Detail)
+	b := All(context.Background(), run, &out, "c", "r")
+	if b.Outcome != Acted || !strings.Contains(b.Detail, "would delete 2 platforms.platform.nanohype.dev") {
+		t.Fatalf("got %s: %s\n%s", b.Outcome, b.Detail, out.String())
+	}
+	for _, want := range []string{"would disarm ArgoCD: 1 Application(s)", "would delete 1 persistentvolumeclaims",
+		"would scale 1 workload(s) that mount PVCs to zero first: loki/statefulset/loki", "1 eks-fleet spoke cluster(s): fleet/spoke-a"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing %q:\n%s", want, out.String())
+		}
+	}
+	got, _ := os.ReadFile(calls)
+	for _, verb := range []string{" delete ", " scale ", " patch "} {
+		if strings.Contains(" "+string(got), verb) {
+			t.Errorf("a dry-run ran a mutation (%s):\n%s", verb, got)
+		}
+	}
+
+	// A kind it cannot read is a preview that did not run.
+	script = strings.Replace(script, `echo pvc/data-loki-0`, `echo Forbidden >&2; exit 1`, 1)
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if b := All(context.Background(), run, &bytes.Buffer{}, "c", "r"); b.Outcome != NotRun {
+		t.Errorf("an unreadable kind: got %s", b.Outcome)
 	}
 }
 
@@ -338,8 +382,15 @@ func TestOperatorRoles_UnenumerableIsNotRun(t *testing.T) {
 
 func TestUnstickTerminating_ReportsWhatItDid(t *testing.T) {
 	ctx := context.Background()
-	if b := unstickTerminating(ctx, &fakeKube{}, true, &bytes.Buffer{}); b.Outcome != Acted {
-		t.Errorf("dry-run: got %s", b.Outcome)
+	// A dry-run reads for real and names what it would unstick, patching nothing.
+	dry := &fakeKube{ready: true, crds: map[string]bool{"platforms.platform.nanohype.dev": true},
+		listing: map[string]string{"platforms.platform.nanohype.dev": "ns ops\n"}}
+	var dryOut bytes.Buffer
+	if b := unstickTerminating(ctx, dry, true, &dryOut); b.Outcome != Acted || b.Detail != "(dry-run) would unstick 1" || len(dry.patched) != 0 {
+		t.Errorf("dry-run: got %s %q, patched %v", b.Outcome, b.Detail, dry.patched)
+	}
+	if !strings.Contains(dryOut.String(), "would unstick platforms.platform.nanohype.dev ns/ops") {
+		t.Errorf("dry-run must name what it would unstick:\n%s", dryOut.String())
 	}
 	if b := unstickTerminating(ctx, &fakeKube{ready: false}, false, &bytes.Buffer{}); b.Outcome != NotRun || !b.Informational {
 		t.Errorf("unreachable is not nothing pinned, and the in-cluster reap's line decides it: got %s informational=%t",

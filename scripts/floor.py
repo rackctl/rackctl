@@ -183,6 +183,12 @@ CRITICAL = [
     ("internal/phases/phases.go", "permitRollbackBuckets"),
     ("internal/phases/dns.go", "WithdrawSubdomainDelegation"),
     ("internal/phases/dns.go", "delegationNotOurs"),
+    ("internal/reap/reap.go", "fleetSpokes"),
+    ("internal/reap/reap.go", "PointAt"),
+    ("internal/reap/reap.go", "scaleVolumeHolders"),
+    ("internal/reap/reap.go", "listVolumeHolders"),
+    ("internal/reap/reap.go", "unstickTerminating"),
+    ("cmd/misc.go", "spokeGuard"),
 ]
 
 

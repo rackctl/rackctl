@@ -30,7 +30,7 @@ func TestRollbackEndsWithTheBackstopSummary(t *testing.T) {
 	var out bytes.Buffer
 	run := exec.New(&out)
 	run.DryRun = true
-	t.Setenv("PATH", t.TempDir()) // no aws: the IAM and Karpenter enumerations cannot run
+	reachableCluster(t) // aws refuses the IAM and Karpenter enumerations
 
 	eng := &Engine{
 		Phases: []Phase{

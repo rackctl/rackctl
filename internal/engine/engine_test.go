@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -47,6 +49,23 @@ func assumePlatform(t *testing.T, state PlatformState) {
 	orig := PlatformExists
 	t.Cleanup(func() { PlatformExists = orig })
 	PlatformExists = func(context.Context, *State) PlatformState { return state }
+}
+
+// reachableCluster puts an aws and a kubectl on PATH for a plan's rollback: aws answers
+// update-kubeconfig, which a plan's in-cluster preview writes a temporary kubeconfig with,
+// and refuses everything else; kubectl answers every read with nothing.
+func reachableCluster(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"aws":     "case \"$2\" in update-kubeconfig) exit 0 ;; esac\necho 'An error occurred (AccessDenied)' >&2\nexit 254\n",
+		"kubectl": "exit 0\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
 }
 
 func equal(a, b []string) bool {
@@ -329,6 +348,7 @@ func TestEngineDoesNotReapBeforeItHasACluster(t *testing.T) {
 // orphaning EBS volumes and IAM roles nothing will ever collect.
 func TestEngineDoesReapOnceTheKubeconfigIsOurs(t *testing.T) {
 	assumePlatform(t, PlatformAbsent)
+	reachableCluster(t)
 	var out bytes.Buffer
 	run := exec.New(&out)
 	run.DryRun = true

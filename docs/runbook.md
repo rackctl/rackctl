@@ -142,8 +142,13 @@ The usual causes, in order of likelihood:
   a component it did not apply is named, and the incomplete rollback's error names
   `rackctl destroy --force-buckets`.
 - **`could not point kubectl at <cluster>`** — the in-cluster sweeps were skipped. The
-  component teardown still ran and terraform state is scoped by state key, so nothing
-  belonging to another cluster was touched. Fix the kubeconfig and re-run the destroy.
+  component teardown still ran and terraform state is scoped by state key, so no other
+  cluster's Terraform-managed resources were touched. Fix the kubeconfig and re-run the
+  destroy.
+- **`PVCs did not delete cleanly`** — a pod still mounted the claim. After a verified ArgoCD
+  disarm the reap scales every StatefulSet and Deployment outside kube-system that mounts a
+  PVC to zero and waits for it before deleting the claims; the line before it names what
+  was still running, or why the scale-down was skipped.
 - **`in-cluster reap did NOT run — <cluster> exists … but its API does not answer`** — the
   cluster is there and this host cannot reach it: a private endpoint, or an allow-list that
   does not hold this host's egress IP. The line prints both. Re-run from a host the endpoint
@@ -182,6 +187,11 @@ elsewhere, it is left in place, and the line names the servers it points at and 
 destroyed, though kubectl's context now points at the hub. Each spoke is a real EKS cluster
 with its own control plane, VPC and NAT gateways, frequently in another account, and this
 hub is the only thing that knows they exist. Tear the spokes down first.
+
+With `controlPlane.eksFleet` on, it also refuses, with `9`, when the spokes cannot be
+listed: an RBAC denial, a timeout, or a hub this host cannot reach. There is no override.
+Make the hub's API reachable from this host and re-run. A `--dry-run` reads the hub for
+real and shows the same refusal.
 
 ## Where the output went
 
