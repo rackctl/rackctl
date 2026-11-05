@@ -55,7 +55,7 @@ internal/
   doctor/       day-2 health checks
   reap/         sweeps what Terraform does not own; ownership proved by tags
   gitops/       catalog account-id writeback
-  awsid/        assume-role session, cached and re-assumed before expiry
+  awsid/        assume-role session: cached for reads, assumed anew for every mutation
   tf/           terragrunt output parsing
   tui/          bubbletea progress view
   ui/           shared lipgloss styling
