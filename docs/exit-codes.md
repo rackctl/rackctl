@@ -16,7 +16,7 @@ must not be renumbered.
 | 4 | `declined` | A human refused the confirmation, or there was no human to ask. | Nothing was destroyed. Pass `--yes` for a scripted teardown. |
 | 5 | `platform-left-standing` | A phase failed and the platform was deliberately left up — an optional phase, a convergence timeout, or a re-apply over a platform that was already standing. | The platform is usable. `rackctl check` says what is wrong. `rackctl destroy` to remove it. |
 | 6 | `rolled-back` | A phase failed and the rollback ran, and every part of it held. | What this run created has been destroyed. Fix and re-run. |
-| 7 | `resources-may-remain` | Something may still be billing and nobody can vouch for it: the rollback could not finish; a teardown (a rollback or `rackctl destroy`) ended with a backstop that failed or did not run; a `rackctl destroy` component failed; the run could not tell whether a platform already existed, so it rolled nothing back; `--no-clean-on-failure` left a half-built platform in place; or a second interrupt forced exit after a tool that can change the cloud had started, or a second `q` under `--tui` forced exit, before the unwind finished. | Needs a human. See [runbook.md](runbook.md) — *A teardown that stopped partway*. |
+| 7 | `resources-may-remain` | Something may still be billing and nobody can vouch for it: the rollback could not finish; a teardown (a rollback or `rackctl destroy`) ended with a backstop that failed or did not run; a `rackctl destroy` component failed, left the account-scoped roots holding state without `--account-scoped`, or could not read the state of a component the config no longer applies; the run could not tell whether a platform already existed, so it rolled nothing back; `--no-clean-on-failure` left a half-built platform in place; or a second interrupt forced exit after a tool that can change the cloud had started, or a second `q` under `--tui` forced exit, before the unwind finished. | Needs a human. See [runbook.md](runbook.md) — *A teardown that stopped partway*. |
 | 8 | `aborted` | The operator interrupted (Ctrl-C, `SIGTERM`, or the first `q` under `--tui`), and the unwind the run owed has finished — or nothing had been touched yet, which includes a second interrupt that forced exit before any tool that can change the cloud had started (at the `destroy` prompt, or during `check` or `plan`, which start none). | Verify with `rackctl check`, then `rackctl destroy` if needed. An interrupted run whose unwind did not finish exits `7` instead. |
 | 9 | `refused` | A command refused before it touched anything: an `apply` stopped before any spend (a pin that does not resolve, a landing-zone or eks-agent-platform checkout missing a live root, a portal datastore key with no mapping, the preflight phase's tool or identity check, a short vCPU quota whose increase is filed or already pending), or a `rackctl destroy` refused before any destroy (an eks-fleet hub with live spokes). | Nothing changed. The message names what to fix. A destroy refusal says it repointed kubectl. |
 | 10 | `unhealthy` | `rackctl check` ran and found the platform unhealthy, found kubectl pointed at a different cluster, or found the cluster in EKS and could not reach it from this shell. | Read the failed checks. For an unreachable or wrong cluster, run the `aws eks update-kubeconfig` line the check prints and re-run it. |
@@ -57,7 +57,9 @@ this shell cannot reach it; `3` when only pre-spend checks failed; `1` when it c
 run, or could not find out whether the cluster exists; `2` for a config that did not load.
 
 **`rackctl destroy`** exits `0` when every component came down and every backstop held,
-`7` when a component failed or a backstop did not hold, `9` when it refused before any
+`7` when a component failed or a backstop did not hold, when the account-scoped roots still
+hold state and `--account-scoped` was not passed, or when the state of a component the config
+no longer applies could not be read, `9` when it refused before any
 destroy, `4` when the confirmation was declined, and `8` when an interrupt arrived before
 anything was destroyed. An interrupt once the teardown has begun leaves components standing
 and exits `7`, with the message starting `interrupted:`.
@@ -88,9 +90,15 @@ rackctl check -c rackctl.yaml --output json | jq '.preflight[] | select(.status=
   "clusterExists": "present",
   "passed": false,
   "preflight": [{ "name": "vcpu quota", "status": "fail", "detail": "…" }],
-  "platform": []
+  "platform": [],
+  "defaulted": [{ "field": "cluster.endpointPublicAccess", "value": "true" }]
 }
 ```
+
+`defaulted` lists every value the config left out and rackctl filled in: `field` is the
+dotted `rackctl.yaml` path and `value` the value used, as it would be written in the file.
+It is an empty list when the config names every value, and `null` on a report whose config
+did not load.
 
 Each result's `status` is one of:
 

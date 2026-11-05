@@ -83,6 +83,11 @@ through it for real: the armed ArgoCD Applications, the Platforms, Tenants, Node
 PVCs it would delete, the workloads it would scale down first, and the eks-fleet spokes
 that would make the destroy refuse.
 
+What it tears down is decided by state, not only by this config. Every component the
+config does not apply is read from its state bucket, under --dry-run too, and one that still
+holds resources is torn down with the rest and named: a component turned off after an apply
+is still standing. One whose state cannot be read is named, and the destroy exits 7.
+
 With controlPlane.eksFleet on, a destroy refuses when the spoke clusters this hub may
 have vended cannot be listed. There is no override: a wrong guess that there are none
 strands real clusters that bill forever, often in another account.
@@ -104,7 +109,8 @@ force_destroy from its object-lock mode, which live/org pins to GOVERNANCE for t
 reason. Bedrock's invocations bucket carries per-object GOVERNANCE retention on top
 of that, so tearing it down also requires s3:BypassGovernanceRetention on the caller
 — a permission rackctl neither declares nor checks, so a destroy without it fails at
-the object rather than at the flag.`,
+the object rather than at the flag. Without --account-scoped those two roots are left
+standing, and a destroy that leaves them holding state names them and exits 7.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load(destroyConfig)
 		if err != nil {
@@ -293,13 +299,30 @@ the object rather than at the flag.`,
 			Outputs: map[string]string{},
 		}
 
+		// What to tear down is what is standing, not what today's config asks to build. Every
+		// component the config no longer applies is read from state — read-only, and under
+		// --dry-run too — and walked when it still holds resources. A dns component torn down
+		// that way needs its zone, which the state records; it is lent to this run's config
+		// so the component's destroy and the delegation withdrawal both have it.
+		set := phases.TeardownComponents(ctx, st)
+		if set.Zone != "" {
+			teardown := *cfg
+			teardown.DNS = &config.DNS{HostedZone: set.Zone}
+			st.Config = &teardown
+		}
+		apOpts := phases.AgentPlatformTeardown{
+			AccountScoped: destroyAccountScoped,
+			ForceBuckets:  destroyForceBuckets,
+			FromState:     true,
+		}
+
 		// Act 1 of the two-act teardown. force_destroy has no effect until an apply lands
 		// it in state, so this must run BEFORE any destroy — and while every dependency each
 		// leaf declares is still live (agent-iam needs cluster+secrets, cluster-addons needs
 		// cluster, druid needs network+cluster, model-import needs nothing).
 		if destroyForceBuckets {
 			fmt.Println(ui.Step("force-buckets: permit teardown (apply force_destroy_buckets=true)"))
-			if err := phases.PermitBucketTeardown(ctx, st); err != nil {
+			if err := phases.PermitBucketTeardown(ctx, st, set.Unconfigured...); err != nil {
 				return err
 			}
 		}
@@ -326,6 +349,8 @@ the object rather than at the flag.`,
 		// still exit non-zero naming all of them.
 		var failed []error
 
+		// A config with the platform off still asks: the tree's state is what says whether
+		// an earlier apply installed it.
 		if cfg.AgentPlatform.Enabled() {
 			if destroyAccountScoped && !destroyForceBuckets {
 				fmt.Println(ui.Warn("--account-scoped without --force-buckets: the account buckets take " +
@@ -333,17 +358,14 @@ the object rather than at the flag.`,
 			}
 			phases.CaptureLandingZoneOutputs(ctx, st)
 			fmt.Println(ui.Step("destroy agent-platform substrate"))
-			if err := phases.DestroyAgentPlatform(ctx, st, phases.AgentPlatformTeardown{
-				AccountScoped: destroyAccountScoped,
-				ForceBuckets:  destroyForceBuckets,
-			}); err != nil {
-				// NOT a return. See the note above the loop below — this tree holds IAM,
-				// SSM and buckets, and the components after it hold the EKS control plane,
-				// the VPC and the NAT gateway.
-				failed = append(failed, fmt.Errorf("agent-platform substrate: %w", err))
-				fmt.Println(ui.Warn("agent-platform teardown failed — continuing to the " +
-					"landing-zone components, which is where the billable resources are"))
-			}
+		}
+		if err := phases.DestroyAgentPlatform(ctx, st, apOpts); err != nil {
+			// NOT a return. See the note above the loop below — this tree holds IAM,
+			// SSM and buckets, and the components after it hold the EKS control plane,
+			// the VPC and the NAT gateway.
+			failed = append(failed, fmt.Errorf("agent-platform substrate: %w", err))
+			fmt.Println(ui.Warn("agent-platform teardown failed — continuing to the " +
+				"landing-zone components, which is where the billable resources are"))
 		}
 
 		// A destroy that stops at its first failure leaves the most expensive things
@@ -367,7 +389,7 @@ the object rather than at the flag.`,
 		// returning NXDOMAIN. Idempotent: no record, nothing to do.
 		phases.WithdrawSubdomainDelegation(ctx, st)
 
-		comps := phases.CoreComponents(cfg)
+		comps := set.Components
 		for i := len(comps) - 1; i >= 0; i-- {
 			c := comps[i]
 			fmt.Println(ui.Step("destroy " + c))
@@ -385,6 +407,19 @@ the object rather than at the flag.`,
 		// backstop that guards something ran clean.
 		clean := reap.Summarize(os.Stdout, backstops)
 
+		// What this destroy could not vouch for, beyond the components and backstops: state it
+		// could not read for a component the config no longer applies, and the account-scoped
+		// roots it leaves without --account-scoped. Either may be standing, so neither exits 0.
+		remain := teardownRemains(set)
+		if left, err := phases.AgentPlatformLeft(ctx, st, apOpts); err != nil {
+			remain = append(remain, fmt.Errorf("whether the account-scoped agent-platform roots still hold "+
+				"state could not be read: %w", err))
+		} else if len(left) > 0 {
+			remain = append(remain, fmt.Errorf("the account-scoped roots %s still hold state and were left "+
+				"standing: they are shared by every environment in this account. If this is the last "+
+				"environment here, re-run with --account-scoped --force-buckets", strings.Join(left, ", ")))
+		}
+
 		// An interrupt after the teardown began is a teardown that stopped partway, which is
 		// what every failure below reports; the prefix says why it stopped.
 		interrupted := ctx.Err() != nil
@@ -401,7 +436,7 @@ the object rather than at the flag.`,
 			// Resources may remain: the components behind a failure are standing, and an
 			// automation that read this as a generic failure could not tell it from a config
 			// that did not load.
-			return withExit(ExitStranded, said(errors.Join(failed...)))
+			return withExit(ExitStranded, said(errors.Join(append(failed, remain...)...)))
 		}
 		// A guard that did not hold can leave a Karpenter node billing or an operator role
 		// standing, which is the same fact a component that failed to destroy reports. So it
@@ -411,13 +446,30 @@ the object rather than at the flag.`,
 			fmt.Println(ui.Warn("every component was destroyed, but not every backstop ran clean — " +
 				"resources outside terraform's state may remain. The summary above names which; fix the " +
 				"cause and re-run `rackctl destroy`, which is idempotent"))
-			return withExit(ExitStranded, said(fmt.Errorf(
+			return withExit(ExitStranded, said(errors.Join(append([]error{fmt.Errorf(
 				"every component was destroyed, but these backstops did not hold: %s — resources "+
-					"outside terraform's state may remain", strings.Join(reap.Unheld(backstops), ", "))))
+					"outside terraform's state may remain", strings.Join(reap.Unheld(backstops), ", "))},
+				remain...)...)))
+		}
+		if len(remain) > 0 {
+			fmt.Println(ui.Warn("every component this destroy walked came down, but it cannot vouch for " +
+				"everything: the lines below name what may remain"))
+			return withExit(ExitStranded, said(errors.Join(remain...)))
 		}
 		fmt.Println(ui.OK("platform destroyed"))
 		return nil
 	},
+}
+
+// teardownRemains names the components a destroy did not walk and cannot prove are gone:
+// ones this config does not apply whose state could not be read.
+func teardownRemains(set phases.TeardownSet) []error {
+	if len(set.Unread) == 0 {
+		return nil
+	}
+	return []error{fmt.Errorf("the state of %s, which this config does not apply, could not be read, so "+
+		"they were not torn down and may be standing; fix the access and re-run the destroy",
+		strings.Join(set.Unread, ", "))}
 }
 
 // spokeGuard refuses a destroy while this cluster may be an eks-fleet hub with spoke

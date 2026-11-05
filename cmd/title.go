@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/rackctl/rackctl/internal/config"
+	"github.com/rackctl/rackctl/internal/ui"
 )
 
 // commandTitle is the banner a command prints before it acts.
@@ -27,4 +28,20 @@ func commandTitle(verb string, cfg *config.Config) string {
 		cfg.Cloud.Region,
 		cfg.Environment,
 	)
+}
+
+// defaultedLines is the block a command prints under its title naming every value the config
+// left out and rackctl filled in. A default is a decision nobody wrote down; some decide whether
+// the EKS API faces the internet or what sizes the node group gets, so each one is said rather
+// than left to be discovered. Nothing when the config names every value.
+func defaultedLines(cfg *config.Config) []string {
+	d := cfg.Defaulted()
+	if len(d) == 0 {
+		return nil
+	}
+	lines := []string{ui.Step(fmt.Sprintf("%d value(s) not set in the config, using defaults (set them to choose):", len(d)))}
+	for _, v := range d {
+		lines = append(lines, fmt.Sprintf("    %s: %s", v.Field, v.Value))
+	}
+	return lines
 }

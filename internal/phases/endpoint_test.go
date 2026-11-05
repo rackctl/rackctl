@@ -25,13 +25,16 @@ func endpointState(dryRun, public bool, allowlist []string) *engine.State {
 			Environment: config.EnvDev,
 			Cluster: config.Cluster{
 				Name:                 "platform",
-				EndpointPublicAccess: public,
+				EndpointPublicAccess: boolPtr(public),
 				EndpointAllowlist:    allowlist,
 			},
 		},
 		Runner: run,
 	}
 }
+
+// boolPtr is the *bool a config field that defaults to true takes.
+func boolPtr(b bool) *bool { return &b }
 
 // withResolver swaps the egress-IP resolver for the duration of a test. The autodetect path
 // must never make a real network call under test.
@@ -335,5 +338,38 @@ func TestClusterEndpointEnv_AnIncompleteLivePostureRefuses(t *testing.T) {
 				t.Fatalf("want a refusal naming cluster.endpointAllowlist, got %v", err)
 			}
 		})
+	}
+}
+
+// The posture note says whether the value came from the file or from the environment's
+// default. An omitted value used to inject false everywhere, so a minimal development config
+// got a private endpoint that stranded the phases running on the operator's host.
+func TestClusterEndpointEnv_SaysWhetherThePostureWasDefaulted(t *testing.T) {
+	for _, tc := range []struct {
+		env    config.Environment
+		set    *bool
+		inject string
+		say    string
+	}{
+		{config.EnvDev, nil, "=true", "the development default"},
+		{config.EnvStaging, nil, "=false", "the staging default"},
+		{config.EnvDev, boolPtr(false), "=false", "from cluster.endpointPublicAccess"},
+	} {
+		var out strings.Builder
+		run := exec.New(&out)
+		run.DryRun = true
+		cfg := &config.Config{Environment: tc.env, Cluster: config.Cluster{Name: "platform",
+			EndpointPublicAccess: tc.set, EndpointAllowlist: []string{"203.0.113.4/32"}}}
+		cfg.ApplyDefaults()
+		env, err := clusterEndpointEnv(context.Background(), &engine.State{Config: cfg, Runner: run}, "apply")
+		if err != nil {
+			t.Fatalf("%s: %v", tc.env, err)
+		}
+		if !slices.Contains(env, "TF_VAR_cluster_endpoint_public_access"+tc.inject) {
+			t.Errorf("%s (set=%v): want public_access%s, got %v", tc.env, tc.set, tc.inject, env)
+		}
+		if !strings.Contains(out.String(), tc.say) {
+			t.Errorf("%s (set=%v): the note must say %q:\n%s", tc.env, tc.set, tc.say, out.String())
+		}
 	}
 }

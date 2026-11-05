@@ -119,12 +119,19 @@ func runPipeline(ctx context.Context, write bool) error {
 	st := &engine.State{Config: cfg, Runner: run}
 
 	if applyTUI {
+		// Printed before the view takes the screen, so it is on the terminal when the run ends.
+		for _, l := range defaultedLines(cfg) {
+			fmt.Println(l)
+		}
 		// CleanOnFail must match the non-TUI construction below — hardcoding it here
 		// meant --no-clean-on-failure was silently ignored under --tui.
 		return classifyRun(ctx, tui.RunInit(ctx, title, st, phases.All(), !applyNoClean))
 	}
 
 	fmt.Println(ui.Title(title))
+	for _, l := range defaultedLines(cfg) {
+		fmt.Println(l)
+	}
 	if !write {
 		fmt.Println(ui.Warn("plan — nothing is created or changed. `rackctl apply` provisions for real"))
 	}

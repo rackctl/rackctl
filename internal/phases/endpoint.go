@@ -98,9 +98,11 @@ const destroyPlaceholderCIDR = "192.0.2.0/32"
 // list is read on a dry-run too, through Query, since reading it opens nothing.
 func clusterEndpointEnv(ctx context.Context, st *engine.State, verb string) ([]string, error) {
 	c := st.Config.Cluster
-	env := []string{fmt.Sprintf("TF_VAR_cluster_endpoint_public_access=%t", c.EndpointPublicAccess)}
+	public := st.Config.PublicEndpoint()
+	env := []string{fmt.Sprintf("TF_VAR_cluster_endpoint_public_access=%t", public)}
+	note(st, "EKS API endpoint: public access %t, %s", public, endpointSource(st))
 
-	if !c.EndpointPublicAccess {
+	if !public {
 		note(st, "EKS API endpoint: PRIVATE (public access off) — reach it from inside the VPC (bastion/VPN)")
 		return env, nil
 	}
@@ -173,6 +175,16 @@ func clusterEndpointEnv(ctx context.Context, st *engine.State, verb string) ([]s
 	note(st, "EKS API endpoint: PUBLIC, allow-listed to %s (auto-detected operator egress IP); a re-apply "+
 		"keeps it", cidrs[0])
 	return withCIDRs(env, cidrs)
+}
+
+// endpointSource says where the public-access value came from: the file, or the
+// environment's default, which is public in development and private elsewhere.
+func endpointSource(st *engine.State) string {
+	if st.Config.IsDefaulted("cluster.endpointPublicAccess") {
+		return fmt.Sprintf("the %s default (cluster.endpointPublicAccess is not set; set it to choose)",
+			st.Config.Environment)
+	}
+	return "from cluster.endpointPublicAccess"
 }
 
 // withCIDRs appends the allow-list. Terragrunt/tofu read a list(string) TF_VAR as JSON.

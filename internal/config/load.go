@@ -26,6 +26,10 @@ func Load(path string) (*Config, error) {
 	if err := checkRetired(b); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	// Kept so ApplyDefaults can tell a key the file leaves out from one it sets to zero. A
+	// document that decodes into Config decodes into a map too, so the error is unreachable,
+	// and a nil map only makes every zero read as omitted, which is the behaviour without it.
+	_ = yaml.Unmarshal(b, &c.raw)
 	c.ApplyDefaults()
 	if err := c.Validate(); err != nil {
 		return &c, err

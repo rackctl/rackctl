@@ -83,9 +83,12 @@ func TestDestroy_PlatformDestroyedOnlyWhenTheBackstopsHeld(t *testing.T) {
 }
 
 func TestDestroy_ABackstopThatDidNotRunWithholdsPlatformDestroyed(t *testing.T) {
-	// Every aws read is denied: the dry-run cannot write its temporary kubeconfig, so the
-	// in-cluster preview does not run, and the IAM and EC2 backstops cannot enumerate.
-	out, err := runDestroyDryRun(t, "echo 'An error occurred (AccessDenied)' >&2\nexit 254\n")
+	// Every aws read but the state reads is denied: the dry-run cannot write its temporary
+	// kubeconfig, so the in-cluster preview does not run, and the IAM and EC2 backstops cannot
+	// enumerate. The state buckets answer empty, so every component is accounted for and the
+	// backstops alone decide the status.
+	out, err := runDestroyDryRun(t, "case \"$1\" in s3|s3api) exit 0 ;; esac\n"+
+		"echo 'An error occurred (AccessDenied)' >&2\nexit 254\n")
 	if code := exitStatus(err); code != ExitStranded {
 		t.Fatalf("a guard that did not run leaves resources that may be billing: want exit %d, got %d (%v)\n%s",
 			ExitStranded, code, err, out)

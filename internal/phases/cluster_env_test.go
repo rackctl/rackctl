@@ -32,7 +32,7 @@ func TestClusterEnv_DefaultInjectsNoSizing(t *testing.T) {
 	cfg.Cloud.AccountID = "111111111111"
 	cfg.Cloud.Profile = "workload-development"
 	cfg.Cluster.Name = "platform"
-	cfg.Cluster.EndpointPublicAccess = false // avoid egress autodetection in this test
+	cfg.Cluster.EndpointPublicAccess = boolPtr(false) // avoid egress autodetection in this test
 	cfg.ApplyDefaults()
 
 	env, err := clusterEnv(context.Background(), sizingState(cfg), "apply")
@@ -60,7 +60,7 @@ func TestClusterEnv_InjectsNonDefaultVersion(t *testing.T) {
 	cfg := config.Default()
 	cfg.Cluster.Name = "platform"
 	cfg.Cluster.Version = "1.35"
-	cfg.Cluster.EndpointPublicAccess = false
+	cfg.Cluster.EndpointPublicAccess = boolPtr(false)
 
 	env, err := clusterEnv(context.Background(), sizingState(cfg), "apply")
 	if err != nil {

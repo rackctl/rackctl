@@ -1,5 +1,9 @@
 # rackctl full-provision config — AWS, development.
 # `rackctl plan -c examples/rackctl.yaml`, then `rackctl apply -c examples/rackctl.yaml`.
+#
+# Every value this file leaves out is filled with a default, and plan, apply and check list
+# each one under their title with the value used (`rackctl check --output json` carries the
+# same list as `defaulted`). cloud.region and environment have no default and are required.
 org:
   name: acme
   gitops:
@@ -9,19 +13,19 @@ org:
 cloud:
   provider: aws
   accountId: "111111111111"
-  region: us-west-2
+  region: us-west-2              # required, no default: name a region your organization's SCPs allow
   profile: workload-development  # AWS SSO profile
 
-environment: development         # development | staging | production
+environment: development         # development | staging | production. Required, no default
 
 cluster:
   name: platform                 # cluster base; the EKS cluster is <environment>-<name> (development-platform). Required, unique per account+env, must != environment
   version: "1.36"                # Kubernetes major.minor. Matches landing-zone's default. Injected as TF_VAR_cluster_version ONLY when it differs from this default — an ambient TF_VAR would otherwise silently override a leaf that pins a different version. Preflight cannot read the leaf default, so it checks upgrade skew only for a version other than this one
-  endpointPublicAccess: true     # prod MUST be false (needs bastion/VPN). landing-zone is private-by-default; rackctl supplies this posture at apply time
+  endpointPublicAccess: true     # omitted: true in development, false in staging and production. An explicit true is refused in production (needs bastion/VPN). landing-zone is private-by-default; rackctl supplies this posture at apply time and the plan says whether it came from here or from the default
   endpointAllowlist: []          # CIDRs allowed to reach the public API endpoint. Empty + public => the first apply auto-detects this host's egress IP as <ip>/32 (never 0.0.0.0/0), and a re-apply keeps the live list while the live endpoint is public (a world-open live list is refused, not kept). Explicit entries win and are how to change it, e.g. [203.0.113.4/32]
   systemNodes:
     instanceTypes: [m7g.xlarge, m6g.xlarge]  # matches landing-zone; a value equal to this default is never injected, so the shown list is what you get
-    minSize: 2
+    minSize: 2                   # an explicit 0 is refused rather than replaced; omit a size to take its default
     maxSize: 6
     desiredSize: 2               # injected as system_node_* ONLY when any field differs from these defaults, so staging/production leaf pins stand
   network:
@@ -174,7 +178,7 @@ agentPlatform:
                                 # Without the check the apply dies at root two of seven — after the VPC, the
                                 # EKS control plane and ArgoCD convergence are built and billing.
   compliance:
-    soc2: true
+    soc2: true                  # default true when omitted
     hipaa: false
 
 controlPlane:

@@ -680,10 +680,25 @@ func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatf
 	//
 	// On the APPLY path the same missing output stays fatal, because there it means the
 	// substrate is about to be built against a key that does not exist.
+	comps, err := agentPlatformTeardownComponents(ctx, st, bucket, opts)
+	if err != nil {
+		return err
+	}
+	if len(comps) == 0 {
+		note(st, "agent-platform substrate: this config does not install the agent platform and no "+
+			"component of the tree holds state in s3://%s — nothing to destroy", bucket)
+		return nil
+	}
+	// A config with the platform off never read the landing-zone outputs this tree's destroy
+	// needs, because it had no tree to destroy until state said otherwise.
+	if !st.Config.AgentPlatform.Enabled() {
+		CaptureLandingZoneOutputs(ctx, st)
+	}
+
 	clusterEnv, cerr := agentPlatformEnv(st)
 	accountEnv, aerr := agentPlatformAccountEnv(st)
 	if missing := errors.Join(cerr, aerr); missing != nil {
-		holding, err := agentPlatformStateHolders(ctx, st, bucket, opts)
+		holding, err := agentPlatformStateHolders(ctx, st, bucket, reachable(comps, opts))
 		if err != nil {
 			return fmt.Errorf("%w; and whether this tree still holds state could not be read: %w", missing, err)
 		}
@@ -701,7 +716,6 @@ func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatf
 	st.Runner.Dir = st.Repos.AgentPlatform
 	defer func() { st.Runner.Dir, st.Runner.Env = prevDir, prevEnv }()
 
-	comps := agentPlatformComponents(st.Config)
 	note(st, "agent-platform substrate: destroying in reverse, BEFORE landing-zone — these components "+
 		"read agent-iam's and observability's SSM parameters through unguarded data blocks, and a "+
 		"destroy PLAN resolves data sources too, so tearing landing-zone down first leaves them "+
@@ -773,9 +787,29 @@ func s3BucketAbsent(err error) bool {
 // shares the bucket, out of the answer. An object that exists with no resources is a root
 // already destroyed — terraform keeps the empty state — and holds nothing.
 //
-// Account roots count only when this teardown would reach them: without --account-scoped
-// they are deliberately left standing, and their state is not this environment's to report.
-func agentPlatformStateHolders(ctx context.Context, st *engine.State, bucket string, opts AgentPlatformTeardown) ([]string, error) {
+// Only the components in comps are asked about; a caller passes the ones its teardown
+// would reach.
+func agentPlatformStateHolders(ctx context.Context, st *engine.State, bucket string, comps []apComponent) ([]string, error) {
+	held, err := agentPlatformHolders(ctx, st, bucket, comps)
+	if err != nil {
+		return nil, err
+	}
+	var holding []string
+	for _, h := range held {
+		holding = append(holding, fmt.Sprintf("%s (%d resource(s))", h.name, h.resources))
+	}
+	return holding, nil
+}
+
+// apHolding is one component of this tree whose state still lists resources.
+type apHolding struct {
+	apComponent
+	resources int
+}
+
+// agentPlatformHolders is agentPlatformStateHolders' read, returning the components rather
+// than their display lines.
+func agentPlatformHolders(ctx context.Context, st *engine.State, bucket string, comps []apComponent) ([]apHolding, error) {
 	listed, err := st.Runner.Query(ctx, "aws", "s3api", "list-objects-v2", "--bucket", bucket,
 		"--query", "Contents[].Key", "--output", "text")
 	if err != nil {
@@ -783,11 +817,8 @@ func agentPlatformStateHolders(ctx context.Context, st *engine.State, bucket str
 	}
 	keys := strings.Fields(listed)
 
-	var holding []string
-	for _, c := range agentPlatformComponents(st.Config) {
-		if c.account && !opts.AccountScoped {
-			continue
-		}
+	var holding []apHolding
+	for _, c := range comps {
 		segment := strings.TrimPrefix(agentPlatformDir(st, c), "terraform/live/") + "/"
 		for _, key := range keys {
 			if !strings.HasSuffix(key, ".tfstate") ||
@@ -805,11 +836,104 @@ func agentPlatformStateHolders(ctx context.Context, st *engine.State, bucket str
 				return nil, fmt.Errorf("s3://%s/%s is not readable terraform state: %w", bucket, key, err)
 			}
 			if len(state.Resources) > 0 {
-				holding = append(holding, fmt.Sprintf("%s (%d resource(s))", c.name, len(state.Resources)))
+				holding = append(holding, apHolding{apComponent: c, resources: len(state.Resources)})
 			}
 		}
 	}
 	return holding, nil
+}
+
+// reachable is comps minus the account roots a teardown without --account-scoped leaves
+// standing: their state is not this environment's to report.
+func reachable(comps []apComponent, opts AgentPlatformTeardown) []apComponent {
+	var out []apComponent
+	for _, c := range comps {
+		if c.account && !opts.AccountScoped {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// allAgentPlatformComponents is every component of this tree, in apply order: the list
+// agentPlatformComponents returns for a config with every gate on.
+func allAgentPlatformComponents(cfg *config.Config) []apComponent {
+	all := *cfg
+	on := true
+	all.AgentPlatform.CostPipeline = &on
+	return agentPlatformComponents(&all)
+}
+
+// agentPlatformTeardownComponents is the walk DestroyAgentPlatform takes, in apply order.
+//
+// Without FromState it is the config's own set, which is what a rollback undoes. With it,
+// every component the config does not install is read from state, and walked when it still
+// holds resources: a config that turned the platform or its cost tier off after applying them
+// otherwise walked past their state, left their IAM, SSM and buckets standing, and reported a
+// clean teardown. Account roots are asked about only when the teardown would reach them.
+func agentPlatformTeardownComponents(ctx context.Context, st *engine.State, bucket string, opts AgentPlatformTeardown) ([]apComponent, error) {
+	var configured []apComponent
+	if st.Config.AgentPlatform.Enabled() {
+		configured = agentPlatformComponents(st.Config)
+	}
+	if !opts.FromState {
+		return configured, nil
+	}
+	isConfigured := map[string]bool{}
+	for _, c := range configured {
+		isConfigured[c.name] = true
+	}
+	var others []apComponent
+	for _, c := range reachable(allAgentPlatformComponents(st.Config), opts) {
+		if !isConfigured[c.name] {
+			others = append(others, c)
+		}
+	}
+	if len(others) == 0 {
+		return configured, nil
+	}
+	held, err := agentPlatformHolders(ctx, st, bucket, others)
+	if err != nil {
+		return nil, fmt.Errorf("could not establish whether the agent-platform components this config does "+
+			"not install still hold state: %w", err)
+	}
+	holds := map[string]bool{}
+	for _, h := range held {
+		holds[h.name] = true
+		note(st, "agent-platform substrate: %s is not in this config but its state holds %d resource(s) — "+
+			"tearing it down with the rest", h.name, h.resources)
+	}
+	var comps []apComponent
+	for _, c := range allAgentPlatformComponents(st.Config) {
+		if isConfigured[c.name] || holds[c.name] {
+			comps = append(comps, c)
+		}
+	}
+	return comps, nil
+}
+
+// AgentPlatformLeft names the account roots of this tree that hold state and that a
+// teardown without --account-scoped leaves standing, so a destroy that leaves them can say
+// so and not exit 0. Empty with --account-scoped, and when the tree was never applied.
+func AgentPlatformLeft(ctx context.Context, st *engine.State, opts AgentPlatformTeardown) ([]string, error) {
+	if opts.AccountScoped {
+		return nil, nil
+	}
+	bucket := agentPlatformStateBucket(st)
+	if _, err := st.Runner.Query(ctx, "aws", "s3api", "head-bucket", "--bucket", bucket); err != nil {
+		if s3BucketAbsent(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("aws s3api head-bucket on s3://%s: %w", bucket, err)
+	}
+	var account []apComponent
+	for _, c := range allAgentPlatformComponents(st.Config) {
+		if c.account {
+			account = append(account, c)
+		}
+	}
+	return agentPlatformStateHolders(ctx, st, bucket, account)
 }
 
 // AgentPlatformTeardown says how far a teardown of ONE environment may reach.
@@ -840,6 +964,10 @@ type AgentPlatformTeardown struct {
 	// "COMPLIANCE"`, and live/org/bedrock-account pins GOVERNANCE precisely so the account tears
 	// down cleanly. It does quietly require s3:BypassGovernanceRetention on the caller.
 	ForceBuckets bool
+	// FromState also tears down the components this config does not install whose state
+	// still holds resources. `rackctl destroy` sets it; a rollback does not, because a
+	// rollback undoes what its own run applied and nothing else.
+	FromState bool
 }
 
 // noteAccountScopedTeardown says exactly what a teardown is about to leave behind, or about to

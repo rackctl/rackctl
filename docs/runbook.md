@@ -18,6 +18,12 @@ Confirm the **account** and the **profile** in that line before you proceed. The
 shared by every account you have and the org name says nothing about which credentials are
 in scope, so those two are the only fields that identify the cloud about to change.
 
+Under the banner, `plan`, `apply` and `check` list every value the config left out and the
+default used, such as `cluster.endpointPublicAccess: true`. A default you did not mean is
+fixed by setting the field. `cloud.region` and `environment` have no default: a config
+without them exits `2` naming the field, and so does a node-group size set to `0`, which is
+refused rather than replaced.
+
 `rackctl destroy` then asks you to type the cluster name. That is deliberately worse
 ergonomics than a y/n: the failure this guards is a reflex failure, and the name is the one
 thing you cannot type correctly while thinking about a different cluster.
@@ -168,6 +174,18 @@ The usual causes, in order of likelihood:
   cluster is there and this host cannot reach it: a private endpoint, or an allow-list that
   does not hold this host's egress IP. The line prints both. Re-run from a host the endpoint
   admits so the Platforms, NodeClaims and PVCs are reaped before the cluster goes.
+
+- **`the account-scoped roots … still hold state and were left standing`** — every component
+  of this environment came down, and the account's Bedrock invocation-logging root and cost
+  pipeline did not, because they are shared by every environment in the account. The exit is
+  `7` so an automation does not record an empty account. If other environments still run
+  here, that is the intended end state. If this is the last one, re-run with
+  `--account-scoped --force-buckets`.
+- **`<component> is not in this config but its state holds …`** — the config turned the
+  component off after an apply. The destroy tears it down with the rest; nothing to do unless
+  its own destroy fails. **`the state of <component>, which this config does not apply, could
+  not be read`** is the same case without proof either way: it is not walked, and the run exits
+  `7`. Fix the access to the state bucket and re-run.
 
 Both `rackctl destroy` and a rollback end with a **backstop summary**: one line per sweep
 that guards something terraform cannot see, saying whether it ran, found nothing, failed or

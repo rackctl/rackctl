@@ -57,6 +57,16 @@ internal/reap/reap.go:scaleVolumeHolders
 internal/reap/reap.go:listVolumeHolders
 internal/reap/reap.go:unstickTerminating
 cmd/misc.go:spokeGuard
+cmd/misc.go:teardownRemains
+internal/phases/teardown_set.go:TeardownComponents
+internal/phases/teardown_set.go:allCoreComponents
+internal/phases/teardown_set.go:readLandingZoneState
+internal/phases/teardown_set.go:zoneName
+internal/phases/agentplatform.go:agentPlatformTeardownComponents
+internal/phases/agentplatform.go:agentPlatformHolders
+internal/phases/agentplatform.go:AgentPlatformLeft
+internal/phases/agentplatform.go:reachable
+internal/phases/agentplatform.go:allAgentPlatformComponents
 "
 
 # check_report applies both floors to a `go tool cover -func` report on stdin. Split out
