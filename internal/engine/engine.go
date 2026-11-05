@@ -332,7 +332,11 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) 
 	// phase. They address terraform state, which is scoped by the state key rather than
 	// by ambient context, so they can only ever destroy what this run created.
 	if st.Runner != nil && e.Out != nil && st.KubeconfigCluster != "" {
-		reap.All(ctx, st.Runner, e.Out)
+		region := ""
+		if st.Config != nil {
+			region = st.Config.Cloud.Region
+		}
+		st.Backstops = append(st.Backstops, reap.All(ctx, st.Runner, e.Out, st.KubeconfigCluster, region))
 
 		// Force-delete the operator-minted IAM roles the finalizer may not have. A rollback
 		// is the worst case for that finalizer — it runs against a half-built cluster where
@@ -344,8 +348,9 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) 
 		if st.Config != nil {
 			org = st.Config.Org.Name
 		}
-		reap.OperatorRoles(ctx, st.Runner, e.Out, reap.Owner{Org: org, Cluster: st.KubeconfigCluster})
-		reap.UnstickTerminating(ctx, st.Runner, e.Out)
+		st.Backstops = append(st.Backstops,
+			reap.OperatorRoles(ctx, st.Runner, e.Out, reap.Owner{Org: org, Cluster: st.KubeconfigCluster}),
+			reap.UnstickTerminating(ctx, st.Runner, e.Out))
 
 		// And backstop the NodeClaim reap: a rollback runs against a half-built cluster,
 		// which is exactly the case where Karpenter is not alive to honour a finalizer.
@@ -353,8 +358,16 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) 
 		// group, and Terraform cannot delete one that is in use — the rollback then
 		// stops with the cluster gone and the instance still billing.
 		if st.Config != nil {
-			reap.OrphanedNodes(ctx, st.Runner, e.Out, st.Config.ClusterName(), st.Config.Cloud.Region)
+			st.Backstops = append(st.Backstops,
+				reap.OrphanedNodes(ctx, st.Runner, e.Out, st.Config.ClusterName(), st.Config.Cloud.Region))
 		}
+	} else {
+		// Not a gap: with no cluster this run pointed kubectl at, these sweeps have nothing
+		// they could safely act on. Said, so the summary accounts for every backstop.
+		st.Backstops = append(st.Backstops, reap.Backstop{
+			Name: "cluster sweeps (in-cluster, operator IAM roles, Karpenter nodes)", Outcome: reap.NotRun, Informational: true,
+			Detail: "this run never pointed kubectl at a cluster it built, so there was nothing they could safely act on",
+		})
 	}
 	// Every phase is attempted even after one fails: a component that cannot be destroyed
 	// says nothing about the ones behind it, and stopping at the first would strand them.
@@ -371,6 +384,21 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) 
 				fmt.Fprintln(e.Out, ui.Fail("teardown "+p.ID()+": "+err.Error()))
 			}
 		}
+	}
+	// Which guards held, said once at the end. A guard that failed or did not run can leave a
+	// Karpenter node billing or an operator role standing, which is a rollback that did not
+	// complete exactly as a component that failed to destroy is, so it is returned with them
+	// and the run classifies as resources-may-remain rather than rolled-back. Informational
+	// backstops never reach that list.
+	if e.Out != nil {
+		reap.Summarize(e.Out, st.Backstops)
+	}
+	if unheld := reap.Unheld(st.Backstops); len(unheld) > 0 {
+		if e.Out != nil {
+			fmt.Fprintln(e.Out, ui.Warn("not every backstop ran clean — resources outside terraform's state "+
+				"may remain; the summary above names which"))
+		}
+		failed = append(failed, fmt.Errorf("these backstops did not hold: %s", strings.Join(unheld, ", ")))
 	}
 	return failed
 }

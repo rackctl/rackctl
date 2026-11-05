@@ -28,6 +28,10 @@ exit 0
 	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write fake terragrunt: %v", err)
 	}
+	// The API answers. TestClusterPhase_AnUnreachableAPIIsLeftStanding replaces it.
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
+		t.Fatalf("write fake kubectl: %v", err)
+	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	cfg := baseCfg()

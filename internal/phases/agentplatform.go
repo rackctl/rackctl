@@ -3,6 +3,7 @@ package phases
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -312,11 +313,14 @@ func logsKMSKey(st *engine.State, dataKMS string) string {
 
 // needOutput reads a captured terragrunt output, failing with the component that produces it.
 //
-// captureOutputs is best-effort and silently returns on any error, which is right for the
-// advisory uses it was written for. Here the values are REQUIRED: a missing one produces an
-// apply with an empty TF_VAR, and an empty KMS ARN or VPC id does not fail fast — it fails
-// somewhere inside a provider call with a message naming neither rackctl nor the component
-// that should have produced it.
+// captureOutputs is best-effort, which is right for the advisory uses it was written for.
+// Here the values are REQUIRED: a missing one produces an apply with an empty TF_VAR, and an
+// empty KMS ARN or VPC id does not fail fast — it fails somewhere inside a provider call with
+// a message naming neither rackctl nor the component that should have produced it.
+//
+// The error says which of three things happened, from State.CaptureErr rather than from a
+// guess: the producer's outputs could not be read (and why), they were read and lack this
+// key, or they were never read in this run.
 func needOutput(st *engine.State, key, producer string) (string, error) {
 	v := st.Outputs[key]
 	// A dry-run captures nothing — captureOutputs returns immediately without --apply — so
@@ -328,11 +332,17 @@ func needOutput(st *engine.State, key, producer string) (string, error) {
 		return "<" + producer + "." + key + ">", nil
 	}
 	if v == "" {
+		var why string
+		switch err, read := st.CaptureErr[producer]; {
+		case read && err != nil:
+			why = fmt.Sprintf("reading %s's outputs failed: %v", producer, err)
+		case read:
+			why = fmt.Sprintf("%s's outputs were read and carry no %q, so its outputs changed shape", producer, key)
+		default:
+			why = fmt.Sprintf("%s's outputs were never read in this run", producer)
+		}
 		return "", fmt.Errorf("the agent-platform substrate needs %q, which landing-zone's %q component "+
-			"produces, and it was not captured. rackctl reads it with `terragrunt output -json` after "+
-			"applying %s — so either that component did not apply, or its outputs changed shape. "+
-			"Nothing in eks-agent-platform/terraform has been applied yet, so nothing needs unwinding",
-			key, producer, producer)
+			"produces, and it is missing: %s", key, producer, why)
 	}
 	return v, nil
 }
@@ -452,13 +462,14 @@ func ensureAgentPlatformBackend(ctx context.Context, st *engine.State) error {
 // which is what the operator's budget reconciler queries — leaving it with no data source at
 // all.
 func applyAgentPlatform(ctx context.Context, st *engine.State) error {
+	const untouched = "nothing in eks-agent-platform/terraform has been applied yet, so nothing needs unwinding"
 	clusterEnv, err := agentPlatformEnv(st)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w. %s", err, untouched)
 	}
 	accountEnv, err := agentPlatformAccountEnv(st)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w. %s", err, untouched)
 	}
 	if err := assertAgentPlatformRoots(st); err != nil {
 		return err
@@ -618,36 +629,53 @@ func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatf
 	// phase left the EKS control plane, the VPC and the NAT gateway billing, and said so in
 	// a message about a component tree that had never been applied. rackctl itself points
 	// operators at `rackctl destroy` from three separate pre-platform failure branches.
-	if !st.Runner.DryRun {
-		bucket := agentPlatformStateBucket(st)
-		if _, err := st.Runner.Capture(ctx, "aws", "s3api", "head-bucket", "--bucket", bucket); err != nil {
-			note(st, "agent-platform substrate: s3://%s does not exist, so nothing in this tree was "+
-				"ever applied — skipping it and going straight to the landing-zone components", bucket)
-			return nil
+	//
+	// Absent means S3 said so: a 404. A 403, a throttle or an expired token is a bucket this
+	// run could not see, and reading that as "never applied" skipped a tree that may still
+	// hold IAM, SSM and buckets — reported as a clean teardown. The read runs in dry-run too,
+	// so a dry-run shows the same decision the teardown would make.
+	bucket := agentPlatformStateBucket(st)
+	if _, err := st.Runner.Query(ctx, "aws", "s3api", "head-bucket", "--bucket", bucket); err != nil {
+		if !s3BucketAbsent(err) {
+			return fmt.Errorf("could not establish whether the agent-platform tree was ever applied: "+
+				"aws s3api head-bucket on its state bucket s3://%s failed: %w", bucket, err)
 		}
+		note(st, "agent-platform substrate: s3://%s does not exist, so nothing in this tree was "+
+			"ever applied — skipping it and going straight to the landing-zone components", bucket)
+		return nil
 	}
 
-	// A missing landing-zone output on the DESTROY path is not an error. "Nothing in
-	// eks-agent-platform/terraform has been applied yet, so nothing needs unwinding" is a
-	// statement that the teardown has nothing to do, and returning it as a failure would
-	// have the destroy count it and exit non-zero over an empty tree.
+	// A missing landing-zone output on the DESTROY path is not by itself an error, and not by
+	// itself proof of an empty tree either.
 	//
 	// The state bucket check above is necessary and not sufficient: rackctl creates that
 	// bucket outside terraform, so it outlives the tree it holds state for. A second
 	// teardown finds the bucket present, the tree already destroyed, and landing-zone's
 	// secrets component gone — so the output cannot be read and there is nothing that needs
-	// it.
+	// it. But the same missing output also follows a first teardown whose agent-platform
+	// destroy FAILED and whose landing-zone walk then removed secrets: the outputs are gone
+	// and this tree's resources are not. Reporting that as "nothing to unwind" made the
+	// second run claim success over a tree still standing.
+	//
+	// So the state is asked directly. A component whose state still lists resources is a
+	// tree that has not come down, and the error names it so the destroy counts it.
 	//
 	// On the APPLY path the same missing output stays fatal, because there it means the
 	// substrate is about to be built against a key that does not exist.
-	clusterEnv, err := agentPlatformEnv(st)
-	if err != nil {
-		note(st, "agent-platform substrate: %v — treating as nothing to unwind", err)
-		return nil
-	}
-	accountEnv, err := agentPlatformAccountEnv(st)
-	if err != nil {
-		note(st, "agent-platform substrate: %v — treating as nothing to unwind", err)
+	clusterEnv, cerr := agentPlatformEnv(st)
+	accountEnv, aerr := agentPlatformAccountEnv(st)
+	if missing := errors.Join(cerr, aerr); missing != nil {
+		holding, err := agentPlatformStateHolders(ctx, st, bucket, opts)
+		if err != nil {
+			return fmt.Errorf("%w; and whether this tree still holds state could not be read: %w", missing, err)
+		}
+		if len(holding) > 0 {
+			return fmt.Errorf("%w — and these components still hold state in s3://%s, so their "+
+				"resources are standing: %s. Restore the missing landing-zone output (re-apply its "+
+				"component) and re-run the destroy", missing, bucket, strings.Join(holding, ", "))
+		}
+		note(st, "agent-platform substrate: %v — and no component of this tree holds state in s3://%s, "+
+			"so there is nothing to unwind", missing, bucket)
 		return nil
 	}
 
@@ -704,6 +732,66 @@ func DestroyAgentPlatform(ctx context.Context, st *engine.State, opts AgentPlatf
 		}
 	}
 	return nil
+}
+
+// s3BucketAbsent reports whether an S3 error is the service answering "no such bucket". A 403
+// is not absence: S3 answers 403 for a bucket the caller may not read, which says nothing
+// about whether it exists.
+func s3BucketAbsent(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "(404)") || strings.Contains(s, "NoSuchBucket") || strings.Contains(s, "Not Found")
+}
+
+// agentPlatformStateHolders names the components of this tree whose state in bucket still
+// lists resources — the ones a teardown that skipped them would leave standing.
+//
+// A state object is found by its component's root path, not by a key rackctl composes: the
+// tree's backend derives each key from the root's path under terraform/live, so the key for
+// live/<environment>-platform/bedrock carries "<environment>-platform/bedrock/" whatever
+// prefix the backend adds. Matching on that segment keeps another environment's state, which
+// shares the bucket, out of the answer. An object that exists with no resources is a root
+// already destroyed — terraform keeps the empty state — and holds nothing.
+//
+// Account roots count only when this teardown would reach them: without --account-scoped
+// they are deliberately left standing, and their state is not this environment's to report.
+func agentPlatformStateHolders(ctx context.Context, st *engine.State, bucket string, opts AgentPlatformTeardown) ([]string, error) {
+	listed, err := st.Runner.Query(ctx, "aws", "s3api", "list-objects-v2", "--bucket", bucket,
+		"--query", "Contents[].Key", "--output", "text")
+	if err != nil {
+		return nil, fmt.Errorf("aws s3api list-objects-v2 on s3://%s: %w", bucket, err)
+	}
+	keys := strings.Fields(listed)
+
+	var holding []string
+	for _, c := range agentPlatformComponents(st.Config) {
+		if c.account && !opts.AccountScoped {
+			continue
+		}
+		segment := strings.TrimPrefix(agentPlatformDir(st, c), "terraform/live/") + "/"
+		for _, key := range keys {
+			if !strings.HasSuffix(key, ".tfstate") ||
+				(!strings.HasPrefix(key, segment) && !strings.Contains(key, "/"+segment)) {
+				continue
+			}
+			raw, err := st.Runner.Query(ctx, "aws", "s3", "cp", "s3://"+bucket+"/"+key, "-")
+			if err != nil {
+				return nil, fmt.Errorf("aws s3 cp s3://%s/%s: %w", bucket, key, err)
+			}
+			var state struct {
+				Resources []json.RawMessage `json:"resources"`
+			}
+			if err := json.Unmarshal([]byte(raw), &state); err != nil {
+				return nil, fmt.Errorf("s3://%s/%s is not readable terraform state: %w", bucket, key, err)
+			}
+			if len(state.Resources) > 0 {
+				holding = append(holding, fmt.Sprintf("%s (%d resource(s))", c.name, len(state.Resources)))
+			}
+		}
+	}
+	return holding, nil
 }
 
 // AgentPlatformTeardown says how far a teardown of ONE environment may reach.

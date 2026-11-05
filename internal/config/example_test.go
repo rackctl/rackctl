@@ -126,8 +126,9 @@ func TestIsPlaceholderAccount_SeparatesPlaceholdersFromRealIDs(t *testing.T) {
 			t.Errorf("%q is a placeholder and must be accepted", s)
 		}
 	}
-	// Real-shaped ids, none of them anyone's: the point is that the detector FIRES.
-	for _, s := range []string{"477165397189", "351619759866", "908234110765"} {
+	// Account-shaped ids made up for this test: the point is that the detector FIRES on a
+	// value that looks like a real estate's, without this file carrying one.
+	for _, s := range []string{"493817265024", "720461938571", "865203417796"} {
 		if isPlaceholderAccount(s) {
 			t.Errorf("%q is account-shaped and must be flagged — a detector that accepts "+
 				"everything makes the sweep above meaningless", s)

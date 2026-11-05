@@ -19,13 +19,13 @@ import (
 func TestCommandTitle_NamesTheAccountAndTheProfile(t *testing.T) {
 	cfg := config.Default()
 	cfg.Org.Name = "acme"
-	cfg.Cloud.AccountID = "477165397189"
+	cfg.Cloud.AccountID = "123456789012"
 	cfg.Cloud.Profile = "acme-production"
 	cfg.Cloud.Region = "us-east-1"
 	cfg.Environment = config.EnvProduction
 
 	got := commandTitle("destroy", cfg)
-	for _, want := range []string{"destroy", "acme", "477165397189", "acme-production", "us-east-1", "production"} {
+	for _, want := range []string{"destroy", "acme", "123456789012", "acme-production", "us-east-1", "production"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the banner must carry %q — it is what an operator confirms before a "+
 				"destructive run.\ngot: %s", want, got)
@@ -47,7 +47,7 @@ func TestCommandTitle_DistinguishesEnvironments(t *testing.T) {
 
 // EKS writes the cluster ARN into the kubeconfig; the check compares a bare name.
 func TestEKSClusterName_ExtractsTheNameFromAnARN(t *testing.T) {
-	got := eksClusterName("arn:aws:eks:us-east-1:477165397189:cluster/production-platform")
+	got := eksClusterName("arn:aws:eks:us-east-1:123456789012:cluster/production-platform")
 	if got != "production-platform" {
 		t.Fatalf("got %q, want %q", got, "production-platform")
 	}

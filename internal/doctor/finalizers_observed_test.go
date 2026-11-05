@@ -43,7 +43,7 @@ func TestStuckFinalizersOKWhenCoreKindsReadEmpty(t *testing.T) {
 	env := kubectlReturning(t, `
 case "$*" in
   *"get pvc"*|*"get namespaces"*) echo '{"items":[]}' ;;
-  *) exit 1 ;;
+  *) echo 'error: the server doesn'"'"'t have a resource type "platforms"' >&2; exit 1 ;;
 esac
 exit 0
 `)

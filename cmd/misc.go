@@ -152,15 +152,27 @@ the object rather than at the flag.`,
 		// operator whose context is stale would previously have had the sweeps silently
 		// skip a cluster that WAS reachable under its own name, leaving the controller-owned
 		// resources for the component teardown to trip over.
+		// What each backstop reported about itself, printed as one summary at the end.
+		var backstops []reap.Backstop
 		reaping := true
+		var pointErr error
+		// A repoint that failed because the cluster does not exist is the idempotent re-run
+		// after a teardown that already deleted it. There is nothing in it to reap, and
+		// recording the reap as not run would hold every such re-run unclean for good.
+		clusterGone := false
 		if err := reap.PointAt(ctx, run, cfg.ClusterName()); err != nil {
-			reaping = false
-			fmt.Println(ui.Warn(fmt.Sprintf(
-				"could not point kubectl at %s (%v) — skipping the in-cluster reap. The component "+
-					"teardown still runs, and terraform state is scoped by state key, so nothing "+
-					"belonging to another cluster can be touched. But a Platform or PVC left behind "+
-					"here may stop that teardown on a DeleteConflict or an in-use security group; "+
-					"if so, fix the kubeconfig and re-run.", cfg.ClusterName(), err)))
+			reaping, pointErr = false, err
+			clusterGone = reap.ClusterGone(ctx, run, cfg.ClusterName(), cfg.Cloud.Region)
+			if clusterGone {
+				fmt.Println(ui.Step("no cluster named " + cfg.ClusterName() + " — nothing to reap in-cluster"))
+			} else {
+				fmt.Println(ui.Warn(fmt.Sprintf(
+					"could not point kubectl at %s (%v) — skipping the in-cluster reap. The component "+
+						"teardown still runs, and terraform state is scoped by state key, so nothing "+
+						"belonging to another cluster can be touched. But a Platform or PVC left behind "+
+						"here may stop that teardown on a DeleteConflict or an in-use security group; "+
+						"if so, fix the kubeconfig and re-run.", cfg.ClusterName(), err)))
+			}
 		}
 
 		// REFUSE before anything destructive if this hub has vended spoke clusters.
@@ -200,8 +212,15 @@ the object rather than at the flag.`,
 		// while it is still running to do so. Destroying the cluster first orphans
 		// them and makes agent-iam fail on DeleteConflict, halting the teardown with
 		// the cluster already gone. See reap.go.
-		if reaping {
-			reap.All(ctx, run, os.Stdout)
+		switch {
+		case reaping:
+			backstops = append(backstops, reap.All(ctx, run, os.Stdout, cfg.ClusterName(), cfg.Cloud.Region))
+		case clusterGone:
+			backstops = append(backstops, reap.Backstop{Name: "in-cluster reap", Outcome: reap.FoundNothing,
+				Detail: "the cluster no longer exists"})
+		default:
+			backstops = append(backstops, reap.Backstop{Name: "in-cluster reap", Outcome: reap.NotRun,
+				Detail: fmt.Sprintf("kubectl could not be pointed at %s (%v)", cfg.ClusterName(), pointErr)})
 		}
 
 		// Force-delete the IAM roles the operator mints per Platform, in case its
@@ -219,7 +238,8 @@ the object rather than at the flag.`,
 		// belongs to this run before it is force-deleted. The path and the name are structural
 		// guesses; the tag is the resource's own statement. In an account that holds more than
 		// this deployment, those are not the same thing.
-		reap.OperatorRoles(ctx, run, os.Stdout, reap.Owner{Org: cfg.Org.Name, Cluster: cfg.ClusterName()})
+		backstops = append(backstops,
+			reap.OperatorRoles(ctx, run, os.Stdout, reap.Owner{Org: cfg.Org.Name, Cluster: cfg.ClusterName()}))
 
 		// With the roles gone, any Platform/Tenant still pinned in Terminating is
 		// guarding nothing — free it, so an interrupted teardown does not wedge. Must
@@ -233,8 +253,17 @@ the object rather than at the flag.`,
 		// remove finalizers from CRs whose AWS state is deliberately still alive, orphaning
 		// exactly what this package exists never to orphan. Narrowing the IAM sweep without
 		// gating this one would have made the wrong-cluster case worse than it was.
-		if reaping {
-			reap.UnstickTerminating(ctx, run, os.Stdout)
+		// When the repoint failed, the in-cluster reap's line already decides whether that
+		// left anything, so this one is informational rather than a second verdict on it.
+		switch {
+		case reaping:
+			backstops = append(backstops, reap.UnstickTerminating(ctx, run, os.Stdout))
+		case clusterGone:
+			backstops = append(backstops, reap.Backstop{Name: "unstick Terminating CRs", Outcome: reap.FoundNothing,
+				Detail: "the cluster no longer exists"})
+		default:
+			backstops = append(backstops, reap.Backstop{Name: "unstick Terminating CRs", Outcome: reap.NotRun,
+				Informational: true, Detail: "gated on the same repoint as the in-cluster reap, whose line decides"})
 		}
 
 		// Backstop the NodeClaim reap above. It needs a reachable cluster and a live
@@ -243,7 +272,7 @@ the object rather than at the flag.`,
 		// group, and Terraform cannot delete a security group that is in use — the
 		// teardown then stops with the cluster already gone and the instance still
 		// billing. Runs BEFORE the components, unlike the volume sweep.
-		reap.OrphanedNodes(ctx, run, os.Stdout, cfg.ClusterName(), cfg.Cloud.Region)
+		backstops = append(backstops, reap.OrphanedNodes(ctx, run, os.Stdout, cfg.ClusterName(), cfg.Cloud.Region))
 
 		// Reverse of the apply order, through the SAME helper the phases use.
 		//
@@ -352,13 +381,30 @@ the object rather than at the flag.`,
 		}
 		// The cluster is gone; anything still tagged for it is an orphan by definition.
 		// Run it even after failures: an aborted destroy is exactly when orphans exist.
-		reap.OrphanedVolumes(ctx, run, os.Stdout, cfg.ClusterName(), cfg.Cloud.Region)
+		backstops = append(backstops, reap.OrphanedVolumes(ctx, run, os.Stdout, cfg.ClusterName(), cfg.Cloud.Region)...)
+
+		// Which guards held, said once. "platform destroyed" is a claim about everything this
+		// run built, including what terraform cannot see, so it is printed only when every
+		// backstop that guards something ran clean.
+		clean := reap.Summarize(os.Stdout, backstops)
 
 		if len(failed) > 0 {
 			fmt.Println(ui.Fail(fmt.Sprintf("%d component(s) failed to destroy — resources may "+
 				"still be billing. Fix the cause and re-run `rackctl destroy`; it is idempotent.",
 				len(failed))))
 			return errors.Join(failed...)
+		}
+		// A guard that did not hold can leave a Karpenter node billing or an operator role
+		// standing, which is the same fact a component that failed to destroy reports. So it
+		// exits resources-may-remain, not 0: an automation that gates on the status must not
+		// record this as a clean teardown. Informational reports never reach this branch.
+		if !clean {
+			fmt.Println(ui.Warn("every component was destroyed, but not every backstop ran clean — " +
+				"resources outside terraform's state may remain. The summary above names which; fix the " +
+				"cause and re-run `rackctl destroy`, which is idempotent"))
+			return withExit(ExitStranded, fmt.Errorf(
+				"every component was destroyed, but these backstops did not hold: %s — resources "+
+					"outside terraform's state may remain", strings.Join(reap.Unheld(backstops), ", ")))
 		}
 		fmt.Println(ui.OK("platform destroyed"))
 		return nil

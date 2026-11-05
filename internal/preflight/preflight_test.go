@@ -28,6 +28,15 @@ func fakeBin(t *testing.T, name, body string) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+// eksAbsent and s3Absent are the shell bodies of a fake aws answering "not there" the way the
+// real CLI does: the service's error code on stderr and a non-zero exit. A bare `exit 1` is a
+// call that failed for an unknown reason, which the checks must NOT read as absence.
+const (
+	eksAbsent = `echo "An error occurred (ResourceNotFoundException) when calling the DescribeCluster operation: No cluster found" >&2; exit 254`
+	s3Absent  = `echo "An error occurred (404) when calling the HeadObject operation: Not Found" >&2; exit 254`
+	denied    = `echo "An error occurred (AccessDenied) when calling the operation: not authorized" >&2; exit 254`
+)
+
 func testEnv() *Env {
 	return &Env{
 		Cfg: &config.Config{
@@ -129,10 +138,10 @@ func TestCheckGitHubToken_ZeroExitWithNoTokenIsNotHealthy(t *testing.T) {
 
 // No tenants repo means the provider is never called. Gating an install on a credential
 // it will never use would be a false alarm on the common path.
-func TestCheckGitHubToken_OKWhenNoTenantsRepo(t *testing.T) {
+func TestCheckGitHubToken_SkipWhenNoTenantsRepo(t *testing.T) {
 	fakeBin(t, "gh", `exit 1`)
 
-	if r := CheckGitHubToken(context.Background(), tokenEnv(t, "")); r.Status != doctor.OK {
+	if r := CheckGitHubToken(context.Background(), tokenEnv(t, "")); r.Status != doctor.Skip {
 		t.Fatalf("portal-off installs need no GitHub token: %s", r.Detail)
 	}
 }
@@ -145,7 +154,7 @@ func TestCheckGitHubToken_OKWhenNoTenantsRepo(t *testing.T) {
 func TestCheckStaleState_FailsWhenStateOutlivesTheCluster(t *testing.T) {
 	fakeBin(t, "aws", `
 case "$1 $2" in
-  "eks describe-cluster") exit 1 ;;                        # the cluster is GONE
+  "eks describe-cluster") `+eksAbsent+` ;;                        # the cluster is GONE
   "s3 cp")                echo '{"resources":[{"type":"aws_vpc"},{"type":"aws_subnet"}]}' ;;
   *)                      echo "" ;;
 esac
@@ -167,7 +176,7 @@ exit 0`)
 func TestCheckStaleState_NeverAdvisesPurgingStateThatMayTrackLiveResources(t *testing.T) {
 	fakeBin(t, "aws", `
 case "$1 $2" in
-  "eks describe-cluster") exit 1 ;;
+  "eks describe-cluster") `+eksAbsent+` ;;
   "s3 cp")                echo '{"resources":[{"type":"aws_iam_role"},{"type":"aws_s3_bucket"}]}' ;;
   *)                      echo "" ;;
 esac
@@ -417,7 +426,7 @@ exit 0`)
 
 // Turning the tier off is a legitimate install, and the check must say what was given up
 // rather than reporting a bare green tick.
-func TestCheckCostPipelinePrerequisite_OKWhenTheTierIsOff(t *testing.T) {
+func TestCheckCostPipelinePrerequisite_SkipWhenTheTierIsOff(t *testing.T) {
 	// aws exits non-zero for everything: if the short-circuit were removed this would warn,
 	// so the assertion below distinguishes "skipped deliberately" from "happened to pass".
 	fakeBin(t, "aws", `exit 1`)
@@ -427,8 +436,9 @@ func TestCheckCostPipelinePrerequisite_OKWhenTheTierIsOff(t *testing.T) {
 	env.Cfg.AgentPlatform.CostPipeline = &off
 
 	r := CheckCostPipelinePrerequisite(context.Background(), env)
-	if r.Status != doctor.OK {
-		t.Fatalf("costPipeline: false is a supported install: %s — %s", r.Status, r.Detail)
+	if r.Status != doctor.Skip {
+		t.Fatalf("costPipeline: false is a supported install, and a check that asked nothing "+
+			"reports skip rather than ok: %s — %s", r.Status, r.Detail)
 	}
 	if !strings.Contains(r.Detail, "BudgetPolicy") {
 		t.Errorf("the detail must name what turning the tier off costs:\n%s", r.Detail)

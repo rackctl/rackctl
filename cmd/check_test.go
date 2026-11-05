@@ -14,7 +14,7 @@ import (
 // into something that coincidentally equals the configured name.
 func TestEKSClusterName(t *testing.T) {
 	for _, tc := range []struct{ name, entry, want string }{
-		{"eks arn", "arn:aws:eks:us-west-2:351619759866:cluster/development-platform", "development-platform"},
+		{"eks arn", "arn:aws:eks:us-west-2:123456789012:cluster/development-platform", "development-platform"},
 		{"gov partition", "arn:aws-us-gov:eks:us-gov-west-1:111111111111:cluster/prod-platform", "prod-platform"},
 		{"kind context", "kind-rackctl", "kind-rackctl"},
 		{"bare name", "development-platform", "development-platform"},
@@ -35,11 +35,11 @@ func TestEKSClusterName(t *testing.T) {
 // identities.
 func TestAWSEnvPinsProfileAndRegion(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Cloud.Profile = "stxkxs"
+	cfg.Cloud.Profile = "workload-development"
 	cfg.Cloud.Region = "us-west-2"
 
 	got := awsEnv(cfg)
-	want := map[string]bool{"AWS_PROFILE=stxkxs": true, "AWS_REGION=us-west-2": true}
+	want := map[string]bool{"AWS_PROFILE=workload-development": true, "AWS_REGION=us-west-2": true}
 	if len(got) != len(want) {
 		t.Fatalf("awsEnv = %v, want exactly %d entries", got, len(want))
 	}
@@ -55,12 +55,12 @@ func TestAWSEnvPinsProfileAndRegion(t *testing.T) {
 // environment does not come back missing the AWS pair.
 func TestTGEnvIncludesAWSIdentity(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Cloud.Profile = "stxkxs"
+	cfg.Cloud.Profile = "workload-development"
 	cfg.Cloud.Region = "us-west-2"
-	cfg.Cloud.AccountID = "351619759866"
+	cfg.Cloud.AccountID = "123456789012"
 
 	env := tgEnv(cfg)
-	for _, want := range []string{"AWS_PROFILE=stxkxs", "AWS_REGION=us-west-2", "TERRAGRUNT_ACCOUNT_ID=351619759866"} {
+	for _, want := range []string{"AWS_PROFILE=workload-development", "AWS_REGION=us-west-2", "TERRAGRUNT_ACCOUNT_ID=123456789012"} {
 		var found bool
 		for _, e := range env {
 			if e == want {
@@ -100,14 +100,14 @@ func TestAWSEnvDoesNotShareBackingArray(t *testing.T) {
 func TestCommandTitleCarriesAccountAndProfile(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Org.Name = "acme"
-	cfg.Cloud.AccountID = "351619759866"
-	cfg.Cloud.Profile = "stxkxs"
+	cfg.Cloud.AccountID = "123456789012"
+	cfg.Cloud.Profile = "workload-development"
 	cfg.Cloud.Region = "us-west-2"
 	cfg.Environment = "development"
 
 	got := commandTitle("destroy", cfg)
 
-	for _, want := range []string{"destroy", "acme", "351619759866", "stxkxs", "us-west-2", "development"} {
+	for _, want := range []string{"destroy", "acme", "123456789012", "workload-development", "us-west-2", "development"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("title %q is missing %q", got, want)
 		}
@@ -119,8 +119,8 @@ func TestCommandTitleCarriesAccountAndProfile(t *testing.T) {
 func TestCommandTitleIsConsistentAcrossVerbs(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Org.Name = "acme"
-	cfg.Cloud.AccountID = "351619759866"
-	cfg.Cloud.Profile = "stxkxs"
+	cfg.Cloud.AccountID = "123456789012"
+	cfg.Cloud.Profile = "workload-development"
 	cfg.Cloud.Region = "us-west-2"
 	cfg.Environment = "development"
 

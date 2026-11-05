@@ -179,6 +179,7 @@ CRITICAL = [
     ("internal/reap/own.go", "roleTags"),
     ("cmd/misc.go", "confirmDestroy"),
     ("internal/phases/agentplatform.go", "createBucketArgs"),
+    ("internal/phases/agentplatform.go", "agentPlatformStateHolders"),
 ]
 
 

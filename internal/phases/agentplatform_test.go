@@ -898,7 +898,8 @@ func TestDestroyAgentPlatform_SkipsWhenTheTreeWasNeverApplied(t *testing.T) {
 		[]byte(fmt.Sprintf("#!/bin/sh\necho called >> %q\nexit 0\n", logf)), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte("#!/bin/sh\n"+
+		"echo 'An error occurred (404) when calling the HeadBucket operation: Not Found' >&2\nexit 254\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))

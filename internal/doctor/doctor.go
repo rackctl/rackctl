@@ -79,6 +79,18 @@ func (e *Env) kubectlJSON(ctx context.Context, v any, args ...string) error {
 	return json.Unmarshal([]byte(out), v)
 }
 
+// reason renders a kubectl failure for a verdict. Capture carries kubectl's stderr in the
+// error — RBAC denied, a timeout, a missing resource type — and a verdict that discards it
+// sends the operator to find out what rackctl already knew.
+func reason(err error) string { return truncate(err.Error(), 200) }
+
+// notInstalled reports whether kubectl answered that the API server has no such resource
+// type, which is what an uninstalled CRD looks like. It is the one read failure that means
+// "not applicable"; every other one means the question went unanswered.
+func notInstalled(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "doesn't have a resource type")
+}
+
 // Run executes every platform check and returns the results in a stable order.
 // It does not stop at the first failure: a partial picture of a broken cluster is
 // exactly what makes a broken cluster hard to diagnose.
@@ -146,17 +158,22 @@ func CheckStuckFinalizers(ctx context.Context, env *Env) Result {
 		} `json:"metadata"`
 	}
 
-	var stuck []string
-	read := 0
+	var stuck, unread []string
 	for _, kind := range terminatingKinds {
 		var list struct {
 			Items []item `json:"items"`
 		}
-		// A CRD that is not installed is not a failure — the agent platform is optional.
 		if err := env.kubectlJSON(ctx, &list, "get", kind, "-A"); err != nil {
+			// A CRD that is not installed is not a failure — the agent platform is optional.
+			// That is the ONLY read failure skipped. pvc and namespaces are core kinds, so a
+			// failure there is an unread kind, and so is a CRD read that failed for any reason
+			// other than the type being absent.
+			if strings.Contains(kind, ".") && notInstalled(err) {
+				continue
+			}
+			unread = append(unread, kind+" ("+reason(err)+")")
 			continue
 		}
-		read++
 		for _, it := range list.Items {
 			ts := it.Metadata.DeletionTimestamp
 			if ts == nil || time.Since(*ts) < stuckFor {
@@ -176,20 +193,23 @@ func CheckStuckFinalizers(ctx context.Context, env *Env) Result {
 	}
 	sort.Strings(stuck)
 
+	var unreadNote string
+	if len(unread) > 0 {
+		unreadNote = " Not read, so UNCHECKED: " + strings.Join(unread, "; ") + "."
+	}
 	if len(stuck) > 0 {
 		return fail(name, fmt.Sprintf(
 			"%d object(s) cannot finish deleting — ArgoCD rates a resource pending deletion as "+
 				"Progressing, so each of these holds its Application at Progressing forever and the "+
-				"convergence gate can never pass: %s", len(stuck), strings.Join(stuck, "; ")))
+				"convergence gate can never pass: %s.%s", len(stuck), strings.Join(stuck, "; "), unreadNote))
 	}
-	// Skipping an absent CRD is right; skipping every kind is not the same answer. `pvc` and
-	// `namespaces` are core resources, so a run that reads none of the kinds did not meet a
-	// cluster missing the optional CRDs — it failed to read the API at all, and the tick below
-	// would rest on zero observations.
-	if read == 0 {
-		return warn(name, "could not read any of "+strings.Join(terminatingKinds, ", ")+
-			" — an object wedged in Terminating holds its Application at Progressing forever, "+
-			"and nothing here rules that out")
+	// Skipping an absent CRD is right; skipping a kind that failed to read is not the same
+	// answer. A tick over a partial read rests on fewer observations than it claims, and the
+	// PVC wedge — the commonest one — is invisible when pvc is the kind that went unread.
+	if len(unread) > 0 {
+		return warn(name, "could not read every kind this check covers — an object wedged in "+
+			"Terminating holds its Application at Progressing forever, and nothing here rules that "+
+			"out for these."+unreadNote)
 	}
 	return ok(name, "nothing wedged in Terminating")
 }
@@ -231,7 +251,10 @@ func CheckGitOpsSource(ctx context.Context, env *Env) Result {
 		} `json:"spec"`
 	}
 	if err := env.kubectlJSON(ctx, &app, "-n", "argocd", "get", "application", "app-of-apps"); err != nil {
-		return fail(name, "app-of-apps not found — the gitops bootstrap did not complete")
+		if strings.Contains(err.Error(), "NotFound") {
+			return fail(name, "app-of-apps does not exist — the gitops bootstrap did not complete ("+reason(err)+")")
+		}
+		return fail(name, "could not read app-of-apps ("+reason(err)+") — which catalog this cluster syncs from is unverified")
 	}
 
 	got := app.Spec.Source.RepoURL
@@ -306,7 +329,7 @@ func CheckApplications(ctx context.Context, env *Env) Result {
 
 	var apps appList
 	if err := env.kubectlJSON(ctx, &apps, "-n", "argocd", "get", "applications"); err != nil {
-		return fail(name, "cannot read Applications — is ArgoCD installed?")
+		return fail(name, "cannot read Applications ("+reason(err)+")")
 	}
 	if len(apps.Items) == 0 {
 		return fail(name, "no Applications — app-of-apps has not generated anything")
@@ -367,8 +390,18 @@ func CheckApplicationSets(ctx context.Context, env *Env) Result {
 	const name = "applicationsets"
 
 	var sets appSetList
+	// Unreadable fails, as Applications does. An erroring ApplicationSet is exactly the
+	// failure the Application list cannot show, so a read that did not happen leaves it
+	// entirely unasserted.
 	if err := env.kubectlJSON(ctx, &sets, "-n", "argocd", "get", "applicationsets"); err != nil {
-		return warn(name, "cannot read ApplicationSets")
+		return fail(name, "cannot read ApplicationSets ("+reason(err)+")")
+	}
+	// No expected count is held here — that is catalog knowledge. But zero is never the
+	// answer for a catalog that generates its addons through ApplicationSets, and "0
+	// generating cleanly" is a tick over nothing examined.
+	if len(sets.Items) == 0 {
+		return warn(name, "no ApplicationSets in argocd — nothing here was examined, so an erroring "+
+			"one cannot be ruled out; the catalog generates its addons through them")
 	}
 
 	var bad []string
@@ -443,7 +476,13 @@ func CheckWorkloads(ctx context.Context, env *Env) Result {
 
 	var pods podList
 	if err := env.kubectlJSON(ctx, &pods, "get", "pods", "-A"); err != nil {
-		return fail(name, "cannot read pods")
+		return fail(name, "cannot read pods ("+reason(err)+")")
+	}
+	// A cluster running a platform runs pods: kube-system alone has several. Zero is a read
+	// that returned nothing, and "0 pods, none crashlooping" is a tick over nothing examined.
+	if len(pods.Items) == 0 {
+		return fail(name, "no pods in any namespace — a provisioned platform cannot have none, so "+
+			"this read examined nothing")
 	}
 
 	var bad, settled []string
@@ -534,7 +573,17 @@ func CheckDashboards(ctx context.Context, env *Env) Result {
 
 	var ds dashboardList
 	if err := env.kubectlJSON(ctx, &ds, "get", "grafanadashboards", "-A"); err != nil {
-		return warn(name, "cannot read GrafanaDashboards — is grafana-operator installed?")
+		if notInstalled(err) {
+			return warn(name, "the GrafanaDashboard CRD is not installed, though observability.tier is "+
+				"full — grafana-operator has not been delivered, so no dashboard can render ("+reason(err)+")")
+		}
+		return warn(name, "cannot read GrafanaDashboards ("+reason(err)+")")
+	}
+	// The full tier ships dashboards. Zero under it is nothing examined rather than every
+	// dashboard applied.
+	if len(ds.Items) == 0 {
+		return warn(name, "no GrafanaDashboards, though observability.tier is full — nothing here was "+
+			"examined, so a dashboard that never rendered cannot be ruled out")
 	}
 
 	var bad []string
@@ -593,7 +642,12 @@ func CheckKarpenter(ctx context.Context, env *Env) Result {
 
 	var pools nodePoolList
 	if err := env.kubectlJSON(ctx, &pools, "get", "nodepools"); err != nil {
-		return skip(name, "no NodePools (karpenter not installed)")
+		// Only an absent resource type means Karpenter is not installed. Any other failure is
+		// a read that did not happen, and a skip would hide it.
+		if notInstalled(err) {
+			return skip(name, "no NodePool resource type — karpenter is not installed")
+		}
+		return warn(name, "cannot read NodePools ("+reason(err)+")")
 	}
 	if len(pools.Items) == 0 {
 		return skip(name, "no NodePools")

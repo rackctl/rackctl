@@ -26,8 +26,8 @@ func TestBucketNames_StateBackendExistingIsNotACollision(t *testing.T) {
 	fakeBin(t, "aws", `
 case "$1 $2" in
   "s3api list-buckets") echo "111122223333-us-west-2-tfstate" ;;
-  "eks describe-cluster") exit 1 ;;      # no live cluster => not a re-apply
-  "s3api head-bucket")    exit 1 ;;      # every other name is free
+  "eks describe-cluster") `+eksAbsent+` ;;      # no live cluster => not a re-apply
+  "s3api head-bucket")    `+s3Absent+` ;;      # every other name is free
   *) exit 1 ;;
 esac`)
 	r := CheckBucketNames(context.Background(), testEnv())
@@ -43,8 +43,8 @@ func TestBucketNames_ComponentBucketLeftBehindFails(t *testing.T) {
 	fakeBin(t, "aws", `
 case "$1 $2" in
   "s3api list-buckets") echo "development-platform-111122223333-us-west-2-velero" ;;
-  "eks describe-cluster") exit 1 ;;
-  "s3api head-bucket")    exit 1 ;;
+  "eks describe-cluster") `+eksAbsent+` ;;
+  "s3api head-bucket")    `+s3Absent+` ;;
   *) exit 1 ;;
 esac`)
 	r := CheckBucketNames(context.Background(), testEnv())
@@ -60,7 +60,7 @@ func TestBucketNames_ReapplyIsNotACollision(t *testing.T) {
 case "$1 $2" in
   "s3api list-buckets") echo "development-platform-111122223333-us-west-2-velero" ;;
   "eks describe-cluster") echo ACTIVE ;;
-  "s3api head-bucket")    exit 1 ;;
+  "s3api head-bucket")    `+s3Absent+` ;;
   *) exit 1 ;;
 esac`)
 	if r := CheckBucketNames(context.Background(), testEnv()); r.Status != doctor.OK {
@@ -82,8 +82,8 @@ func TestBucketNames_AccountScopedBucketIsReportedNotRefused(t *testing.T) {
 	fakeBin(t, "aws", `
 case "$1 $2" in
   "s3api list-buckets") echo "org-111122223333-us-west-2-bedrock-invocations" ;;
-  "eks describe-cluster") exit 1 ;;      # this environment's cluster does not exist yet
-  "s3api head-bucket")    exit 1 ;;
+  "eks describe-cluster") `+eksAbsent+` ;;      # this environment's cluster does not exist yet
+  "s3api head-bucket")    `+s3Absent+` ;;
   *) exit 1 ;;
 esac`)
 	r := CheckBucketNames(context.Background(), testEnv())
@@ -138,8 +138,8 @@ func TestBucketNames_OwnedByAnotherAccountIsUnrecoverable(t *testing.T) {
 	fakeBin(t, "aws", `
 case "$1 $2" in
   "s3api list-buckets") echo "" ;;       # we own none of them
-  "eks describe-cluster") exit 1 ;;
-  "s3api head-bucket")    exit 0 ;;      # ...but they all exist. 403-shaped: reachable, not ours
+  "eks describe-cluster") `+eksAbsent+` ;;
+  "s3api head-bucket")    exit 0 ;;      # ...but they all exist. Reachable, not ours
   *) exit 1 ;;
 esac`)
 	r := CheckBucketNames(context.Background(), testEnv())

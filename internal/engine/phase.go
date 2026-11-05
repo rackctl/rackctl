@@ -7,6 +7,7 @@ import (
 
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/exec"
+	"github.com/rackctl/rackctl/internal/reap"
 )
 
 // Repos holds the local paths of the nanohype repos rackctl orchestrates.
@@ -39,6 +40,21 @@ type State struct {
 	// update-kubeconfig has still repointed the kubeconfig and still has a real cluster
 	// to reap, and that is precisely the case a rollback exists for.
 	KubeconfigCluster string
+
+	// CaptureErr records each component whose outputs were read, keyed by component: nil
+	// when the read succeeded, the error when it did not. A missing key means the outputs
+	// were never read in this run.
+	//
+	// It is what lets a later consumer of a missing output say WHY it is missing. Without it
+	// the best that consumer could do was list causes nobody had checked, while the error
+	// that explained the absence had already been discarded.
+	CaptureErr map[string]error
+
+	// Backstops collects what each teardown sweep reported about itself, in the order they
+	// ran — the in-cluster reap and the IAM and EC2 backstops the rollback runs, and the
+	// volume sweep a phase teardown runs. The rollback prints them as one summary at its end,
+	// so which guards held is said once, in one place, rather than left in the scroll.
+	Backstops []reap.Backstop
 }
 
 // Phase is one ordered step of the 0→running bootstrap.

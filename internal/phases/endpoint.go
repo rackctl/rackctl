@@ -22,6 +22,11 @@ const ipEchoEndpoint = "https://checkip.amazonaws.com"
 // autodetect path can be exercised in tests without a real network call.
 var egressResolver = fetchEgressIP
 
+// EgressIP resolves this host's public egress IP through the same resolver the endpoint
+// allow-list uses, so a report of an unreachable cluster names the address that allow-list
+// would have to hold.
+func EgressIP(ctx context.Context) (string, error) { return egressResolver(ctx) }
+
 // fetchEgressIP asks ipEchoEndpoint for this host's public source address, with a bounded
 // timeout so a hung resolver cannot stall a provision. It returns the bare IP (no mask).
 func fetchEgressIP(ctx context.Context) (string, error) {

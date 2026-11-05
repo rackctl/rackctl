@@ -71,8 +71,13 @@ var operatorOwnedKinds = []string{
 //
 // But a finalizer that does NOT complete is reported loudly, naming what to look for,
 // because the alternative is that it surfaces several components later as an opaque
-// DeleteConflict — after the cluster is already gone.
-func All(ctx context.Context, run *exec.Runner, out io.Writer) {
+// DeleteConflict — after the cluster is already gone. And a cluster that exists and does
+// not answer is not a cluster that is gone: see unreachable.
+//
+// cluster and region name the cluster kubectl was pointed at, so an unreachable API can be
+// told apart from an absent cluster by asking EKS.
+func All(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) Backstop {
+	const name = "in-cluster reap"
 	if run.DryRun {
 		fmt.Fprintln(out, ui.Step("reap controller-owned resources (finalizers)"))
 		fmt.Fprintf(out, "    → (dry-run) kubectl -n argocd scale deployment/argocd-applicationset-controller "+
@@ -84,17 +89,20 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 			fmt.Fprintf(out, "    → (dry-run) kubectl delete %s --all -A --wait --timeout=5m\n", k)
 		}
 		fmt.Fprintf(out, "    → (dry-run) kubectl delete pvc --all -A --wait --timeout=5m\n")
-		return
+		return Backstop{Name: name, Outcome: Acted, Detail: "(dry-run) described, not run"}
 	}
 
-	// No reachable cluster ⇒ nothing to reap. A teardown must still work against a
-	// half-provisioned environment, which is exactly the case during a rollback.
+	// A teardown must still work against a half-provisioned environment, which is exactly the
+	// case during a rollback — so an API that does not answer is not an error. It is also not
+	// proof there is nothing to reap; unreachable asks EKS which it is.
 	if _, err := run.Capture(ctx, "kubectl", "get", "--raw", "/readyz"); err != nil {
-		fmt.Fprintln(out, ui.Step("no reachable cluster — nothing to reap"))
-		return
+		return unreachable(ctx, run, out, cluster, region, err)
 	}
 
-	disarmArgoCD(ctx, run, out)
+	var problems []string
+	if p := disarmArgoCD(ctx, run, out); p != "" {
+		problems = append(problems, p)
+	}
 
 	for _, kind := range operatorOwnedKinds {
 		// An uninstalled CRD is not a failure: the platform may never have been
@@ -109,6 +117,7 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 				"%s did not finalize — the operator could not delete the IAM roles it created. "+
 					"agent-iam will fail on DeleteConflict. Look for <cluster>-<platform>-{tenant,session} "+
 					"roles and anything under: aws iam list-roles --path-prefix /eks-agent-platform/", kind)))
+			problems = append(problems, kind+" did not finalize")
 		}
 	}
 
@@ -121,11 +130,15 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer) {
 		fmt.Fprintln(out, ui.Fail(
 			"PVCs did not delete cleanly — the EBS CSI driver may not have released their volumes. "+
 				"Check: aws ec2 describe-volumes --filters Name=status,Values=available"))
-		return
+		return Backstop{Name: name, Outcome: Failed, Detail: strings.Join(append(problems, "PVCs did not delete cleanly"), "; ")}
 	}
 	if s := strings.TrimSpace(out2); s != "" {
 		fmt.Fprintln(out, ui.OK(s))
 	}
+	if len(problems) > 0 {
+		return Backstop{Name: name, Outcome: Failed, Detail: strings.Join(problems, "; ")}
+	}
+	return Backstop{Name: name, Outcome: Acted, Detail: "ArgoCD disarmed; controller-owned CRs and PVCs deleted"}
 }
 
 // execer is the slice of *exec.Runner that reap's deterministic backstops use. Naming it
@@ -240,18 +253,19 @@ type execer interface {
 // it declines to prevent. That is the correct trade. Force-deleting an untagged IAM role
 // because its name matched is how a teardown reaches outside itself, and IAM is global — no
 // region protects anything here.
-func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer, own Owner) {
-	reapOperatorRoles(ctx, run, run.DryRun, out, own)
+func OperatorRoles(ctx context.Context, run *exec.Runner, out io.Writer, own Owner) Backstop {
+	return reapOperatorRoles(ctx, run, run.DryRun, out, own)
 }
 
-func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writer, own Owner) {
+func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writer, own Owner) Backstop {
 	const pathPrefix = "/eks-agent-platform/tenants/"
+	const bname = "operator IAM roles"
 
 	// A blank cluster name would make the prefix filter below match everything, turning the
 	// scoping this function documents into an account-wide sweep. There is no cluster whose
-	// roles could be named for it, so there is nothing to reap.
+	// roles could be named for it, so the sweep does not run — and says so.
 	if own.Cluster == "" {
-		return
+		return Backstop{Name: bname, Outcome: NotRun, Detail: "no cluster name to scope the sweep by"}
 	}
 
 	if dryRun {
@@ -284,7 +298,7 @@ func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writ
 		fmt.Fprintln(out, ui.Warn("could not enumerate IAM roles under "+pathPrefix+
 			" ("+err.Error()+") — this backstop did NOT run. If agent-iam fails on DeleteConflict, "+
 			"an operator-minted role is still there."))
-		return
+		return Backstop{Name: bname, Outcome: NotRun, Detail: "could not enumerate IAM roles under " + pathPrefix + ": " + err.Error()}
 	}
 	var candidates []string
 	for _, name := range strings.Fields(strings.TrimSpace(names)) {
@@ -297,7 +311,7 @@ func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writ
 			fmt.Fprintln(out, ui.OK("no IAM roles under "+pathPrefix+" named "+own.Cluster+
 				"-* — this sweep selects nothing"))
 		}
-		return
+		return Backstop{Name: bname, Outcome: FoundNothing}
 	}
 
 	var owned, refused []string
@@ -323,27 +337,42 @@ func reapOperatorRoles(ctx context.Context, run execer, dryRun bool, out io.Writ
 				"this run, so they were left alone. If agent-iam now fails on DeleteConflict, one of "+
 				"them is why — check its tags and remove it deliberately.", len(refused), pathPrefix)))
 	}
+	leftBehind := Backstop{Name: bname, Outcome: LeftBehind,
+		Detail: fmt.Sprintf("refused %d role(s) it could not prove were this run's", len(refused))}
 	if len(owned) == 0 {
-		return
+		return leftBehind
 	}
 
 	if dryRun {
 		fmt.Fprintln(out, ui.Step(fmt.Sprintf(
 			"(dry-run) would force-delete %d operator-minted IAM role(s): %s",
 			len(owned), strings.Join(owned, ", "))))
-		return
+		if len(refused) > 0 {
+			return leftBehind
+		}
+		return Backstop{Name: bname, Outcome: Acted, Detail: fmt.Sprintf("(dry-run) would force-delete %d", len(owned))}
 	}
 
 	fmt.Fprintln(out, ui.Step(fmt.Sprintf(
 		"force-deleting %d operator-minted IAM role(s) a finalizer left behind (agent-iam would else fail on DeleteConflict)", len(owned))))
+	var failed []string
 	for _, name := range owned {
 		if err := forceDeleteRole(ctx, run, name); err != nil {
 			fmt.Fprintln(out, ui.Fail(
 				"could not delete "+name+" — agent-iam may still fail on DeleteConflict: "+err.Error()))
+			failed = append(failed, name)
 			continue
 		}
 		fmt.Fprintln(out, ui.OK("deleted "+name))
 	}
+	switch {
+	case len(failed) > 0:
+		return Backstop{Name: bname, Outcome: Failed, Detail: "could not delete " + strings.Join(failed, ", ")}
+	case len(refused) > 0:
+		leftBehind.Detail = fmt.Sprintf("deleted %d; %s", len(owned), leftBehind.Detail)
+		return leftBehind
+	}
+	return Backstop{Name: bname, Outcome: Acted, Detail: fmt.Sprintf("deleted %d", len(owned))}
 }
 
 // forceDeleteRole detaches everything from a role and deletes it, mirroring the operator's
@@ -396,11 +425,12 @@ func forceDeleteRole(ctx context.Context, run execer, name string) error {
 //
 // Best-effort and cluster-optional: a teardown against an unreachable cluster has no CRs to
 // unstick, which is not an error.
-func UnstickTerminating(ctx context.Context, run *exec.Runner, out io.Writer) {
-	unstickTerminating(ctx, run, run.DryRun, out)
+func UnstickTerminating(ctx context.Context, run *exec.Runner, out io.Writer) Backstop {
+	return unstickTerminating(ctx, run, run.DryRun, out)
 }
 
-func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Writer) {
+func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Writer) Backstop {
+	const bname = "unstick Terminating CRs"
 	// Platform is namespaced, Tenant is cluster-scoped — the jsonpath emits the namespace
 	// (empty for Tenant) so the patch can add -n only when there is one.
 	kinds := []string{"platforms.platform.nanohype.dev", "tenants.platform.nanohype.dev"}
@@ -408,11 +438,20 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 		for _, k := range kinds {
 			fmt.Fprintln(out, ui.Step("(dry-run) unstick any "+k+" pinned in Terminating (finalizer force-removed)"))
 		}
-		return
+		return Backstop{Name: bname, Outcome: Acted, Detail: "(dry-run) described, not run"}
 	}
 	if _, err := run.Capture(ctx, "kubectl", "get", "--raw", "/readyz"); err != nil {
-		return // no reachable cluster — nothing to unstick
+		// Not reachable is not the same as nothing pinned, and the in-cluster reap probes the
+		// same API first. Its line carries the verdict: did not run for a cluster that exists,
+		// found nothing for one that is gone. Deciding it a second time here would hold a
+		// gone cluster's teardown unclean forever. And when that reap did run, it deleted the
+		// CRs with --wait, so nothing it left can be pinned here.
+		return Backstop{Name: bname, Outcome: NotRun, Informational: true,
+			Detail: "the cluster API did not answer (" + err.Error() + "); the in-cluster reap's line decides"}
 	}
+
+	var unstuck int
+	var unlisted, unpatched []string
 
 	for _, kind := range kinds {
 		if _, err := run.Capture(ctx, "kubectl", "get", "crd", kind); err != nil {
@@ -423,6 +462,7 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 		listed, err := run.Capture(ctx, "kubectl", "get", kind, "--all-namespaces",
 			"-o", `jsonpath={range .items[?(@.metadata.deletionTimestamp)]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}`)
 		if err != nil {
+			unlisted = append(unlisted, kind+" ("+err.Error()+")")
 			continue
 		}
 		for _, line := range strings.Split(strings.TrimSpace(listed), "\n") {
@@ -443,9 +483,21 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 				"-p", `[{"op":"remove","path":"/metadata/finalizers"}]`)
 			if err := run.Run(ctx, "kubectl", args...); err != nil {
 				fmt.Fprintln(out, ui.Fail("could not unstick "+name+": "+err.Error()))
+				unpatched = append(unpatched, name)
+				continue
 			}
+			unstuck++
 		}
 	}
+	switch {
+	case len(unpatched) > 0:
+		return Backstop{Name: bname, Outcome: Failed, Detail: "could not unstick " + strings.Join(unpatched, ", ")}
+	case len(unlisted) > 0:
+		return Backstop{Name: bname, Outcome: NotRun, Detail: "could not list " + strings.Join(unlisted, ", ")}
+	case unstuck > 0:
+		return Backstop{Name: bname, Outcome: Acted, Detail: fmt.Sprintf("unstuck %d", unstuck)}
+	}
+	return Backstop{Name: bname, Outcome: FoundNothing}
 }
 
 // OrphanedNodes terminates Karpenter's EC2 instances, and must run BEFORE the cluster
@@ -477,13 +529,14 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 // wedges the teardown on DependencyViolation with the cluster already gone.
 //
 // Enumeration runs in dry-run so the selection can be shown rather than described.
-func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
-	orphanedNodes(ctx, run, run.DryRun, out, cluster, region)
+func OrphanedNodes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) Backstop {
+	return orphanedNodes(ctx, run, run.DryRun, out, cluster, region)
 }
 
-func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster, region string) {
+func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster, region string) Backstop {
+	const bname = "Karpenter nodes"
 	if cluster == "" {
-		return
+		return Backstop{Name: bname, Outcome: NotRun, Detail: "no cluster name to filter by"}
 	}
 	ids, err := run.Query(ctx, "aws", "ec2", "describe-instances",
 		"--region", region,
@@ -499,7 +552,7 @@ func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, 
 		fmt.Fprintln(out, ui.Warn("could not enumerate Karpenter instances for "+cluster+
 			" ("+err.Error()+") — this backstop did NOT run. A surviving node will stop the "+
 			"teardown on DependencyViolation deleting the node security group."))
-		return
+		return Backstop{Name: bname, Outcome: NotRun, Detail: "could not enumerate instances: " + err.Error()}
 	}
 	ids = strings.TrimSpace(ids)
 	if ids == "" || ids == "None" {
@@ -507,14 +560,14 @@ func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, 
 			fmt.Fprintln(out, ui.OK("no EC2 instances tagged karpenter.sh/managed-by="+cluster+
 				" — this sweep selects nothing"))
 		}
-		return
+		return Backstop{Name: bname, Outcome: FoundNothing}
 	}
 
 	insts := strings.Fields(ids)
 	if dryRun {
 		fmt.Fprintln(out, ui.Step(fmt.Sprintf("(dry-run) would terminate %d Karpenter instance(s): %s",
 			len(insts), strings.Join(insts, ", "))))
-		return
+		return Backstop{Name: bname, Outcome: Acted, Detail: fmt.Sprintf("(dry-run) would terminate %d", len(insts))}
 	}
 	fmt.Fprintln(out, ui.Step(fmt.Sprintf("terminating %d Karpenter instance(s) left by %s", len(insts), cluster)))
 	args := append([]string{"ec2", "terminate-instances", "--region", region, "--instance-ids"}, insts...)
@@ -523,9 +576,10 @@ func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, 
 			"could not terminate Karpenter's instances — they will keep billing, AND the node "+
 				"security group cannot be deleted while they hold it, so the teardown will fail "+
 				"with DependencyViolation: "+err.Error()))
-		return
+		return Backstop{Name: bname, Outcome: Failed, Detail: "could not terminate " + strings.Join(insts, ", ")}
 	}
 	fmt.Fprintln(out, ui.OK("terminated "+strings.Join(insts, ", ")))
+	return Backstop{Name: bname, Outcome: Acted, Detail: fmt.Sprintf("terminated %d", len(insts))}
 }
 
 // OrphanedVolumes deletes EBS volumes the cluster left behind, AFTER it is gone.
@@ -580,15 +634,20 @@ func orphanedNodes(ctx context.Context, run execer, dryRun bool, out io.Writer, 
 //
 // Tagging them properly is upstream work — a configuration_values block on the addon — and is
 // filed as such. This is what rackctl can do without it.
-func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) {
-	orphanedVolumes(ctx, run, run.DryRun, out, cluster, region)
+//
+// It returns two backstops: the informational report of volumes it cannot prove are ours,
+// then the sweep of the ones it can.
+func OrphanedVolumes(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) []Backstop {
+	return orphanedVolumes(ctx, run, run.DryRun, out, cluster, region)
 }
 
-func orphanedVolumes(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster, region string) {
+func orphanedVolumes(ctx context.Context, run execer, dryRun bool, out io.Writer, cluster, region string) []Backstop {
+	const bname = "orphaned EBS volumes"
 	if cluster == "" {
-		return
+		return []Backstop{{Name: bname, Outcome: NotRun, Detail: "no cluster name to filter by"}}
 	}
-	reportUnprovableVolumes(ctx, run, out, cluster, region)
+	report := reportUnprovableVolumes(ctx, run, out, cluster, region)
+	result := func(b Backstop) []Backstop { return []Backstop{report, b} }
 
 	ids, err := run.Query(ctx, "aws", "ec2", "describe-volumes",
 		"--region", region,
@@ -600,7 +659,7 @@ func orphanedVolumes(ctx context.Context, run execer, dryRun bool, out io.Writer
 		fmt.Fprintln(out, ui.Warn("could not enumerate orphaned EBS volumes for "+cluster+
 			" ("+err.Error()+") — this sweep did NOT run. Any volume the cluster left behind is "+
 			"still billing; check `aws ec2 describe-volumes --filters Name=status,Values=available`."))
-		return
+		return result(Backstop{Name: bname, Outcome: NotRun, Detail: "could not enumerate volumes: " + err.Error()})
 	}
 	ids = strings.TrimSpace(ids)
 	if ids == "" || ids == "None" {
@@ -608,23 +667,29 @@ func orphanedVolumes(ctx context.Context, run execer, dryRun bool, out io.Writer
 			fmt.Fprintln(out, ui.OK("no available EBS volumes tagged kubernetes.io/cluster/"+cluster+
 				" — this sweep selects nothing"))
 		}
-		return
+		return result(Backstop{Name: bname, Outcome: FoundNothing})
 	}
 
 	vols := strings.Fields(ids)
 	if dryRun {
 		fmt.Fprintln(out, ui.Step(fmt.Sprintf("(dry-run) would delete %d orphaned EBS volume(s): %s",
 			len(vols), strings.Join(vols, ", "))))
-		return
+		return result(Backstop{Name: bname, Outcome: Acted, Detail: fmt.Sprintf("(dry-run) would delete %d", len(vols))})
 	}
 	fmt.Fprintln(out, ui.Step(fmt.Sprintf("sweeping %d EBS volume(s) orphaned by %s", len(vols), cluster)))
+	var failed []string
 	for _, v := range vols {
 		if err := run.Run(ctx, "aws", "ec2", "delete-volume", "--region", region, "--volume-id", v); err != nil {
 			fmt.Fprintln(out, ui.Fail("could not delete "+v+" — it will keep billing: "+err.Error()))
+			failed = append(failed, v)
 			continue
 		}
 		fmt.Fprintln(out, ui.OK("deleted "+v))
 	}
+	if len(failed) > 0 {
+		return result(Backstop{Name: bname, Outcome: Failed, Detail: "could not delete " + strings.Join(failed, ", ")})
+	}
+	return result(Backstop{Name: bname, Outcome: Acted, Detail: fmt.Sprintf("deleted %d", len(vols))})
 }
 
 // reportUnprovableVolumes names the available EBS volumes that a Kubernetes cluster clearly
@@ -639,13 +704,23 @@ func orphanedVolumes(ctx context.Context, run execer, dryRun bool, out io.Writer
 //
 // The provenance keys are the EBS CSI driver's own defaults, so a match is strong evidence of
 // origin even though it is no evidence of ownership.
-func reportUnprovableVolumes(ctx context.Context, run execer, out io.Writer, cluster, region string) {
+//
+// It is informational: it deletes nothing, so what it finds never decides whether a
+// teardown held. Its own query failing is still said, because "no unprovable volumes" and
+// "the report did not run" read identically as silence.
+func reportUnprovableVolumes(ctx context.Context, run execer, out io.Writer, cluster, region string) Backstop {
+	const bname = "unprovable EBS volumes"
 	raw, err := run.Query(ctx, "aws", "ec2", "describe-volumes",
 		"--region", region,
 		"--filters", "Name=status,Values=available",
 		"--query", "Volumes[].{VolumeId:VolumeId,Size:Size,Tags:Tags}", "--output", "json")
-	if err != nil || strings.TrimSpace(raw) == "" {
-		return
+	if err != nil {
+		fmt.Fprintln(out, ui.Warn("could not list available EBS volumes ("+err.Error()+") — the report of "+
+			"volumes a CSI driver made and nothing proves are "+cluster+"'s did NOT run"))
+		return Backstop{Name: bname, Outcome: NotRun, Informational: true, Detail: "could not list volumes: " + err.Error()}
+	}
+	if strings.TrimSpace(raw) == "" {
+		return Backstop{Name: bname, Outcome: FoundNothing, Informational: true}
 	}
 	var vols []struct {
 		VolumeId string
@@ -653,7 +728,9 @@ func reportUnprovableVolumes(ctx context.Context, run execer, out io.Writer, clu
 		Tags     []struct{ Key, Value string }
 	}
 	if err := json.Unmarshal([]byte(raw), &vols); err != nil {
-		return
+		fmt.Fprintln(out, ui.Warn("could not read the available EBS volumes ("+err.Error()+") — the report "+
+			"of volumes nothing proves are "+cluster+"'s did NOT run"))
+		return Backstop{Name: bname, Outcome: NotRun, Informational: true, Detail: "unreadable volume list: " + err.Error()}
 	}
 
 	var unprovable []string
@@ -672,7 +749,7 @@ func reportUnprovableVolumes(ctx context.Context, run execer, out io.Writer, clu
 		}
 	}
 	if len(unprovable) == 0 {
-		return
+		return Backstop{Name: bname, Outcome: FoundNothing, Informational: true}
 	}
 
 	fmt.Fprintln(out, ui.Warn(fmt.Sprintf(
@@ -684,6 +761,8 @@ func reportUnprovableVolumes(ctx context.Context, run execer, out io.Writer, clu
 			"certainly its Loki/Tempo/database volumes; delete them deliberately with "+
 			"`aws ec2 delete-volume --volume-id <id>`. The durable fix is upstream: set extraVolumeTags "+
 			"on the aws-ebs-csi-driver addon so the volumes say which cluster made them."))
+	return Backstop{Name: bname, Outcome: LeftBehind, Informational: true,
+		Detail: "named, not deleted: " + strings.Join(unprovable, ", ")}
 }
 
 // PointAt aims kubectl at the cluster whose resources are about to be reaped, and reports
@@ -790,8 +869,11 @@ func armedApplications(ctx context.Context, run *exec.Runner) ([]string, error) 
 	if err != nil {
 		return nil, err
 	}
+	// Items is a pointer so a document with no items key — `{}`, `null`, a response of some
+	// other kind — is told apart from a list that is genuinely empty. Both decode cleanly
+	// into a plain slice, and the first would then certify a disarm nothing examined.
 	var list struct {
-		Items []struct {
+		Items *[]struct {
 			Metadata struct {
 				Name string `json:"name"`
 			} `json:"metadata"`
@@ -805,8 +887,11 @@ func armedApplications(ctx context.Context, run *exec.Runner) ([]string, error) 
 	if err := json.Unmarshal([]byte(out), &list); err != nil {
 		return nil, fmt.Errorf("no readable Application list: %w", err)
 	}
+	if list.Items == nil {
+		return nil, fmt.Errorf("the Application list carries no items, so no Application was examined")
+	}
 	var armed []string
-	for _, it := range list.Items {
+	for _, it := range *list.Items {
 		if len(it.Spec.SyncPolicy.Automated) > 0 {
 			armed = append(armed, it.Metadata.Name)
 		}
@@ -837,10 +922,13 @@ func armedApplications(ctx context.Context, run *exec.Runner) ([]string, error) 
 // So the disarm stops the controllers, and then VERIFIES. A step that reports success from
 // its own exit code is exactly the shape of every other bug this teardown has produced: the
 // command ran, the setting did not stick, and nothing looked wrong.
-func disarmArgoCD(ctx context.Context, run *exec.Runner, out io.Writer) {
+//
+// It returns what it could not establish, or "" when the disarm is confirmed or there was
+// no ArgoCD to disarm.
+func disarmArgoCD(ctx context.Context, run *exec.Runner, out io.Writer) string {
 	if _, err := run.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications",
 		"-o", "name", "--request-timeout=30s"); err != nil {
-		return // no ArgoCD, or no Applications — nothing to disarm
+		return "" // no ArgoCD, or no Applications — nothing to disarm
 	}
 	fmt.Fprintln(out, ui.Step("disarm ArgoCD selfHeal (it recreates what the reap deletes)"))
 
@@ -878,7 +966,7 @@ func disarmArgoCD(ctx context.Context, run *exec.Runner, out io.Writer) {
 				"nothing here proves selfHeal is off. If an Application is still armed it will "+
 				"recreate the Platform CRs this reap deletes, leaving their IAM roles behind for "+
 				"agent-iam to fail on later with DeleteConflict."))
-		return
+		return "the ArgoCD disarm could not be confirmed"
 	}
 	if len(armed) > 0 {
 		fmt.Fprintln(out, ui.Fail(fmt.Sprintf(
@@ -887,9 +975,10 @@ func disarmArgoCD(ctx context.Context, run *exec.Runner, out io.Writer) {
 				"their IAM roles behind and fails agent-iam later on DeleteConflict",
 			len(armed), strings.Join(armed[:min(3, len(armed))], ", "),
 			map[bool]string{true: ", …", false: ""}[len(armed) > 3])))
-		return
+		return fmt.Sprintf("%d ArgoCD Application(s) still armed after the disarm", len(armed))
 	}
 	fmt.Fprintln(out, ui.OK("ArgoCD is passive — no Application carries syncPolicy.automated"))
+	return ""
 }
 
 // applicationNames lists the Applications in the argocd namespace by bare name.

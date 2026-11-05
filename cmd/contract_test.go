@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -11,6 +13,8 @@ import (
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/doctor"
 	"github.com/rackctl/rackctl/internal/engine"
+	rackexec "github.com/rackctl/rackctl/internal/exec"
+	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/tui"
 )
 
@@ -85,6 +89,59 @@ func TestClassifyRun_SeparatesTheThreeCloudStates(t *testing.T) {
 			t.Errorf("%s: exit %d, want %d", tc.name, got, tc.want)
 		}
 	}
+}
+
+// A rollback whose guard did not hold leaves something that may be billing, so the engine's
+// outcome classifies as resources-may-remain, not rolled-back. An informational report that
+// did not run decides nothing.
+func TestClassifyRun_ARollbackWhoseGuardDidNotHoldIsStranded(t *testing.T) {
+	for _, tc := range []struct {
+		b    reap.Backstop
+		want int
+	}{
+		{reap.Backstop{Name: "Karpenter nodes", Outcome: reap.Failed}, ExitStranded},
+		{reap.Backstop{Name: "orphaned EBS volumes", Outcome: reap.NotRun}, ExitStranded},
+		{reap.Backstop{Name: "unprovable EBS volumes", Outcome: reap.NotRun, Informational: true}, ExitRolledBack},
+		{reap.Backstop{Name: "orphaned EBS volumes", Outcome: reap.FoundNothing}, ExitRolledBack},
+	} {
+		run := rackexec.New(io.Discard)
+		run.DryRun = true
+		t.Setenv("PATH", t.TempDir())
+		eng := &engine.Engine{
+			Phases:      []engine.Phase{backstopPhase{id: "cluster", b: tc.b}, backstopPhase{id: "gitops", fail: true}},
+			Out:         io.Discard,
+			CleanOnFail: true,
+		}
+		err := eng.Run(context.Background(), &engine.State{Runner: run, Config: &config.Config{}})
+		if got := ExitCode(classifyRun(err)); got != tc.want {
+			t.Errorf("%s %s: exit %d, want %d (%v)", tc.b.Name, tc.b.Outcome, got, tc.want, err)
+		}
+	}
+}
+
+// backstopPhase records its backstop on teardown, the way the cluster phase records the
+// volume sweep.
+type backstopPhase struct {
+	id   string
+	fail bool
+	b    reap.Backstop
+}
+
+func (p backstopPhase) ID() string                 { return p.id }
+func (p backstopPhase) Title() string              { return p.id }
+func (p backstopPhase) Optional() bool             { return false }
+func (p backstopPhase) Enabled(*engine.State) bool { return true }
+func (p backstopPhase) Run(context.Context, *engine.State) error {
+	if p.fail {
+		return errors.New("boom")
+	}
+	return nil
+}
+func (p backstopPhase) Teardown(_ context.Context, st *engine.State) error {
+	if p.b.Name != "" {
+		st.Backstops = append(st.Backstops, p.b)
+	}
+	return nil
 }
 
 // The failure name printed to stderr and the status an agent reads must describe the same
