@@ -115,7 +115,10 @@ did not finish and what the run built may remain. Use it only if the unwind itse
 
 Under `--tui`, `q` does the same, and the footer says so before you press it. The first `q`
 stops the run and keeps the view up while the rollback runs to its end, each phase it undoes
-marked torn down; the second `q` forces exit, exactly as a second Ctrl-C does.
+marked torn down; the second `q` forces exit, exactly as a second Ctrl-C does. A signal
+from outside, a `SIGTERM` from a CI runner or `kill -INT`, is handled as on the plain path
+and never closes the view early; should the view close before the run ends for any other
+reason, rackctl says so and waits for the run, its rollback included, before it exits.
 
 An interrupted run exits `8` when its unwind finished, and `7` when it did not; the message
 starts with `interrupted:` either way. An interrupted `rackctl destroy` exits `8` only when

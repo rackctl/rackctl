@@ -6,7 +6,10 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -228,12 +231,12 @@ func TestForceExit_StopsTheToolsAndDrainsTheEngine(t *testing.T) {
 	forceStop = func() { stopped = true }
 	t.Cleanup(func() { forceStop = exec.ForceStop })
 	events := make(chan engine.Event, 2) // deliberately smaller than what we emit
-	done := make(chan error, 1)
+	done := newOutcome()
 	go func() {
 		for i := 0; i < 50; i++ { // would wedge on a full, undrained channel
 			events <- engine.Event{Index: i}
 		}
-		done <- nil
+		done.set(nil)
 	}()
 
 	finished := make(chan error, 1)
@@ -281,5 +284,116 @@ func TestView_ShowsThePostureTheTeardownAndWhatQuitDoes(t *testing.T) {
 	m.finished = true
 	if strings.Contains(view(), "portal") {
 		t.Errorf("no portal is installed, and the closing line hands off to one:\n%s", view())
+	}
+}
+
+// gatedFailure is an in-flight phase that fails once release is closed, and records that it
+// ran to its end.
+type gatedFailure struct {
+	release chan struct{}
+	ended   *atomic.Bool
+}
+
+func (gatedFailure) ID() string                 { return "gitops" }
+func (gatedFailure) Title() string              { return "gitops" }
+func (gatedFailure) Optional() bool             { return false }
+func (gatedFailure) Enabled(*engine.State) bool { return true }
+func (p gatedFailure) Run(context.Context, *engine.State) error {
+	<-p.release
+	p.ended.Store(true)
+	return errors.New("the gitops phase failed")
+}
+func (gatedFailure) Teardown(context.Context, *engine.State) error { return nil }
+
+// A view that returns before the engine has finished, by a quit or an interrupt message, does
+// not end RunInit. The engine's outcome, its rollback included, is waited on and returned,
+// because exiting there abandoned the unwind and reported a status the run had not reached.
+func TestRunInit_AViewThatExitsEarlyWaitsForTheEngine(t *testing.T) {
+	orig := engine.PlatformExists
+	t.Cleanup(func() { engine.PlatformExists = orig })
+	engine.PlatformExists = func(context.Context, *engine.State) engine.PlatformState { return engine.PlatformAbsent }
+	for name, early := range map[string]tea.Msg{"quit": tea.QuitMsg{}, "interrupt": tea.InterruptMsg{}} {
+		t.Run(name, func(t *testing.T) {
+			var notices bytes.Buffer
+			stderr = &notices
+			t.Cleanup(func() { stderr = os.Stderr })
+			release := make(chan struct{})
+			var ended atomic.Bool
+			tornDown := false
+			sent := false
+			// The first engine event the view sees is turned into the early exit, as Bubble
+			// Tea's own signal handler would deliver one.
+			filter := tea.WithFilter(func(_ tea.Model, msg tea.Msg) tea.Msg {
+				if _, ok := msg.(eventMsg); ok && !sent {
+					sent = true
+					time.AfterFunc(100*time.Millisecond, func() { close(release) })
+					return early
+				}
+				return msg
+			})
+			st := &engine.State{Runner: exec.New(io.Discard)}
+			err := RunInit(context.Background(), "test", st,
+				[]engine.Phase{slowTeardown{done: &tornDown}, gatedFailure{release: release, ended: &ended}}, true,
+				tea.WithInput(nil), tea.WithoutRenderer(), filter)
+
+			if !ended.Load() || !tornDown {
+				t.Fatalf("RunInit returned before the engine finished (phase ended=%v, torn down=%v): %v",
+					ended.Load(), tornDown, err)
+			}
+			var run *engine.RunError
+			if !errors.As(err, &run) || run.Outcome != engine.RolledBack {
+				t.Fatalf("want the engine's rolled-back outcome, got %v", err)
+			}
+			if !strings.Contains(notices.String(), "before the run finished; waiting for it to end") {
+				t.Errorf("the wait must be said:\n%s", notices.String())
+			}
+			if !strings.Contains(notices.String(), "failure detected — rolling back provisioned resources") {
+				t.Errorf("the notices published after the view exited must be kept:\n%s", notices.String())
+			}
+		})
+	}
+}
+
+// signalsSelf is a phase that sends this process SIGTERM once the view is up, then finishes.
+type signalsSelf struct{}
+
+func (signalsSelf) ID() string                 { return "cluster" }
+func (signalsSelf) Title() string              { return "cluster" }
+func (signalsSelf) Optional() bool             { return false }
+func (signalsSelf) Enabled(*engine.State) bool { return true }
+func (signalsSelf) Run(context.Context, *engine.State) error {
+	time.Sleep(150 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		return err
+	}
+	time.Sleep(300 * time.Millisecond)
+	return nil
+}
+func (signalsSelf) Teardown(context.Context, *engine.State) error { return nil }
+
+// A signal belongs to root's forwarder, not to the view. With Bubble Tea's own handler
+// installed, a SIGTERM closed the view mid-run and rackctl exited while the engine was still
+// unwinding.
+func TestRunInit_TheViewDoesNotHandleSignals(t *testing.T) {
+	sink := make(chan os.Signal, 1)
+	signal.Notify(sink, syscall.SIGTERM) // stands in for root's forwarder
+	t.Cleanup(func() { signal.Stop(sink) })
+	var notices bytes.Buffer
+	stderr = &notices
+	t.Cleanup(func() { stderr = os.Stderr })
+
+	st := &engine.State{Runner: exec.New(io.Discard)}
+	err := RunInit(context.Background(), "test", st, []engine.Phase{signalsSelf{}}, true,
+		tea.WithInput(nil), tea.WithoutRenderer())
+	if err != nil {
+		t.Fatalf("RunInit: %v", err)
+	}
+	select {
+	case <-sink:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the signal never arrived")
+	}
+	if strings.Contains(notices.String(), "before the run finished") {
+		t.Errorf("the view handled the signal and closed mid-run:\n%s", notices.String())
 	}
 }

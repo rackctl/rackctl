@@ -46,6 +46,23 @@ var stderr io.Writer = os.Stderr
 type eventMsg engine.Event
 type doneMsg struct{ err error }
 
+// outcome is the engine's result, published by closing ready. A close reaches every reader,
+// where a value sent on a channel reaches one: the view's own wait for it outlives a view
+// that exits early and would otherwise take the value, leaving whoever then waits on the
+// unwind waiting forever.
+type outcome struct {
+	ready chan struct{}
+	err   error
+}
+
+func newOutcome() *outcome { return &outcome{ready: make(chan struct{})} }
+
+// set records the engine's result and releases every reader. It is called once.
+func (o *outcome) set(err error) {
+	o.err = err
+	close(o.ready)
+}
+
 type phaseRow struct {
 	title  string
 	status engine.Status
@@ -57,7 +74,7 @@ type model struct {
 	title    string
 	rows     []phaseRow
 	events   chan engine.Event
-	done     chan error
+	done     *outcome
 	spinner  spinner.Model
 	finished bool
 	// aborted is the first q: the engine's context is cancelled and the view stays up while
@@ -93,6 +110,14 @@ type model struct {
 // in-flight terragrunt the same way a first Ctrl-C does, and the view stays up while the run
 // unwinds, a rollback included, to its end. The second q forces exit. The plain path does
 // exactly the same, so the same keystroke leaves the cloud in the same state on both.
+//
+// Signals are not the view's to handle. Bubble Tea's own handler turns a SIGTERM or a
+// SIGINT into an early return from the program, which ended the process while the engine,
+// cancelled by root's forwarder, was still unwinding, and left its tools running in their
+// own process groups. The program runs without it, so a signal reaches only root's
+// forwarder, which treats it as it treats a q. A view that still returns before the engine
+// has finished, for any reason, waits for the engine's outcome rather than reporting one it
+// does not have.
 // opts is for tests, which drive the program headless; production passes none.
 func RunInit(ctx context.Context, title string, st *engine.State, ph []engine.Phase, cleanOnFail bool, opts ...tea.ProgramOption) error {
 	// Subprocess output goes to a transcript rather than to io.Discard. The TUI owns the
@@ -110,9 +135,9 @@ func RunInit(ctx context.Context, title string, st *engine.State, ph []engine.Ph
 	defer cancel()
 
 	events := make(chan engine.Event, 128)
-	done := make(chan error, 1)
+	done := newOutcome()
 	eng := &engine.Engine{Phases: ph, Out: tr, CleanOnFail: cleanOnFail, Hook: func(ev engine.Event) { events <- ev }}
-	go func() { done <- eng.Run(ctx, st) }()
+	go func() { done.set(eng.Run(ctx, st)) }()
 
 	rows := make([]phaseRow, len(ph))
 	for i, p := range ph {
@@ -126,24 +151,34 @@ func RunInit(ctx context.Context, title string, st *engine.State, ph []engine.Ph
 	// program's copy; the local `m` is never touched. Returning it reported success
 	// for every failed run. (setRow appears to work only because m.rows is a slice
 	// sharing a backing array — which is exactly why this was easy to miss.)
-	final, err := tea.NewProgram(model{
+	final, viewErr := tea.NewProgram(model{
 		title: title, rows: rows, events: events, done: done, spinner: sp, stop: cancel,
 		noRollback: !cleanOnFail, success: engine.SuccessLine(st.Config),
 		tail: func() string { return tr.Tail(96) },
-	}, opts...).Run()
-	if err != nil {
-		tr.Report(stderr)
-		return err
-	}
+	}, append([]tea.ProgramOption{tea.WithoutSignalHandler()}, opts...)...).Run()
 	fm, ok := final.(model)
-	if !ok {
-		tr.Report(stderr)
-		return fmt.Errorf("tui: unexpected final model %T", final)
+	if viewErr == nil && !ok {
+		viewErr = fmt.Errorf("tui: unexpected final model %T", final)
 	}
-	if fm.forced {
+	var err error
+	switch {
+	case ok && fm.forced:
 		err = forceExit(events, done)
-	} else {
+	case ok && fm.finished:
 		err = fm.err
+	default:
+		// The view ended before the engine did. Its outcome is still the run's outcome, and
+		// the process must outlive the unwind that produces it, so it is waited on as the
+		// first q waits.
+		why := "the view closed"
+		if viewErr != nil {
+			why = "the view failed (" + viewErr.Error() + ")"
+		}
+		fmt.Fprintf(stderr, "%s before the run finished; waiting for it to end, its rollback included. An "+
+			"interrupt stops it, and a second one forces exit. Its output goes to %s\n", why, tr.Path())
+		var notices []string
+		notices, err = awaitEngine(events, done)
+		fm.notices = append(fm.notices, notices...)
 	}
 	// The path and the engine's notices are reported after the view exits, so they survive
 	// the alternate screen buffer, and on success as well as on failure — a run that worked
@@ -158,7 +193,7 @@ func RunInit(ctx context.Context, title string, st *engine.State, ph []engine.Ph
 // forceExit is the second q. Every tool the engine started is killed, process group and
 // all, and no new one can start, so the engine returns promptly; it is waited on, bounded
 // by abortGrace, so the transcript is not closed underneath it.
-func forceExit(events chan engine.Event, done chan error) error {
+func forceExit(events chan engine.Event, done *outcome) error {
 	forceStop()
 
 	// The engine's Hook publishes to `events`, and with the view gone nothing is
@@ -177,20 +212,49 @@ func forceExit(events chan engine.Event, done chan error) error {
 	}()
 
 	select {
-	case err := <-done:
+	case <-done.ready:
 		// The engine's error describes a run the operator abandoned; ErrForced says what
 		// that left and what to run next, so it is what is returned.
-		_ = err
 	case <-time.After(abortGrace):
 	}
 	return ErrForced
 }
 
+// awaitEngine waits for the engine's outcome once the view is gone, draining the events its
+// Hook publishes so the engine cannot block on a full channel, and keeping their notices.
+// Unlike forceExit it is not bounded: the unwind it waits for must run to completion.
+func awaitEngine(events chan engine.Event, done *outcome) ([]string, error) {
+	var notices []string
+	keep := func(ev engine.Event) {
+		if ev.Notice != "" {
+			notices = append(notices, ev.Notice)
+		}
+	}
+	for {
+		select {
+		case ev := <-events:
+			keep(ev)
+		case <-done.ready:
+			for {
+				select {
+				case ev := <-events:
+					keep(ev)
+				default:
+					return notices, done.err
+				}
+			}
+		}
+	}
+}
+
 func waitEvent(ch chan engine.Event) tea.Cmd {
 	return func() tea.Msg { return eventMsg(<-ch) }
 }
-func waitDone(ch chan error) tea.Cmd {
-	return func() tea.Msg { return doneMsg{<-ch} }
+func waitDone(o *outcome) tea.Cmd {
+	return func() tea.Msg {
+		<-o.ready
+		return doneMsg{o.err}
+	}
 }
 
 func (m model) Init() tea.Cmd {
