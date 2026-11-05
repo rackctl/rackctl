@@ -1164,8 +1164,16 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	err := applyWith(ctx, st, "cluster-bootstrap", "TF_VAR_enable_eval_runtime=true")
 	st.Runner.Dir = prevDir
+	// From here on the phase is CONVERGING, not provisioning: the agent-platform tree is
+	// built, and what follows republishes an annotation and waits on what the catalog
+	// delivers. A failure in that is not a reason to destroy the cloud underneath, for the
+	// same reason the gitops phase gives for its convergence wait, so each one leaves the
+	// platform standing and names the next step.
 	if err != nil {
-		return fmt.Errorf("republishing cluster-bootstrap for eval-runtime: %w", err)
+		return &engine.NoRollbackError{Err: fmt.Errorf(
+			"republishing cluster-bootstrap for eval-runtime: %w. The cloud IS provisioned and the "+
+				"cluster is left standing — fix the cause and re-run `rackctl apply`, or `rackctl destroy` "+
+				"if you want it gone", err)}
 	}
 
 	note(st, "agent operator + CRDs are owned by the GitOps catalog (addons-agent-operator); waiting for convergence")
@@ -1176,15 +1184,19 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 	for _, crd := range agentPlatformCRDs {
 		if err := st.Runner.Run(ctx, "kubectl", "wait", "--for=condition=Established",
 			"crd/"+crd, "--timeout=10m"); err != nil {
-			return fmt.Errorf("agent-platform CRD %s never established — the catalog did not deliver the operator chart "+
-				"(check the eks-agent-platform/enabled label on the ArgoCD cluster Secret, and the "+
-				"addons-agent-operator ApplicationSet): %w", crd, err)
+			return &engine.NoRollbackError{Err: fmt.Errorf(
+				"agent-platform CRD %s never established — the catalog did not deliver the operator chart "+
+					"(check the eks-agent-platform/enabled label on the ArgoCD cluster Secret, and the "+
+					"addons-agent-operator ApplicationSet): %w. The cloud IS provisioned and the cluster is "+
+					"left standing — run `rackctl check`, and `rackctl destroy` if you want it gone", crd, err)}
 		}
 	}
 
 	if err := st.Runner.Run(ctx, "kubectl", "-n", "eks-agent-platform", "wait",
 		"--for=condition=Available", "deploy/eks-agent-platform-operator", "--timeout=10m"); err != nil {
-		return fmt.Errorf("agent operator never became Available: %w", err)
+		return &engine.NoRollbackError{Err: fmt.Errorf(
+			"agent operator never became Available: %w. The cloud IS provisioned and the cluster is left "+
+				"standing — run `rackctl check`, and `rackctl destroy` if you want it gone", err)}
 	}
 	return nil
 }
