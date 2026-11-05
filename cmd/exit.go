@@ -39,6 +39,7 @@ const (
 	ExitRolledBack = 6
 	// ExitStranded means a phase failed AND the rollback could not finish, or a teardown
 	// ended with a backstop that guards billable or blocking resources failed or not run.
+	// A second interrupt, which forces exit before the unwind finishes, exits this too.
 	// This is the one that needs a human: resources this run created may still exist.
 	// docs/runbook.md covers what to look for.
 	ExitStranded = 7

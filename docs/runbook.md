@@ -104,10 +104,12 @@ rackctl check -c rackctl.yaml     # names what is wrong, per check
 
 ### An interrupt
 
-The first Ctrl-C cancels the run's context, which terminates the in-flight terragrunt,
-kubectl or helm rather than orphaning it, and lets the rollback run. **The second Ctrl-C
-kills the process outright** — including a rollback in progress, which will leave resources
-behind. Use it only if the unwind itself has hung.
+The first Ctrl-C cancels the run's context. A running terragrunt or tofu gets one SIGINT,
+its graceful stop, and up to two minutes to write its state and release the state lock
+before it is killed; rackctl prints `waiting up to 2m0s for <tool> to release state` while
+it does. Then the rollback runs. **The second Ctrl-C forces exit**: rackctl kills every tool
+it started, process group and all, starts nothing more, and exits `7`, because the unwind
+did not finish and what the run built may remain. Use it only if the unwind itself has hung.
 
 An interrupted run exits `8` when its unwind finished, and `7` when it did not; the message
 starts with `interrupted:` either way. An interrupted `rackctl destroy` exits `8` only when

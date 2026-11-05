@@ -4,7 +4,9 @@ import (
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -108,4 +110,75 @@ func TestDestroy_AnInterruptIsAbortedOnlyBeforeAnythingWasDestroyed(t *testing.T
 			t.Errorf("the message must say the teardown was interrupted:\n%s", out)
 		}
 	})
+}
+
+// The second interrupt is forwarded. A mutating child runs in its own process group, so the
+// terminal's Ctrl-C does not reach it, and a rackctl that simply died would leave tofu
+// running with nothing to report to. The stub ignores the first interrupt, as a tofu still
+// writing state does, so only the forwarded kill can end it.
+func TestDestroy_ASecondInterruptKillsTheToolAndExitsResourcesMayRemain(t *testing.T) {
+	sleep, err := osexec.LookPath("sleep")
+	if err != nil {
+		t.Skip("no sleep on PATH")
+	}
+	dir := t.TempDir()
+	pidfile := filepath.Join(dir, "pid")
+	cmd := destroyCommand(t, map[string]string{
+		"terragrunt": "trap '' INT\necho $$ > " + pidfile + "\nexec " + sleep + " 60\n",
+	}, "--yes")
+	out, err := os.CreateTemp(dir, "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = out.Close() }()
+	cmd.Stdout, cmd.Stderr = out, out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if b, err := os.ReadFile(pidfile); err == nil && strings.TrimSpace(string(b)) != "" {
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatal("terragrunt never started")
+		}
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	code := exitStatus(cmd.Wait())
+	b, _ := os.ReadFile(out.Name())
+	if code != ExitStranded {
+		t.Fatalf("want exit %d, got %d\n%s", ExitStranded, code, b)
+	}
+	if !strings.Contains(string(b), "forced exit on a second interrupt") {
+		t.Errorf("the message must say why it stopped:\n%s", b)
+	}
+	for deadline := time.Now().Add(5 * time.Second); processAlive(pid); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatal("the tool outlived rackctl — the second interrupt was not forwarded to its group")
+		}
+	}
+}
+
+// processAlive reports whether pid is running, counting a zombie as gone.
+func processAlive(pid int) bool {
+	if pid <= 0 || syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return true
+	}
+	f := strings.Fields(string(stat))
+	return len(f) < 3 || f[2] != "Z"
 }
