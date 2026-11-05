@@ -347,19 +347,29 @@ func tg(ctx context.Context, st *engine.State, verb, component string, extraEnv 
 	return st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", verb, "-auto-approve")
 }
 
-// captureOutputs merges a component's `terragrunt output -json` into State. It
-// is a no-op in dry-run and on any error (outputs are advisory, not required).
+// captureOutputs merges a component's `terragrunt output -json` into State. It is a no-op
+// in dry-run. A failed read does not stop the run — outputs are advisory to most callers —
+// but it is recorded in State.CaptureErr and said in one line, so a consumer that needed one
+// of them can cite the reason rather than guess at it.
 func captureOutputs(ctx context.Context, st *engine.State, component string) {
 	if st.Runner.DryRun {
 		return
 	}
+	if st.CaptureErr == nil {
+		st.CaptureErr = map[string]error{}
+	}
 	dir := componentDir(st, component)
 	data, err := st.Runner.Capture(ctx, "terragrunt", "--working-dir", dir, "output", "-json")
-	if err != nil || data == "" {
-		return
+	if err == nil && strings.TrimSpace(data) == "" {
+		err = fmt.Errorf("terragrunt output -json printed nothing")
 	}
-	m, err := tf.ParseOutputs([]byte(data))
+	var m map[string]string
+	if err == nil {
+		m, err = tf.ParseOutputs([]byte(data))
+	}
+	st.CaptureErr[component] = err
 	if err != nil {
+		note(st, "could not read %s's terragrunt outputs: %v", component, err)
 		return
 	}
 	for k, v := range m {

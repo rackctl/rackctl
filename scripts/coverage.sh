@@ -46,6 +46,7 @@ internal/reap/own.go:Proves
 internal/reap/own.go:roleTags
 cmd/misc.go:confirmDestroy
 internal/phases/agentplatform.go:createBucketArgs
+internal/phases/agentplatform.go:agentPlatformStateHolders
 "
 
 # check_report applies both floors to a `go tool cover -func` report on stdin. Split out

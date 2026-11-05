@@ -39,6 +39,15 @@ type State struct {
 	// update-kubeconfig has still repointed the kubeconfig and still has a real cluster
 	// to reap, and that is precisely the case a rollback exists for.
 	KubeconfigCluster string
+
+	// CaptureErr records each component whose outputs were read, keyed by component: nil
+	// when the read succeeded, the error when it did not. A missing key means the outputs
+	// were never read in this run.
+	//
+	// It is what lets a later consumer of a missing output say WHY it is missing. Without it
+	// the best that consumer could do was list causes nobody had checked, while the error
+	// that explained the absence had already been discarded.
+	CaptureErr map[string]error
 }
 
 // Phase is one ordered step of the 0→running bootstrap.
