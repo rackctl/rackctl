@@ -181,6 +181,8 @@ CRITICAL = [
     ("internal/phases/agentplatform.go", "createBucketArgs"),
     ("internal/phases/agentplatform.go", "agentPlatformStateHolders"),
     ("internal/phases/phases.go", "permitRollbackBuckets"),
+    ("internal/phases/dns.go", "WithdrawSubdomainDelegation"),
+    ("internal/phases/dns.go", "delegationNotOurs"),
 ]
 
 

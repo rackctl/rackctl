@@ -170,6 +170,12 @@ Deleting it would be a guess. Delete them deliberately:
 aws ec2 delete-volume --volume-id <id>
 ```
 
+The subdomain delegation is the same. A destroy withdraws the NS record it wrote into the
+parent zone only when that record points at the name servers of this account's zone by the
+same name. On a re-run where the child zone is already gone, or when the record points
+elsewhere, it is left in place, and the line names the servers it points at and the exact
+`aws route53 change-resource-record-sets` command that removes it.
+
 ### An eks-fleet hub with live spokes
 
 `rackctl destroy` refuses outright, lists them and exits `9` (`refused`): nothing was

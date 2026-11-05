@@ -48,6 +48,8 @@ cmd/misc.go:confirmDestroy
 internal/phases/agentplatform.go:createBucketArgs
 internal/phases/agentplatform.go:agentPlatformStateHolders
 internal/phases/phases.go:permitRollbackBuckets
+internal/phases/dns.go:WithdrawSubdomainDelegation
+internal/phases/dns.go:delegationNotOurs
 "
 
 # check_report applies both floors to a `go tool cover -func` report on stdin. Split out
