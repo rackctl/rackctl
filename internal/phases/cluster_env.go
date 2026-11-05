@@ -22,9 +22,9 @@ import (
 // system-node caps than development; wiring Default()'s values unconditionally would
 // quietly downgrade both. A dry-run with every field at its default therefore injects only
 // cluster_name + the endpoint posture — and a test pins that.
-func clusterEnv(ctx context.Context, st *engine.State) ([]string, error) {
+func clusterEnv(ctx context.Context, st *engine.State, verb string) ([]string, error) {
 	env := []string{"TF_VAR_cluster_name=" + st.Config.Cluster.Name}
-	endpointEnv, err := clusterEndpointEnv(ctx, st)
+	endpointEnv, err := clusterEndpointEnv(ctx, st, verb)
 	if err != nil {
 		return nil, err
 	}

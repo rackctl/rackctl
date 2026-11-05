@@ -269,9 +269,10 @@ func componentEnv(ctx context.Context, st *engine.State, component, verb string)
 		return clusterNetworkEnv(st, verb), nil
 	case "cluster":
 		// cluster_name, endpoint posture, and sizing (version + system nodes) when non-default.
-		// The endpoint builder may detect this host's egress IP, so it can fail and must be
-		// able to say so.
-		return clusterEnv(ctx, st)
+		// The endpoint builder reads the live allow-list and, on a first apply only, detects
+		// this host's egress IP, so it can fail and must be able to say so. The verb decides
+		// whether detection may run at all: a destroy never detects.
+		return clusterEnv(ctx, st, verb)
 	case "dns":
 		// domain_name + acm_certificates + enable_dnssec. All three leaf-pinned to values that
 		// fail or mislead, and two of them are what make a dns-enabled install fail after
