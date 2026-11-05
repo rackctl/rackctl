@@ -441,8 +441,13 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 		return Backstop{Name: bname, Outcome: Acted, Detail: "(dry-run) described, not run"}
 	}
 	if _, err := run.Capture(ctx, "kubectl", "get", "--raw", "/readyz"); err != nil {
-		// Not reachable is not the same as nothing pinned; the in-cluster reap's line says why.
-		return Backstop{Name: bname, Outcome: NotRun, Detail: "the cluster API did not answer: " + err.Error()}
+		// Not reachable is not the same as nothing pinned, and the in-cluster reap probes the
+		// same API first. Its line carries the verdict: did not run for a cluster that exists,
+		// found nothing for one that is gone. Deciding it a second time here would hold a
+		// gone cluster's teardown unclean forever. And when that reap did run, it deleted the
+		// CRs with --wait, so nothing it left can be pinned here.
+		return Backstop{Name: bname, Outcome: NotRun, Informational: true,
+			Detail: "the cluster API did not answer (" + err.Error() + "); the in-cluster reap's line decides"}
 	}
 
 	var unstuck int

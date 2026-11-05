@@ -65,3 +65,51 @@ func TestRollbackEndsWithTheBackstopSummary(t *testing.T) {
 		t.Errorf("want the four rollback sweeps and the phase's own, got %d: %+v", len(st.Backstops), st.Backstops)
 	}
 }
+
+// rollbackWith runs a two-phase rollback whose cluster teardown records b, with no cluster
+// this run pointed kubectl at, so b is the only backstop that can decide the outcome.
+func rollbackWith(t *testing.T, b reap.Backstop) (string, error) {
+	t.Helper()
+	var out bytes.Buffer
+	run := exec.New(&out)
+	run.DryRun = true
+	t.Setenv("PATH", t.TempDir())
+	eng := &Engine{
+		Phases: []Phase{
+			sweepPhase{recPhase: recPhase{id: "cluster", enabled: true, log: new([]string)}, b: b},
+			recPhase{id: "gitops", enabled: true, fail: true, log: new([]string)},
+		},
+		Out:         &out,
+		CleanOnFail: true,
+	}
+	err := eng.Run(context.Background(), &State{Runner: run, Config: &config.Config{}})
+	if err == nil {
+		t.Fatal("a failed phase must fail the run")
+	}
+	return out.String(), err
+}
+
+// A rollback whose guard failed did not complete: the Karpenter node or volume it missed is
+// still billing, so the run must not read as rolled back with nothing remaining.
+func TestRollback_AGuardThatDidNotHoldIsAnIncompleteRollback(t *testing.T) {
+	for _, o := range []reap.Outcome{reap.Failed, reap.NotRun} {
+		out, err := rollbackWith(t, reap.Backstop{Name: "orphaned EBS volumes", Outcome: o})
+		if !strings.Contains(err.Error(), "the rollback did not complete") ||
+			!strings.Contains(err.Error(), "these backstops did not hold: orphaned EBS volumes") {
+			t.Errorf("%s: the rollback must report itself incomplete, naming the guard: %v\n%s", o, err, out)
+		}
+	}
+}
+
+// Informational reports and guards that held leave a rollback complete.
+func TestRollback_GuardsThatHeldLeaveTheRollbackComplete(t *testing.T) {
+	for _, b := range []reap.Backstop{
+		{Name: "orphaned EBS volumes", Outcome: reap.FoundNothing},
+		{Name: "unprovable EBS volumes", Outcome: reap.NotRun, Informational: true},
+	} {
+		out, err := rollbackWith(t, b)
+		if strings.Contains(err.Error(), "did not complete") {
+			t.Errorf("%s %s: a rollback whose guards held is complete: %v\n%s", b.Name, b.Outcome, err, out)
+		}
+	}
+}

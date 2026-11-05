@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/ui"
 )
 
@@ -66,15 +67,46 @@ type Backstop struct {
 // backstop that did not run is not clean: "nothing was found" and "nothing was looked for"
 // are opposite facts about what is still billing.
 func Clean(bs []Backstop) bool {
+	return len(Unheld(bs)) == 0
+}
+
+// Unheld names every backstop that guards something and failed or did not run, in order.
+// Informational backstops are never named: they delete nothing, so what they miss cannot
+// leave anything billing.
+func Unheld(bs []Backstop) []string {
+	var names []string
 	for _, b := range bs {
 		if b.Informational {
 			continue
 		}
 		if b.Outcome == Failed || b.Outcome == NotRun {
-			return false
+			names = append(names, b.Name)
 		}
 	}
-	return true
+	return names
+}
+
+// ClusterGone reports whether EKS says the cluster does not exist. Only
+// ResourceNotFoundException answers yes; any other failure leaves the question open, and
+// an open question is not a cluster that is gone.
+//
+// A destroy that could not point kubectl at its cluster asks this, because the idempotent
+// re-run after a partial teardown reaches a cluster that the first run already deleted, and
+// a cluster that is gone has nothing in it to reap.
+func ClusterGone(ctx context.Context, run *exec.Runner, cluster, region string) bool {
+	return clusterGone(ctx, run, cluster, region)
+}
+
+func clusterGone(ctx context.Context, run execer, cluster, region string) bool {
+	if cluster == "" {
+		return false
+	}
+	args := []string{"eks", "describe-cluster", "--name", cluster}
+	if region != "" {
+		args = append(args, "--region", region)
+	}
+	_, err := run.Query(ctx, "aws", append(args, "--query", "cluster.status", "--output", "text")...)
+	return err != nil && strings.Contains(err.Error(), "ResourceNotFoundException")
 }
 
 // Summarize prints the backstop summary — one line per backstop, saying which ran, found

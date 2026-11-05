@@ -58,6 +58,45 @@ func TestClean_InformationalBackstopsDoNotDecideIt(t *testing.T) {
 	}
 }
 
+func TestUnheld_NamesTheGuardsThatDidNotHold(t *testing.T) {
+	got := Unheld([]Backstop{
+		{Name: "a", Outcome: FoundNothing},
+		{Name: "b", Outcome: Failed},
+		{Name: "c", Outcome: NotRun, Informational: true},
+		{Name: "d", Outcome: NotRun},
+		{Name: "e", Outcome: LeftBehind},
+	})
+	if strings.Join(got, ",") != "b,d" {
+		t.Errorf("want the failed and the unrun guards, in order; got %v", got)
+	}
+}
+
+// Only EKS saying the cluster does not exist makes it gone. A denied read is an open
+// question, not an empty account.
+func TestClusterGone_OnlyResourceNotFoundIsGone(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeEKS{err: errors.New("An error occurred (ResourceNotFoundException): No cluster found")}
+	if !clusterGone(ctx, f, "dev", "us-west-2") {
+		t.Error("ResourceNotFoundException is a cluster that is gone")
+	}
+	if strings.Join(f.args, " ") != "eks describe-cluster --name dev --region us-west-2 --query cluster.status --output text" {
+		t.Errorf("argv: %v", f.args)
+	}
+	f = &fakeEKS{err: errors.New("An error occurred (ResourceNotFoundException): No cluster found")}
+	if !clusterGone(ctx, f, "dev", "") || strings.Contains(strings.Join(f.args, " "), "--region") {
+		t.Errorf("no region sends no --region: %v", f.args)
+	}
+	if clusterGone(ctx, &fakeEKS{err: errors.New("AccessDenied")}, "dev", "us-west-2") {
+		t.Error("a denied read is not a cluster that is gone")
+	}
+	if clusterGone(ctx, &fakeEKS{answer: "ACTIVE"}, "dev", "us-west-2") {
+		t.Error("an answering cluster is not gone")
+	}
+	if clusterGone(ctx, &fakeEKS{err: errors.New("ResourceNotFoundException")}, "", "us-west-2") {
+		t.Error("no cluster name asks nothing and proves nothing")
+	}
+}
+
 // ─────────────────────────── unreachable ───────────────────────────
 
 // fakeEKS answers describe-cluster, the one read unreachable makes.
@@ -302,8 +341,9 @@ func TestUnstickTerminating_ReportsWhatItDid(t *testing.T) {
 	if b := unstickTerminating(ctx, &fakeKube{}, true, &bytes.Buffer{}); b.Outcome != Acted {
 		t.Errorf("dry-run: got %s", b.Outcome)
 	}
-	if b := unstickTerminating(ctx, &fakeKube{ready: false}, false, &bytes.Buffer{}); b.Outcome != NotRun {
-		t.Errorf("unreachable is not nothing pinned: got %s", b.Outcome)
+	if b := unstickTerminating(ctx, &fakeKube{ready: false}, false, &bytes.Buffer{}); b.Outcome != NotRun || !b.Informational {
+		t.Errorf("unreachable is not nothing pinned, and the in-cluster reap's line decides it: got %s informational=%t",
+			b.Outcome, b.Informational)
 	}
 	k := &fakeKube{ready: true, crds: map[string]bool{"platforms.platform.nanohype.dev": true},
 		listing: map[string]string{"platforms.platform.nanohype.dev": "ns ops\n"}}

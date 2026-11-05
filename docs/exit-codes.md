@@ -16,8 +16,18 @@ must not be renumbered.
 | 4 | `declined` | A human refused the confirmation, or there was no human to ask. | Nothing was destroyed. Pass `--yes` for a scripted teardown. |
 | 5 | `platform-left-standing` | A phase failed and the platform was deliberately left up — an optional phase, a convergence timeout, or a run that did not build what it found. | The platform is usable. `rackctl check` says what is wrong. `rackctl destroy` to remove it. |
 | 6 | `rolled-back` | A phase failed and the rollback ran to completion. | What this run created has been destroyed. Fix and re-run. |
-| 7 | `resources-may-remain` | A phase failed **and** the rollback could not finish. | Needs a human. See [runbook.md](runbook.md) — *A teardown that stopped partway*. |
+| 7 | `resources-may-remain` | A phase failed **and** the rollback could not finish, or a teardown (a rollback or `rackctl destroy`) ended with a backstop that failed or did not run. | Needs a human. See [runbook.md](runbook.md) — *A teardown that stopped partway*. |
 | 8 | `aborted` | The operator interrupted. | Whether the unwind finished depends on how far it got before a second interrupt. Verify with `rackctl check`, then `rackctl destroy` if needed. |
+
+A backstop is a sweep that guards something terraform cannot see: the in-cluster reap, the
+operator IAM roles, the Karpenter nodes and the orphaned EBS volumes. One that failed or did
+not run can leave an instance billing or a role that stops the next teardown, so a rollback
+that hits one is not complete and exits `7` rather than `6`, and a `rackctl destroy` whose
+every component came down exits `7` rather than `0`. The message names each backstop that did
+not hold. The unprovable-volume report is informational: it deletes nothing, so it never
+decides the status, and a destroy whose guards all held exits `0` with its warning. A cluster
+that no longer exists is a backstop that found nothing, so the re-run after a partial
+teardown can finish clean.
 
 The name is printed to stderr alongside the message, so a terminal and a `$?` carry the
 same vocabulary:

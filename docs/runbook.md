@@ -127,7 +127,11 @@ Both `rackctl destroy` and a rollback end with a **backstop summary**: one line 
 that guards something terraform cannot see, saying whether it ran, found nothing, failed or
 did not run. `platform destroyed` is printed only when every one of them ran clean; otherwise
 the closing line says which did not, and those are what to check before calling the account
-empty. The unprovable-volume report is listed too, and is informational — it deletes nothing.
+empty. A backstop that did not hold exits `7` (`resources-may-remain`), from a destroy whose
+components all came down and from a rollback alike. The unprovable-volume report is listed
+too, and is informational: it deletes nothing, so it warns and never changes the exit status.
+A re-run against a cluster the first run already deleted reports the in-cluster reap as
+`found nothing — the cluster no longer exists`, and can finish with `platform destroyed`.
 
 ### Resources rackctl will not delete
 

@@ -385,12 +385,20 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) 
 			}
 		}
 	}
-	// Which guards held, said once at the end. The exit status is decided by the component
-	// teardowns above; this line is what tells an operator whether anything terraform cannot
-	// see was left behind.
-	if e.Out != nil && !reap.Summarize(e.Out, st.Backstops) {
-		fmt.Fprintln(e.Out, ui.Warn("not every backstop ran clean — resources outside terraform's state "+
-			"may remain; the summary above names which"))
+	// Which guards held, said once at the end. A guard that failed or did not run can leave a
+	// Karpenter node billing or an operator role standing, which is a rollback that did not
+	// complete exactly as a component that failed to destroy is, so it is returned with them
+	// and the run classifies as resources-may-remain rather than rolled-back. Informational
+	// backstops never reach that list.
+	if e.Out != nil {
+		reap.Summarize(e.Out, st.Backstops)
+	}
+	if unheld := reap.Unheld(st.Backstops); len(unheld) > 0 {
+		if e.Out != nil {
+			fmt.Fprintln(e.Out, ui.Warn("not every backstop ran clean — resources outside terraform's state "+
+				"may remain; the summary above names which"))
+		}
+		failed = append(failed, fmt.Errorf("these backstops did not hold: %s", strings.Join(unheld, ", ")))
 	}
 	return failed
 }
