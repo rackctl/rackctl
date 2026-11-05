@@ -13,10 +13,16 @@ import (
 	"github.com/rackctl/rackctl/internal/doctor"
 )
 
-// fakeQuotaAWS puts an aws on PATH that answers the vCPU quota with have, lists pending as
-// the open request (or none), and records a filed request so the history lists it after.
-// It returns a reader for every invocation.
+// fakeQuotaAWS puts an aws on PATH whose credentials are for the account quotaCfg names,
+// answers the vCPU quota with have, lists pending as the open request (or none), and records
+// a filed request so the history lists it after. It returns a reader for every invocation.
 func fakeQuotaAWS(t *testing.T, have, pending string) func() string {
+	t.Helper()
+	return fakeQuotaAWSFor(t, "111111111111", have, pending)
+}
+
+// fakeQuotaAWSFor is fakeQuotaAWS with the credentials' account named.
+func fakeQuotaAWSFor(t *testing.T, account, have, pending string) func() string {
 	t.Helper()
 	dir := t.TempDir()
 	log := filepath.Join(dir, "calls.log")
@@ -24,6 +30,7 @@ func fakeQuotaAWS(t *testing.T, have, pending string) func() string {
 	script := `#!/bin/sh
 echo "$*" >> ` + log + `
 case "$2" in
+  get-caller-identity) echo "` + account + `" ;;
   get-service-quota) echo "` + have + `" ;;
   list-requested-service-quota-change-history-by-quota)
     if [ -f ` + filed + ` ]; then
@@ -68,6 +75,55 @@ func TestRequestQuota_FilesTheIncreaseAndRefusesNamingIt(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "req-filed") {
 		t.Errorf("the refusal must name the request it filed: %v", err)
+	}
+}
+
+// Credentials for another account file nothing there, and leave the refusal to the gate's
+// identity check. The step ran ahead of that check and filed the increase in whatever account
+// the ambient profile resolved to, then refused over the stray request on every re-run.
+func TestRequestQuota_CredentialsForAnotherAccountFileNothing(t *testing.T) {
+	calls := fakeQuotaAWSFor(t, "222222222222", "32", noPending)
+	if err := requestQuota(context.Background(), quotaCfg(), nil, io.Discard); err != nil {
+		t.Fatalf("an account mismatch is the gate's refusal to give, got %v", err)
+	}
+	if strings.Contains(calls(), "request-service-quota-increase") {
+		t.Errorf("nothing may be filed in an account the config does not name:\n%s", calls())
+	}
+}
+
+// A pending request in another account is not named as this config's: the refusal over it
+// hid the mismatch.
+func TestRequestQuota_APendingRequestInAnotherAccountIsNotNamed(t *testing.T) {
+	fakeQuotaAWSFor(t, "222222222222", "32",
+		`{"RequestedQuotas":[{"Id":"req-1","CaseId":"case-42","Status":"CASE_OPENED","DesiredValue":256}]}`)
+	if err := requestQuota(context.Background(), quotaCfg(), nil, io.Discard); err != nil {
+		t.Fatalf("an account mismatch is the gate's refusal to give, got %v", err)
+	}
+}
+
+// An identity that could not be read files nothing.
+func TestRequestQuota_AnUnreadIdentityFilesNothing(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "calls.log")
+	script := `#!/bin/sh
+echo "$*" >> ` + log + `
+case "$2" in
+  get-caller-identity) echo "An error occurred (ExpiredToken)" >&2; exit 254 ;;
+  get-service-quota) echo 32 ;;
+  list-requested-service-quota-change-history-by-quota) echo '{"RequestedQuotas":[]}' ;;
+  *) : ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := requestQuota(context.Background(), quotaCfg(), nil, io.Discard); err != nil {
+		t.Fatalf("an unread identity is the gate's refusal to give, got %v", err)
+	}
+	b, _ := os.ReadFile(log)
+	if strings.Contains(string(b), "request-service-quota-increase") {
+		t.Errorf("nothing may be filed under credentials not matched to the config:\n%s", b)
 	}
 }
 
@@ -139,6 +195,7 @@ func TestRequestQuota_AFailedFilingRefusesWithTheCommand(t *testing.T) {
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$2" in
+  get-caller-identity) echo 111111111111 ;;
   get-service-quota) echo 32 ;;
   list-requested-service-quota-change-history-by-quota) echo '{"RequestedQuotas":[]}' ;;
   *) echo "An error occurred (AccessDeniedException)" >&2; exit 254 ;;
@@ -261,5 +318,38 @@ cluster:
 	}
 	if strings.Contains(string(out), "Preflight — tools") {
 		t.Errorf("no phase may run before the quota is granted:\n%s", out)
+	}
+}
+
+// Through the binary: credentials for another account file nothing, and the apply exits
+// preflight with the mismatch named rather than refused over a quota in the wrong account.
+func TestApply_CredentialsForAnotherAccountFileNoQuotaAndExitPreflight(t *testing.T) {
+	bin := buildRackctl(t)
+	calls := fakeQuotaAWSFor(t, "222222222222", "32", noPending)
+	cfg := filepath.Join(t.TempDir(), "rackctl.yaml")
+	if err := os.WriteFile(cfg, []byte(`org:
+  name: acme
+cloud:
+  provider: aws
+  accountId: "111111111111"
+  region: us-west-2
+  profile: test
+environment: development
+cluster:
+  name: platform
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := osexec.Command(bin, "apply", "-c", cfg)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if got := exitStatus(err); got != ExitPreflight {
+		t.Fatalf("exit = %d, want %d preflight:\n%s", got, ExitPreflight, out)
+	}
+	if strings.Contains(calls(), "request-service-quota-increase") {
+		t.Fatalf("the increase was filed in an account the config does not name:\n%s", calls())
+	}
+	if !strings.Contains(string(out), "credentials are for account 222222222222") {
+		t.Errorf("the gate must name the account mismatch:\n%s", out)
 	}
 }

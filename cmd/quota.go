@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/rackctl/rackctl/internal/config"
+	"github.com/rackctl/rackctl/internal/doctor"
 	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/preflight"
 	"github.com/rackctl/rackctl/internal/ui"
@@ -28,6 +29,13 @@ import (
 // It returns nil whenever the quota cannot be judged short, and leaves the verdict to the
 // gate: a quota that could not be read is the gate's warning to give, and autoRequest off is
 // the gate's refusal, which names the command to file it.
+//
+// The credentials are matched to cloud.accountId before anything is read or filed. The
+// profile is ambient, and this step runs ahead of the gate's identity check, so without the
+// match it filed the increase, and opened its support case, in whatever account the profile
+// resolved to. Every re-run then found that stray request pending and refused over it,
+// hiding the mismatch the gate exists to report. A mismatch, or an identity that could not
+// be read, files nothing and leaves the refusal to the gate.
 func requestQuota(ctx context.Context, cfg *config.Config, env []string, out io.Writer) error {
 	if !cfg.Quotas.AutoRequestEnabled() || cfg.Quotas.VCPU <= 0 {
 		return nil
@@ -36,6 +44,9 @@ func requestQuota(ctx context.Context, cfg *config.Config, env []string, out io.
 	run.Env = env
 	pe := &preflight.Env{Cfg: cfg, Run: run}
 
+	if preflight.CheckIdentity(ctx, pe).Status != doctor.OK {
+		return nil
+	}
 	have, err := preflight.VCPUQuota(ctx, pe)
 	if err != nil || int(have) >= cfg.Quotas.VCPU {
 		return nil

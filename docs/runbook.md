@@ -71,7 +71,9 @@ recur:
   cluster.
 - **`vcpu quota`** — a fresh account caps at ~32 vCPU. With `quotas.autoRequest` on,
   `rackctl apply` files the increase before the gate, or finds the request already open,
-  and exits `9` refused naming the request id and its case id. AWS takes minutes to days to
+  and exits `9` refused naming the request id and its case id. It files only once the
+  credentials match `cloud.accountId`; a mismatch files nothing and the gate's `aws
+  identity` check refuses it. AWS takes minutes to days to
   grant it; re-run `rackctl apply` once it has. `rackctl check` names the open request too,
   and with `autoRequest` off it prints the `aws service-quotas` command to file it yourself.
 - **`github token`** — `org.gitops.tenantsRepo` is set, which arms cluster-bootstrap's
