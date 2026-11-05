@@ -3,12 +3,14 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
+	rackexec "github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/phases"
 	"github.com/rackctl/rackctl/internal/reap"
 )
@@ -26,26 +28,68 @@ var rootCmd = &cobra.Command{
 //
 // The signal context is what makes an interrupt survivable. Every subprocess rackctl
 // starts is an exec.CommandContext on a context descended from this one, so cancelling it
-// terminates the in-flight terragrunt, kubectl or helm rather than leaving it parented to
-// a dead shell. Without it the Go default disposition applies and the process dies at
-// once — mid-apply, with whatever the child created since its last state write untracked
-// by terraform and unreachable by a rollback that no longer has a process to run in.
+// stops the in-flight terragrunt, kubectl or helm rather than leaving it parented to a dead
+// shell. A mutation is stopped gracefully: one SIGINT to its process group and up to
+// exec.DefaultInterruptGrace to write state and release its lock (see internal/exec).
+// Without the context the Go default disposition applies and the process dies at once,
+// mid-apply, with whatever the child created since its last state write untracked by
+// terraform and unreachable by a rollback that no longer has a process to run in.
 //
 // Commands reach it through cobra's cmd.Context(); none constructs its own root.
-// A second interrupt must still be able to end the process. While NotifyContext's
-// registration stands, further signals are absorbed rather than delivered, so an operator
-// who interrupts during a rollback — which runs detached from this cancellation, by
-// design — would otherwise have no way out short of another terminal. Unregistering as
-// soon as the context is cancelled restores the default disposition: the first interrupt
-// unwinds, the second kills.
+//
+// A second interrupt must still be able to end the process, including during a rollback,
+// which runs detached from this cancellation by design. Each mutating child runs in its own
+// process group, so the terminal's second Ctrl-C no longer reaches it, and rackctl dying of
+// the default disposition would leave tofu running with nothing to report to. So rackctl
+// forwards it: forceExit kills every child's group, refuses to start another, and exits.
 func Execute() error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go func() {
-		<-ctx.Done()
-		stop()
-	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	go forwardInterrupts(sigs, cancel, forceExit)
 	return rootCmd.ExecuteContext(ctx)
+}
+
+// forwardInterrupts cancels the run on the first signal and calls force on the second.
+func forwardInterrupts(sigs <-chan os.Signal, cancel context.CancelFunc, force func()) {
+	if _, ok := <-sigs; !ok {
+		return
+	}
+	cancel()
+	if _, ok := <-sigs; !ok {
+		return
+	}
+	force()
+}
+
+// exit is os.Exit, a variable so a test can read the status a forced exit chooses.
+var exit = os.Exit
+
+// forceExit is the second interrupt. Every running tool is killed and nothing more starts.
+//
+// What that leaves depends on whether anything mutating ever ran. Once a mutation has
+// started, whatever unwind the first interrupt began has not finished, so what this run
+// built may remain and the status says so. Before then nothing was touched: a second Ctrl-C
+// at the destroy prompt, or over a slow read in `check` or `plan`, is an interrupt like any
+// other and must not send a script to a human over a command that changed nothing.
+func forceExit() {
+	rackexec.ForceStop()
+	code, msg := forcedExit(rackexec.MutationStarted())
+	fmt.Fprintf(os.Stderr, "%s (exit %d): %s\n", exitCodeName(code), code, msg)
+	exit(code)
+}
+
+// forcedExit chooses a forced exit's status and message from whether a mutation started.
+func forcedExit(mutated bool) (int, string) {
+	if !mutated {
+		return ExitAborted, "forced exit on a second interrupt — nothing had been started that changes " +
+			"the cloud, so nothing was touched"
+	}
+	return ExitStranded, "forced exit on a second interrupt — every running tool was killed and the " +
+		"unwind did not finish, so what this run built may remain. Run `rackctl check`, then `rackctl " +
+		"destroy` to remove it"
 }
 
 func init() {

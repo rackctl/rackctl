@@ -55,6 +55,13 @@ const (
 	// slow, it is wrong, and more attempts only delay saying so.
 	DefaultReadAttempts = 3
 
+	// DefaultInterruptGrace is how long a mutating child is given to stop after its one
+	// SIGINT before its process group is killed. tofu's graceful stop finishes the
+	// operations in flight, writes state and releases the lock, and usually does so well
+	// inside this; a child that has not stopped by then is hung, and a hung child must not
+	// hold a three-hour rollback for long.
+	DefaultInterruptGrace = 2 * time.Minute
+
 	// retryBase is the first backoff. It doubles per attempt and carries jitter, so a
 	// phase issuing many reads against one throttled API does not re-issue them in lockstep
 	// and reproduce the throttle it is backing off from.
@@ -127,6 +134,9 @@ type Runner struct {
 	// ReadAttempts overrides DefaultReadAttempts. Zero takes the default; 1 disables
 	// retry, which is what a test asserting a single invocation wants.
 	ReadAttempts int
+	// InterruptGrace overrides DefaultInterruptGrace for Run and Reconcile. Zero takes the
+	// default.
+	InterruptGrace time.Duration
 }
 
 // New returns a Runner writing to out.
@@ -161,6 +171,80 @@ func (r *Runner) runTimeout() time.Duration {
 	return DefaultRunTimeout
 }
 
+func (r *Runner) interruptGrace() time.Duration {
+	if r.InterruptGrace > 0 {
+		return r.InterruptGrace
+	}
+	return DefaultInterruptGrace
+}
+
+// children is every mutating child still running, keyed by its process group, whether one
+// has ever started, and whether ForceStop has been called. Start and registration happen
+// under one lock, so ForceStop either sees a child or the child is never started.
+var children = struct {
+	sync.Mutex
+	groups  map[int]bool
+	mutated bool
+	stopped bool
+}{groups: map[int]bool{}}
+
+// MutationStarted reports whether this process has ever started a mutating child, through
+// Run or Reconcile. Until it has, nothing this process did can have changed the cloud: a
+// dry-run spawns no mutation and a read is never one, so an exit forced before then leaves
+// nothing behind.
+func MutationStarted() bool {
+	children.Lock()
+	defer children.Unlock()
+	return children.mutated
+}
+
+// ErrForceStopped is what a tool call returns once ForceStop has run.
+var ErrForceStopped = errors.New("not started: rackctl was forced to exit")
+
+// runChild starts cmd and waits for it, refusing once ForceStop has run. A grouped child is
+// recorded for ForceStop until it exits.
+func runChild(cmd *exec.Cmd, grouped bool) error {
+	children.Lock()
+	if children.stopped {
+		children.Unlock()
+		return ErrForceStopped
+	}
+	if err := cmd.Start(); err != nil {
+		children.Unlock()
+		return err
+	}
+	pgid := cmd.Process.Pid
+	if grouped {
+		children.groups[pgid] = true
+		children.mutated = true
+	}
+	children.Unlock()
+	err := cmd.Wait()
+	if grouped {
+		children.Lock()
+		delete(children.groups, pgid)
+		children.Unlock()
+	}
+	return err
+}
+
+// ForceStop kills every mutating child still running, process group and all, and refuses
+// to start another. It is the second interrupt.
+//
+// A mutating child runs in its own process group so the first interrupt reaches it exactly
+// once, which also takes it out of reach of the terminal's second one. Without this, a
+// rackctl that exited on a second Ctrl-C would leave tofu running on, parented to nothing
+// and still holding the state lock. Refusing new starts matters as much: a rollback that is
+// abandoned would otherwise begin the next phase's destroy on the way out.
+func ForceStop() {
+	children.Lock()
+	defer children.Unlock()
+	children.stopped = true
+	for pgid := range children.groups {
+		killGroup(pgid)
+	}
+}
+
 func (r *Runner) queryTimeout() time.Duration {
 	if r.QueryTimeout > 0 {
 		return r.QueryTimeout
@@ -168,8 +252,8 @@ func (r *Runner) queryTimeout() time.Duration {
 	return DefaultQueryTimeout
 }
 
-// fail wraps a subprocess error, naming the tool and — when the deadline is what ended it
-// — saying so. A caller that cannot tell a timeout from a non-zero exit reports "exit
+// fail wraps a subprocess error, naming the tool and, when the ceiling is what ended it,
+// saying so. A caller that cannot tell a timeout from a non-zero exit reports "exit
 // status 1" for a tool that never exited at all.
 //
 // parent is the context the caller supplied; child is the deadline-bearing one this
@@ -184,7 +268,7 @@ func fail(parent, child context.Context, name string, timeout time.Duration, std
 	case parent.Err() != nil:
 		return fmt.Errorf("%s: %w%s", name, parent.Err(), detail)
 	case errors.Is(child.Err(), context.DeadlineExceeded):
-		return fmt.Errorf("%s: no output for %s, giving up%s", name, timeout, detail)
+		return fmt.Errorf("%s: still running at its %s ceiling, giving up%s", name, timeout, detail)
 	default:
 		return fmt.Errorf("%s: %w%s", name, err, detail)
 	}
@@ -252,7 +336,8 @@ func (r *Runner) runTee(ctx context.Context, name string, args ...string) error 
 	var errb bytes.Buffer
 	cmd.Stdout = out
 	cmd.Stderr = io.MultiWriter(out, &errb)
-	if err := cmd.Run(); err != nil {
+	defer interruptible(cmd, out, name, r.interruptGrace())()
+	if err := runChild(cmd, true); err != nil {
 		return fail(ctx, child, name, timeout, errb.String(), err)
 	}
 	return nil
@@ -291,9 +376,15 @@ func (r *Runner) Run(ctx context.Context, name string, args ...string) error {
 	cmd.Dir = r.Dir
 	cmd.Env = env
 	// Both streams already reach the operator, so the error carries no duplicate of them.
-	cmd.Stdout = r.Out
-	cmd.Stderr = r.Out
-	if err := cmd.Run(); err != nil {
+	// One serialised writer serves both and the interrupt notice, which is printed from
+	// os/exec's own goroutine.
+	out := &syncWriter{w: r.Out}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	// An interrupt reaches a mutation as one SIGINT and time to release its state, not as
+	// SIGKILL. See interruptible.
+	defer interruptible(cmd, out, name, r.interruptGrace())()
+	if err := runChild(cmd, true); err != nil {
 		return fail(ctx, child, name, timeout, "", err)
 	}
 	return nil
@@ -325,7 +416,7 @@ func (r *Runner) captureOnce(ctx context.Context, name string, args ...string) (
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
+	if err := runChild(cmd, false); err != nil {
 		return "", fail(ctx, child, name, timeout, errb.String(), err)
 	}
 	return strings.TrimSpace(out.String()), nil
@@ -410,7 +501,7 @@ func (r *Runner) queryOnce(ctx context.Context, name string, args ...string) (st
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
+	if err := runChild(cmd, false); err != nil {
 		return "", fail(ctx, child, name, timeout, errb.String(), err)
 	}
 	return strings.TrimSpace(out.String()), nil

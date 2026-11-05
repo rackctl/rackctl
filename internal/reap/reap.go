@@ -30,7 +30,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/rackctl/rackctl/internal/exec"
 	"github.com/rackctl/rackctl/internal/ui"
@@ -79,17 +81,7 @@ var operatorOwnedKinds = []string{
 func All(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region string) Backstop {
 	const name = "in-cluster reap"
 	if run.DryRun {
-		fmt.Fprintln(out, ui.Step("reap controller-owned resources (finalizers)"))
-		fmt.Fprintf(out, "    → (dry-run) kubectl -n argocd scale deployment/argocd-applicationset-controller "+
-			"statefulset/argocd-application-controller --replicas=0\n")
-		fmt.Fprintf(out, "    → (dry-run) kubectl -n argocd patch application <each> "+
-			"--type merge -p '{\"spec\":{\"syncPolicy\":null}}', then re-read to confirm none is still "+
-			"armed  (stop selfHeal recreating what is reaped)\n")
-		for _, k := range operatorOwnedKinds {
-			fmt.Fprintf(out, "    → (dry-run) kubectl delete %s --all -A --wait --timeout=5m\n", k)
-		}
-		fmt.Fprintf(out, "    → (dry-run) kubectl delete pvc --all -A --wait --timeout=5m\n")
-		return Backstop{Name: name, Outcome: Acted, Detail: "(dry-run) described, not run"}
+		return preview(ctx, run, out, cluster, region)
 	}
 
 	// A teardown must still work against a half-provisioned environment, which is exactly the
@@ -100,8 +92,9 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region s
 	}
 
 	var problems []string
-	if p := disarmArgoCD(ctx, run, out); p != "" {
-		problems = append(problems, p)
+	disarm := disarmArgoCD(ctx, run, out)
+	if disarm != "" {
+		problems = append(problems, disarm)
 	}
 
 	for _, kind := range operatorOwnedKinds {
@@ -119,6 +112,20 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region s
 					"roles and anything under: aws iam list-roles --path-prefix /eks-agent-platform/", kind)))
 			problems = append(problems, kind+" did not finalize")
 		}
+	}
+
+	// A PVC carries kubernetes.io/pvc-protection, which holds its deletion while any pod still
+	// mounts it, so Loki, Tempo and the kagent database kept theirs past the five-minute wait
+	// below and the volumes outlived the cluster, untagged, where no sweep can prove them
+	// ours. Stopping what mounts them first is what lets the delete finish. Only after a
+	// verified disarm: an ArgoCD still armed would scale them straight back up.
+	if disarm == "" {
+		if p := scaleVolumeHolders(ctx, run, out); p != "" {
+			problems = append(problems, p)
+		}
+	} else {
+		fmt.Fprintln(out, ui.Warn("not scaling the workloads that mount PVCs to zero — the ArgoCD disarm was not "+
+			"confirmed, so ArgoCD could scale them back. The PVC delete below may wait on them"))
 	}
 
 	// The CSI driver is an EKS addon and outlives ArgoCD, so this still works during a
@@ -139,6 +146,213 @@ func All(ctx context.Context, run *exec.Runner, out io.Writer, cluster, region s
 		return Backstop{Name: name, Outcome: Failed, Detail: strings.Join(problems, "; ")}
 	}
 	return Backstop{Name: name, Outcome: Acted, Detail: "ArgoCD disarmed; controller-owned CRs and PVCs deleted"}
+}
+
+// readFunc is one read: Capture on a real run, Query where a dry-run has to read for real.
+type readFunc func(ctx context.Context, name string, args ...string) (string, error)
+
+// preview is the in-cluster reap of a dry-run. It reads the cluster for real, through the
+// temporary kubeconfig PointAt wrote, and deletes nothing: how many armed Applications the
+// disarm would stop, how many Platforms, Tenants, NodeClaims and PVCs it would delete, the
+// workloads it would scale to zero first, and the eks-fleet spokes that would make a destroy
+// refuse. A preview that printed its own commands could only restate them.
+func preview(ctx context.Context, run execer, out io.Writer, cluster, region string) Backstop {
+	const name = "in-cluster reap"
+	fmt.Fprintln(out, ui.Step("reap controller-owned resources (finalizers) — dry-run: reading "+cluster+
+		" for real through a temporary kubeconfig, deleting nothing"))
+	if _, err := run.Query(ctx, "kubectl", "get", "--raw", "/readyz", "--request-timeout=30s"); err != nil {
+		return unreachable(ctx, run, out, cluster, region, err)
+	}
+	if armed, err := armedApplications(ctx, run.Query); err != nil {
+		fmt.Fprintln(out, ui.Warn("(dry-run) which ArgoCD Applications are armed could not be read ("+err.Error()+
+			") — the disarm would scale ArgoCD's controllers to zero and clear syncPolicy on each"))
+	} else {
+		fmt.Fprintf(out, "    → (dry-run) would disarm ArgoCD: %d Application(s) carry syncPolicy.automated\n", len(armed))
+	}
+
+	var would, unread []string
+	for _, kind := range append(append([]string(nil), operatorOwnedKinds...), "persistentvolumeclaims") {
+		got, err := run.Query(ctx, "kubectl", "get", kind, "--all-namespaces", "-o", "name", "--request-timeout=30s")
+		switch {
+		case err != nil && noSuchResource(err):
+			continue
+		case err != nil:
+			unread = append(unread, kind+" ("+err.Error()+")")
+			continue
+		}
+		n := len(strings.Fields(got))
+		fmt.Fprintf(out, "    → (dry-run) would delete %d %s\n", n, kind)
+		would = append(would, fmt.Sprintf("%d %s", n, kind))
+	}
+	// The disarm and the scale-down only decide whether the deletes can finish, so a preview
+	// of either that cannot be read is said and does not decide the outcome; the kinds above,
+	// which are what the reap deletes, do.
+	if holders, err := volumeHolders(ctx, run.Query); err != nil {
+		fmt.Fprintln(out, ui.Warn("(dry-run) the workloads that mount PVCs could not be read ("+err.Error()+
+			") — the reap would scale each to zero before the PVC delete"))
+	} else {
+		fmt.Fprintf(out, "    → (dry-run) would scale %d workload(s) that mount PVCs to zero first%s\n",
+			len(holders), listed(holders))
+	}
+	if spokes, err := fleetSpokes(ctx, run); err != nil {
+		fmt.Fprintln(out, ui.Warn("(dry-run) the eks-fleet spokes could not be listed ("+err.Error()+")"))
+	} else {
+		fmt.Fprintf(out, "    → (dry-run) %d eks-fleet spoke cluster(s)%s\n", len(spokes), listed(spokes))
+	}
+	if len(unread) > 0 {
+		detail := "(dry-run) could not read " + strings.Join(unread, "; ")
+		fmt.Fprintln(out, ui.Warn(detail))
+		return Backstop{Name: name, Outcome: NotRun, Detail: detail}
+	}
+	return Backstop{Name: name, Outcome: Acted, Detail: "(dry-run) would delete " + strings.Join(would, ", ")}
+}
+
+// listed renders names after a count, or nothing when there are none.
+func listed(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(names, ", ")
+}
+
+// workload is the part of a StatefulSet or Deployment the scale-down reads.
+type workload struct {
+	Kind     string `json:"kind"`
+	Metadata struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+	} `json:"metadata"`
+	Spec struct {
+		VolumeClaimTemplates []json.RawMessage `json:"volumeClaimTemplates"`
+		Template             struct {
+			Spec struct {
+				Volumes []struct {
+					PVC json.RawMessage `json:"persistentVolumeClaim"`
+				} `json:"volumes"`
+			} `json:"spec"`
+		} `json:"template"`
+	} `json:"spec"`
+	Status struct {
+		Replicas int `json:"replicas"`
+	} `json:"status"`
+}
+
+// ref is how kubectl addresses the workload.
+func (w workload) ref() string {
+	return strings.ToLower(w.Kind) + "/" + w.Metadata.Name
+}
+
+// volumeHolders lists the StatefulSets and Deployments outside kube-system whose pods mount
+// a PersistentVolumeClaim, as namespace/kind/name, with their live replica counts.
+//
+// Mounting a claim is the selection, rather than "every addon": those are exactly the pods
+// pvc-protection waits on, and everything else keeps running. kube-system is left alone
+// whatever it mounts, because it holds the EBS CSI driver, which has to stay up to release
+// the volumes the delete frees.
+func volumeHolders(ctx context.Context, read readFunc) ([]string, error) {
+	ws, err := listVolumeHolders(ctx, read)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(ws))
+	for _, w := range ws {
+		names = append(names, w.Metadata.Namespace+"/"+w.ref())
+	}
+	return names, nil
+}
+
+func listVolumeHolders(ctx context.Context, read readFunc) ([]workload, error) {
+	raw, err := read(ctx, "kubectl", "get", "statefulsets,deployments", "--all-namespaces",
+		"-o", "json", "--request-timeout=30s")
+	if err != nil {
+		return nil, err
+	}
+	var list struct {
+		Items *[]workload `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		return nil, fmt.Errorf("no readable workload list: %w", err)
+	}
+	if list.Items == nil {
+		return nil, fmt.Errorf("the workload list carries no items, so no workload was examined")
+	}
+	var out []workload
+	for _, w := range *list.Items {
+		if w.Metadata.Namespace == "kube-system" {
+			continue
+		}
+		mounts := len(w.Spec.VolumeClaimTemplates) > 0
+		for _, v := range w.Spec.Template.Spec.Volumes {
+			mounts = mounts || len(v.PVC) > 0
+		}
+		if mounts {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
+
+// settle is how long scaleVolumeHolders waits for the scaled workloads to reach zero: tries
+// reads, every apart.
+var settle = struct {
+	tries int
+	every time.Duration
+}{tries: 24, every: 5 * time.Second}
+
+// scaleVolumeHolders scales every workload that mounts a PVC to zero, then re-reads their
+// replica counts until each is zero, so the PVC delete that follows is not held by
+// pvc-protection. It returns what it could not establish, or "" when every one reached zero.
+// A delete the reap is about to issue is the same either way; this only decides whether it
+// can finish.
+func scaleVolumeHolders(ctx context.Context, run execer, out io.Writer) string {
+	ws, err := listVolumeHolders(ctx, run.Capture)
+	if err != nil {
+		fmt.Fprintln(out, ui.Warn("could not list the workloads that mount PVCs ("+err.Error()+") — the PVC "+
+			"delete below may wait on the pods still mounting them"))
+		return "the workloads that mount PVCs could not be listed"
+	}
+	if len(ws) == 0 {
+		return ""
+	}
+	fmt.Fprintln(out, ui.Step(fmt.Sprintf("scale %d workload(s) that mount PVCs to zero, so pvc-protection "+
+		"releases their claims", len(ws))))
+	var unscaled []string
+	for _, w := range ws {
+		if err := run.Run(ctx, "kubectl", "-n", w.Metadata.Namespace, "scale", w.ref(), "--replicas=0",
+			"--request-timeout=60s"); err != nil {
+			fmt.Fprintln(out, ui.Warn("could not scale "+w.Metadata.Namespace+"/"+w.ref()+" to zero: "+err.Error()))
+			unscaled = append(unscaled, w.Metadata.Namespace+"/"+w.ref())
+		}
+	}
+	if len(unscaled) > 0 {
+		return "could not scale " + strings.Join(unscaled, ", ") + " to zero"
+	}
+	var running []string
+	for try := 0; try < settle.tries; try++ {
+		running = running[:0]
+		now, err := listVolumeHolders(ctx, run.Capture)
+		if err != nil {
+			running = append(running, "unknown ("+err.Error()+")")
+		} else {
+			for _, w := range now {
+				if w.Status.Replicas > 0 {
+					running = append(running, w.Metadata.Namespace+"/"+w.ref())
+				}
+			}
+		}
+		if len(running) == 0 {
+			fmt.Fprintln(out, ui.OK("every workload that mounts a PVC is at zero replicas"))
+			return ""
+		}
+		select {
+		case <-ctx.Done():
+			return "the scale-down was interrupted"
+		case <-time.After(settle.every):
+		}
+	}
+	fmt.Fprintln(out, ui.Warn("still running after the scale-down: "+strings.Join(running, ", ")+
+		" — the PVC delete below may wait on them"))
+	return "still running after the scale-down: " + strings.Join(running, ", ")
 }
 
 // execer is the slice of *exec.Runner that reap's deterministic backstops use. Naming it
@@ -434,13 +648,13 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 	// Platform is namespaced, Tenant is cluster-scoped — the jsonpath emits the namespace
 	// (empty for Tenant) so the patch can add -n only when there is one.
 	kinds := []string{"platforms.platform.nanohype.dev", "tenants.platform.nanohype.dev"}
+	// A dry-run reads for real, through the temporary kubeconfig PointAt wrote, and names what
+	// it would unstick instead of patching it.
+	read := run.Capture
 	if dryRun {
-		for _, k := range kinds {
-			fmt.Fprintln(out, ui.Step("(dry-run) unstick any "+k+" pinned in Terminating (finalizer force-removed)"))
-		}
-		return Backstop{Name: bname, Outcome: Acted, Detail: "(dry-run) described, not run"}
+		read = run.Query
 	}
-	if _, err := run.Capture(ctx, "kubectl", "get", "--raw", "/readyz"); err != nil {
+	if _, err := read(ctx, "kubectl", "get", "--raw", "/readyz"); err != nil {
 		// Not reachable is not the same as nothing pinned, and the in-cluster reap probes the
 		// same API first. Its line carries the verdict: did not run for a cluster that exists,
 		// found nothing for one that is gone. Deciding it a second time here would hold a
@@ -454,12 +668,12 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 	var unlisted, unpatched []string
 
 	for _, kind := range kinds {
-		if _, err := run.Capture(ctx, "kubectl", "get", "crd", kind); err != nil {
+		if _, err := read(ctx, "kubectl", "get", "crd", kind); err != nil {
 			continue // CRD never installed — this platform did not deploy the operator
 		}
 		// Emit "<namespace> <name>" for every instance carrying a deletionTimestamp, i.e.
 		// every one stuck Terminating. A cluster-scoped Tenant emits a leading space.
-		listed, err := run.Capture(ctx, "kubectl", "get", kind, "--all-namespaces",
+		listed, err := read(ctx, "kubectl", "get", kind, "--all-namespaces",
 			"-o", `jsonpath={range .items[?(@.metadata.deletionTimestamp)]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}`)
 		if err != nil {
 			unlisted = append(unlisted, kind+" ("+err.Error()+")")
@@ -471,6 +685,12 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 				ns, name = "", strings.TrimSpace(line)
 			}
 			if name == "" {
+				continue
+			}
+			if dryRun {
+				fmt.Fprintln(out, ui.Step("(dry-run) would unstick "+kind+" "+strings.TrimPrefix(ns+"/"+name, "/")+
+					" (finalizer force-removed)"))
+				unstuck++
 				continue
 			}
 			fmt.Fprintln(out, ui.Step("unsticking "+kind+" "+strings.TrimPrefix(ns+"/"+name, "/")+
@@ -494,6 +714,8 @@ func unstickTerminating(ctx context.Context, run execer, dryRun bool, out io.Wri
 		return Backstop{Name: bname, Outcome: Failed, Detail: "could not unstick " + strings.Join(unpatched, ", ")}
 	case len(unlisted) > 0:
 		return Backstop{Name: bname, Outcome: NotRun, Detail: "could not list " + strings.Join(unlisted, ", ")}
+	case unstuck > 0 && dryRun:
+		return Backstop{Name: bname, Outcome: Acted, Detail: fmt.Sprintf("(dry-run) would unstick %d", unstuck)}
 	case unstuck > 0:
 		return Backstop{Name: bname, Outcome: Acted, Detail: fmt.Sprintf("unstuck %d", unstuck)}
 	}
@@ -785,8 +1007,40 @@ func reportUnprovableVolumes(ctx context.Context, run execer, out io.Writer, clu
 // case. An operator whose context was stale would otherwise have the sweeps skip a cluster
 // that WAS reachable under its own name, leaving controller-owned resources for the component
 // teardown to trip over on a DeleteConflict or an in-use security group.
-func PointAt(ctx context.Context, run *exec.Runner, cluster string) error {
-	return pointAt(ctx, run, cluster)
+//
+// A dry-run repoints nothing the operator owns. It writes a TEMPORARY kubeconfig aimed at the
+// cluster by name, through Query so the read happens for real, and points this Runner's own
+// subprocesses at it with KUBECONFIG; release removes the file and the variable. That is what
+// lets a dry-run preview the in-cluster sweeps against the right cluster: without it, kubectl
+// would read the operator's ambient context, which a dry-run never repoints. The file is the
+// only thing written, and it is never the operator's.
+func PointAt(ctx context.Context, run *exec.Runner, cluster, region string) (release func(), err error) {
+	if !run.DryRun {
+		return func() {}, pointAt(ctx, run, cluster)
+	}
+	if cluster == "" {
+		return nil, fmt.Errorf("no cluster name to point kubectl at")
+	}
+	f, err := os.CreateTemp("", "rackctl-kubeconfig-*")
+	if err != nil {
+		return nil, fmt.Errorf("writing a temporary kubeconfig for the dry-run: %w", err)
+	}
+	path := f.Name()
+	_ = f.Close()
+	args := []string{"eks", "update-kubeconfig", "--name", cluster, "--kubeconfig", path}
+	if region != "" {
+		args = append(args, "--region", region)
+	}
+	if _, err := run.Query(ctx, "aws", args...); err != nil {
+		_ = os.Remove(path)
+		return nil, err
+	}
+	prev := run.Env
+	run.Env = append(append([]string(nil), prev...), "KUBECONFIG="+path)
+	return func() {
+		run.Env = prev
+		_ = os.Remove(path)
+	}, nil
 }
 
 func pointAt(ctx context.Context, run execer, cluster string) error {
@@ -810,19 +1064,31 @@ func pointAt(ctx context.Context, run execer, cluster string) error {
 // command will ever enumerate them again. They bill forever, in accounts this config does
 // not even name.
 //
-// An empty result is reported for an unreachable cluster or an absent CRD, because both
-// mean the same thing here: there is no hub to read spokes from.
-func FleetSpokes(ctx context.Context, run *exec.Runner) []string {
+// Only an answer that the Cluster resource type does not exist means "no hub". Any other
+// failure — an RBAC denial, a timeout, an API that does not answer — is returned as an error,
+// because it leaves the spoke set unknown, and a caller that read it as empty would destroy a
+// hub with live spokes. It is a read, through Query, so a dry-run sees the refusal the real
+// run would hit.
+func FleetSpokes(ctx context.Context, run *exec.Runner) ([]string, error) {
 	return fleetSpokes(ctx, run)
 }
 
-func fleetSpokes(ctx context.Context, run execer) []string {
-	out, err := run.Capture(ctx, "kubectl", "get", "clusters.fleet.nanohype.dev",
-		"-A", "-o", `jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{end}`)
+func fleetSpokes(ctx context.Context, run execer) ([]string, error) {
+	out, err := run.Query(ctx, "kubectl", "get", "clusters.fleet.nanohype.dev",
+		"-A", "-o", `jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{end}`,
+		"--request-timeout=30s")
 	if err != nil {
-		return nil // no CRD installed, or no reachable cluster — either way, no spokes to strand
+		if noSuchResource(err) {
+			return nil, nil // no CRD installed: this cluster is not a hub
+		}
+		return nil, fmt.Errorf("listing eks-fleet spoke clusters: %w", err)
 	}
-	return strings.Fields(out)
+	return strings.Fields(out), nil
+}
+
+// noSuchResource reports kubectl's answer that a resource type is not installed.
+func noSuchResource(err error) bool {
+	return strings.Contains(err.Error(), "the server doesn't have a resource type")
 }
 
 // disarmArgoCD clears syncPolicy on every Application, so ArgoCD stops re-applying what
@@ -863,8 +1129,8 @@ func fleetSpokes(ctx context.Context, run execer) []string {
 // evidence for a green disarm verdict without an Application having been examined. A JSON
 // document has to arrive and parse before a count means anything, which is what makes the
 // empty result trustworthy when it does occur.
-func armedApplications(ctx context.Context, run *exec.Runner) ([]string, error) {
-	out, err := run.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications",
+func armedApplications(ctx context.Context, read readFunc) ([]string, error) {
+	out, err := read(ctx, "kubectl", "-n", "argocd", "get", "applications",
 		"-o", "json", "--request-timeout=30s")
 	if err != nil {
 		return nil, err
@@ -959,7 +1225,7 @@ func disarmArgoCD(ctx context.Context, run *exec.Runner, out io.Writer) string {
 	// And assert the result, because the patches returning 0 is not the claim being made.
 	// An unreadable answer is not the same as a disarmed one: the tick below states a
 	// safety property, and it is withheld unless the Applications were actually read.
-	armed, err := armedApplications(ctx, run)
+	armed, err := armedApplications(ctx, run.Capture)
 	if err != nil {
 		fmt.Fprintln(out, ui.Warn(
 			"could not confirm the ArgoCD disarm ("+err.Error()+") — the patches were sent, but "+

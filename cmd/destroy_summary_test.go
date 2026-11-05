@@ -83,14 +83,15 @@ func TestDestroy_PlatformDestroyedOnlyWhenTheBackstopsHeld(t *testing.T) {
 }
 
 func TestDestroy_ABackstopThatDidNotRunWithholdsPlatformDestroyed(t *testing.T) {
-	// Every aws read is denied: the IAM and EC2 backstops cannot enumerate.
+	// Every aws read is denied: the dry-run cannot write its temporary kubeconfig, so the
+	// in-cluster preview does not run, and the IAM and EC2 backstops cannot enumerate.
 	out, err := runDestroyDryRun(t, "echo 'An error occurred (AccessDenied)' >&2\nexit 254\n")
 	if code := exitStatus(err); code != ExitStranded {
 		t.Fatalf("a guard that did not run leaves resources that may be billing: want exit %d, got %d (%v)\n%s",
 			ExitStranded, code, err, out)
 	}
 	if !strings.Contains(out, "resources-may-remain (exit 7)") ||
-		!strings.Contains(out, "these backstops did not hold: operator IAM roles, Karpenter nodes, orphaned EBS volumes") {
+		!strings.Contains(out, "these backstops did not hold: in-cluster reap, operator IAM roles, Karpenter nodes, orphaned EBS volumes") {
 		t.Errorf("the error must name the status and every guard that did not hold:\n%s", out)
 	}
 	if strings.Contains(out, "platform destroyed") {

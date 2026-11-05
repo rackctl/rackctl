@@ -171,6 +171,10 @@ func TestClassifyRun_AnInterruptIsAbortedUnlessTheUnwindDidNotFinish(t *testing.
 	if got := ExitCode(classifyRun(context.Background(), fmt.Errorf("run: %w", tui.ErrAborted))); got != ExitAborted {
 		t.Errorf("a TUI abort: exit %d, want %d", got, ExitAborted)
 	}
+	// The second q abandoned the unwind, so what the run built may remain.
+	if got := ExitCode(classifyRun(context.Background(), fmt.Errorf("run: %w", tui.ErrForced))); got != ExitStranded {
+		t.Errorf("a forced TUI exit: exit %d, want %d", got, ExitStranded)
+	}
 	if got := ExitCode(classifyRun(context.Background(), errors.New("tui: no terminal"))); got != ExitFailure {
 		t.Errorf("an error with no recorded outcome is not evidence of a rollback: exit %d, want %d", got, ExitFailure)
 	}
@@ -368,5 +372,15 @@ func TestCheckJSON_ShapeIsStable(t *testing.T) {
 	first, _ := pre[0].(map[string]any)
 	if first["status"] != "fail" {
 		t.Errorf("status must be the lowercase machine token, got %v", first["status"])
+	}
+}
+
+// A forced exit is resources-may-remain only once something mutating has started.
+func TestForcedExit_IsResourcesMayRemainOnlyAfterAMutation(t *testing.T) {
+	if code, msg := forcedExit(false); code != ExitAborted || !strings.Contains(msg, "nothing was touched") {
+		t.Errorf("before any mutation: got %d %q, want %d", code, msg, ExitAborted)
+	}
+	if code, msg := forcedExit(true); code != ExitStranded || !strings.Contains(msg, "may remain") {
+		t.Errorf("after a mutation: got %d %q, want %d", code, msg, ExitStranded)
 	}
 }

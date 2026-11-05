@@ -31,9 +31,11 @@ On a failed phase, `rackctl apply` tears down the phases it completed, in revers
 |---|---|---:|---|
 | `failure detected — rolling back provisioned resources` | The rollback ran. Cloud created by this run is being destroyed. | `6`, or `7` | Wait for it to finish. If it reports `the rollback did not complete`, see *A teardown that stopped partway*. |
 | `failure detected — plan only: would roll back provisioned resources` | A `rackctl plan` failed. Nothing was created and nothing is destroyed; this is the walk an apply would take. | `1` | Fix the failure and plan again. |
+| `existing platform detected — plan only: apply would NOT roll back a failure over it`, or `could not determine whether a platform already exists — plan only: apply would NOT roll back` | A `rackctl plan` asked EKS for real and found an apply would not roll back. Nothing was created. | `1` | Expected on a re-apply. On a first install, fix credentials or connectivity before applying. |
 | `existing platform detected — a failure will NOT roll it back` | The platform was already up before this run. Nothing was destroyed. | `5` | Fix the failure and re-run `rackctl apply`. It is re-runnable. |
 | `could not determine whether a platform already exists — rollback is DISABLED` | The EKS list call failed, so rackctl could not tell a fresh install from a re-apply, and fails closed. Nothing was destroyed, and a half-built first install may be standing. | `7` | Fix credentials or connectivity, then `rackctl check`; re-run, or `rackctl destroy` what was built. |
 | `--no-clean-on-failure: leaving what this run built in place` | The rollback was turned off. What the run built before the failure is still there. | `7` | `rackctl destroy` to remove it, or fix and re-run. |
+| `ArgoCD applications did not all reach Healthy`, `never established`, `agent operator never became Available` or `republishing cluster-bootstrap for eval-runtime`, each with `The cloud IS provisioned` | Phase 5 or phase 6 failed to converge. The cloud is built and left standing. | `5` | `rackctl check` to see what has not settled; re-run `rackctl apply`, or `rackctl destroy` if you want it gone. |
 | `this is an optional phase and the platform underneath it is provisioned` | Phase 7, 8 or 9 failed. The core platform is up and the run continued. | `5` | `rackctl check` to see what is wrong. The platform is usable. |
 | `the core platform is up; optional phases failed` | Same, reported at the end. The exit status is still non-zero. | `5` | As above. |
 
@@ -104,10 +106,21 @@ rackctl check -c rackctl.yaml     # names what is wrong, per check
 
 ### An interrupt
 
-The first Ctrl-C cancels the run's context, which terminates the in-flight terragrunt,
-kubectl or helm rather than orphaning it, and lets the rollback run. **The second Ctrl-C
-kills the process outright** — including a rollback in progress, which will leave resources
-behind. Use it only if the unwind itself has hung.
+The first Ctrl-C cancels the run's context. A running terragrunt or tofu gets one SIGINT,
+its graceful stop, and up to two minutes to write its state and release the state lock
+before it is killed; rackctl prints `waiting up to 2m0s for <tool> to release state` while
+it does. Then the rollback runs. **The second Ctrl-C forces exit**: rackctl kills every tool
+it started, process group and all, starts nothing more, and exits `7`, because the unwind
+did not finish and what the run built may remain. Use it only if the unwind itself has hung.
+A second Ctrl-C before any tool that can change the cloud started, at the `destroy` prompt or
+during `check` or `plan`, exits `8` instead and says nothing was touched.
+
+Under `--tui`, `q` does the same, and the footer says so before you press it. The first `q`
+stops the run and keeps the view up while the rollback runs to its end, each phase it undoes
+marked torn down; the second `q` forces exit, exactly as a second Ctrl-C does. A signal
+from outside, a `SIGTERM` from a CI runner or `kill -INT`, is handled as on the plain path
+and never closes the view early; should the view close before the run ends for any other
+reason, rackctl says so and waits for the run, its rollback included, before it exits.
 
 An interrupted run exits `8` when its unwind finished, and `7` when it did not; the message
 starts with `interrupted:` either way. An interrupted `rackctl destroy` exits `8` only when
@@ -128,10 +141,20 @@ The usual causes, in order of likelihood:
   Look under `aws iam list-roles --path-prefix /eks-agent-platform/`.
 - **`BucketNotEmpty`** — outside development several buckets refuse a destroy while
   non-empty. Re-run with `--force-buckets`, which applies `force_destroy` into state first
-  and then destroys. `force_destroy` has no effect until an apply has landed it.
+  and then destroys. `force_destroy` has no effect until an apply has landed it. A rollback
+  outside development permits it itself, on the components this same run created and no
+  others, and prints `rollback: applying force_destroy_buckets=true on …` before it acts.
+  Created means the component's state was empty before this run first applied it; one it
+  did not apply, or applied over state already there, is named, and the incomplete
+  rollback's error names `rackctl destroy --force-buckets`.
 - **`could not point kubectl at <cluster>`** — the in-cluster sweeps were skipped. The
-  component teardown still ran and terraform state is scoped by state key, so nothing
-  belonging to another cluster was touched. Fix the kubeconfig and re-run the destroy.
+  component teardown still ran and terraform state is scoped by state key, so no other
+  cluster's Terraform-managed resources were touched. Fix the kubeconfig and re-run the
+  destroy.
+- **`PVCs did not delete cleanly`** — a pod still mounted the claim. After a verified ArgoCD
+  disarm the reap scales every StatefulSet and Deployment outside kube-system that mounts a
+  PVC to zero and waits for it before deleting the claims; the line before it names what
+  was still running, or why the scale-down was skipped.
 - **`in-cluster reap did NOT run — <cluster> exists … but its API does not answer`** — the
   cluster is there and this host cannot reach it: a private endpoint, or an allow-list that
   does not hold this host's egress IP. The line prints both. Re-run from a host the endpoint
@@ -158,12 +181,23 @@ Deleting it would be a guess. Delete them deliberately:
 aws ec2 delete-volume --volume-id <id>
 ```
 
+The subdomain delegation is the same. A destroy withdraws the NS record it wrote into the
+parent zone only when that record points at the name servers of this account's zone by the
+same name. On a re-run where the child zone is already gone, or when the record points
+elsewhere, it is left in place, and the line names the servers it points at and the exact
+`aws route53 change-resource-record-sets` command that removes it.
+
 ### An eks-fleet hub with live spokes
 
 `rackctl destroy` refuses outright, lists them and exits `9` (`refused`): nothing was
 destroyed, though kubectl's context now points at the hub. Each spoke is a real EKS cluster
 with its own control plane, VPC and NAT gateways, frequently in another account, and this
 hub is the only thing that knows they exist. Tear the spokes down first.
+
+With `controlPlane.eksFleet` on, it also refuses, with `9`, when the spokes cannot be
+listed: an RBAC denial, a timeout, or a hub this host cannot reach. There is no override.
+Make the hub's API reachable from this host and re-run. A `--dry-run` reads the hub for
+real and shows the same refusal.
 
 ## Where the output went
 
@@ -176,8 +210,10 @@ problem surfaces later.
 transcript: ~/.rackctl/<org>/logs/apply-1234567890.log
 ```
 
-The most recent line is also rendered under the running phase, so a long wait shows what it
-is waiting on. Without `--tui`, output goes to stdout as it happens and no transcript is
+The transcript also carries every line the run prints without `--tui`: the rollback
+posture, a platform left standing, the rollback and each teardown. Those lines are printed
+again after the view exits. The most recent line is rendered under the running phase, so a
+long wait shows what it is waiting on. Without `--tui`, output goes to stdout as it happens and no transcript is
 written.
 
 ## Diagnosing after the fact

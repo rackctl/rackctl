@@ -284,9 +284,11 @@ type Cluster struct {
 	// endpoint. It rides TF_VAR_cluster_endpoint_public_access_cidrs into landing-zone's
 	// cluster component, whose committed tree is private-by-default and fail-closed: a
 	// public endpoint with no allow-list is rejected at plan time — there is no 0.0.0.0/0
-	// fallback. When EndpointPublicAccess is true and this is empty, the cluster phase
-	// auto-detects the operator's public egress IP and scopes the endpoint to <ip>/32.
-	// An explicit allow-list always wins over autodetection.
+	// fallback. When EndpointPublicAccess is true and this is empty, a first apply
+	// auto-detects the operator's public egress IP and scopes the endpoint to <ip>/32, and
+	// every later apply keeps the cluster's live allow-list rather than re-detecting from
+	// whichever host runs it. A destroy never detects. An explicit allow-list always wins,
+	// and is the only way to change the list.
 	EndpointAllowlist []string   `json:"endpointAllowlist,omitempty"`
 	SystemNodes       NodeGroup  `json:"systemNodes"`
 	Network           ClusterNet `json:"network"`

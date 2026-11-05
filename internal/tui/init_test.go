@@ -1,9 +1,15 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"os"
+	"os/signal"
+	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -129,61 +135,265 @@ func TestQuitAfterFinishIsNotAnAbort(t *testing.T) {
 	}
 }
 
-// abort must cancel the engine's context and then WAIT for Run to return, so
-// rackctl does not exit while terragrunt is still mid-apply.
-func TestAbortCancelsAndWaitsForEngine(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	events := make(chan engine.Event, 4)
-	done := make(chan error, 1)
-
-	cancelled := make(chan struct{})
-	go func() { // stand-in for engine.Run: unwinds only once cancelled
-		<-ctx.Done()
-		close(cancelled)
-		done <- nil
-	}()
-
-	start := time.Now()
-	err := abort(cancel, events, done)
-
-	if !errors.Is(err, ErrAborted) {
-		t.Errorf("err = %v, want ErrAborted", err)
+// The first q stops the run and keeps the view up while it unwinds; only the second exits.
+// Exiting on the first ended the process partway through the rollback it had started, with
+// the EKS cluster and the VPC, last in that walk, never reached.
+func TestTheFirstQuitStopsTheRunAndOnlyTheSecondExits(t *testing.T) {
+	stopped := false
+	m := model{rows: []phaseRow{{title: "one"}}, stop: func() { stopped = true }}
+	next, cmd := m.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
+	m = next.(model)
+	if !stopped || !m.aborted {
+		t.Fatal("the first q must cancel the engine's context")
 	}
-	select {
-	case <-cancelled:
-	default:
-		t.Error("abort returned without the engine observing cancellation")
+	if cmd != nil {
+		if _, quit := cmd().(tea.QuitMsg); quit {
+			t.Fatal("the first q exited the view — the rollback it starts would be cut off")
+		}
 	}
-	if time.Since(start) >= abortGrace {
-		t.Error("abort fell through to the grace timeout instead of waiting on done")
+	if m.forced {
+		t.Fatal("the first q is not a forced exit")
+	}
+	next, cmd = m.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
+	m = next.(model)
+	if !m.forced || cmd == nil {
+		t.Fatal("the second q must force exit")
+	}
+	if _, quit := cmd().(tea.QuitMsg); !quit {
+		t.Fatal("the second q must quit the view")
 	}
 }
 
-// The engine's Hook publishes to a buffered channel. Once the view is gone nothing
-// drains it, so an unwind that emits more than the buffer would block in the Hook
-// and `done` would never fire. abort must keep draining or it deadlocks.
-func TestAbortDrainsEventsSoEngineCannotBlock(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	events := make(chan engine.Event, 2) // deliberately smaller than what we emit
-	done := make(chan error, 1)
+// slowTeardown is a completed phase whose teardown takes a while, and records that it
+// finished.
+type slowTeardown struct{ done *bool }
 
+func (slowTeardown) ID() string                               { return "cluster" }
+func (slowTeardown) Title() string                            { return "cluster" }
+func (slowTeardown) Optional() bool                           { return false }
+func (slowTeardown) Enabled(*engine.State) bool               { return true }
+func (slowTeardown) Run(context.Context, *engine.State) error { return nil }
+func (p slowTeardown) Teardown(context.Context, *engine.State) error {
+	time.Sleep(200 * time.Millisecond)
+	*p.done = true
+	return nil
+}
+
+// stopsOnCancel is an in-flight phase that fails once the run is cancelled.
+type stopsOnCancel struct{}
+
+func (stopsOnCancel) ID() string                 { return "gitops" }
+func (stopsOnCancel) Title() string              { return "gitops" }
+func (stopsOnCancel) Optional() bool             { return false }
+func (stopsOnCancel) Enabled(*engine.State) bool { return true }
+func (stopsOnCancel) Run(ctx context.Context, _ *engine.State) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (stopsOnCancel) Teardown(context.Context, *engine.State) error { return nil }
+
+// A q mid-run lets the rollback it triggers run to its end, and reports what the engine
+// recorded, which is what decides the exit status, rather than a blanket abort.
+func TestRunInit_AQuitLetsTheRollbackFinishAndReportsItsOutcome(t *testing.T) {
+	orig := engine.PlatformExists
+	t.Cleanup(func() { engine.PlatformExists = orig })
+	engine.PlatformExists = func(context.Context, *engine.State) engine.PlatformState { return engine.PlatformAbsent }
+	var notices bytes.Buffer
+	stderr = &notices
+	t.Cleanup(func() { stderr = os.Stderr })
+
+	tornDown := false
+	st := &engine.State{Runner: exec.New(io.Discard)}
+	err := RunInit(context.Background(), "test", st,
+		[]engine.Phase{slowTeardown{done: &tornDown}, stopsOnCancel{}}, true,
+		tea.WithInput(strings.NewReader("q")), tea.WithoutRenderer())
+
+	if !tornDown {
+		t.Fatal("RunInit returned before the rollback finished")
+	}
+	var run *engine.RunError
+	if !errors.As(err, &run) {
+		t.Fatalf("the engine's outcome was dropped: %v", err)
+	}
+	if run.Outcome != engine.RolledBack || !run.Interrupted {
+		t.Errorf("want a completed rollback of an interrupted run, got outcome=%v interrupted=%v", run.Outcome, run.Interrupted)
+	}
+	if !strings.Contains(notices.String(), "failure detected — rolling back provisioned resources") {
+		t.Errorf("the rollback notice must be printed once the view exits:\n%s", notices.String())
+	}
+}
+
+// The second q kills every tool and waits, bounded, for the engine to return. The engine's
+// Hook publishes to a buffered channel that nothing drains once the view is gone, so the
+// wait must keep draining it or an unwind that emits more than the buffer wedges.
+func TestForceExit_StopsTheToolsAndDrainsTheEngine(t *testing.T) {
+	stopped := false
+	forceStop = func() { stopped = true }
+	t.Cleanup(func() { forceStop = exec.ForceStop })
+	events := make(chan engine.Event, 2) // deliberately smaller than what we emit
+	done := newOutcome()
 	go func() {
-		<-ctx.Done()
 		for i := 0; i < 50; i++ { // would wedge on a full, undrained channel
 			events <- engine.Event{Index: i}
 		}
-		done <- nil
+		done.set(nil)
 	}()
 
 	finished := make(chan error, 1)
-	go func() { finished <- abort(cancel, events, done) }()
-
+	go func() { finished <- forceExit(events, done) }()
 	select {
 	case err := <-finished:
-		if !errors.Is(err, ErrAborted) {
-			t.Errorf("err = %v, want ErrAborted", err)
+		if !errors.Is(err, ErrForced) || !errors.Is(err, ErrAborted) {
+			t.Errorf("err = %v, want ErrForced", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("abort deadlocked — the engine's Hook blocked on an undrained events channel")
+		t.Fatal("forceExit deadlocked — the engine's Hook blocked on an undrained events channel")
+	}
+	if !stopped {
+		t.Error("a forced exit must kill the tools the engine started")
+	}
+}
+
+// The view says what the run is doing to the cloud: the posture under the title, a
+// disabled phase as disabled, a torn-down phase as torn down, and a footer that says what q
+// does before anyone presses it.
+func TestView_ShowsThePostureTheTeardownAndWhatQuitDoes(t *testing.T) {
+	m := model{rows: []phaseRow{{title: "fleet"}, {title: "cluster"}}, events: make(chan engine.Event, 1),
+		success: engine.SuccessLine(nil)}
+	view := func() string { return m.View().Content }
+	if !strings.Contains(view(), "q stops the run and rolls back what it built") {
+		t.Errorf("the footer must say q rolls back:\n%s", view())
+	}
+	next, _ := m.Update(eventMsg(engine.Event{Notice: "existing platform detected — a failure will NOT roll it back", Posture: true}))
+	m = next.(model)
+	next, _ = m.Update(eventMsg(engine.Event{Index: 1, Status: engine.StatusSkip}))
+	m = next.(model)
+	next, _ = m.Update(eventMsg(engine.Event{Index: 2, Status: engine.StatusTornDown}))
+	m = next.(model)
+	for _, want := range []string{"existing platform detected", "fleet  (disabled)", "cluster  (torn down)",
+		"rolls nothing back"} {
+		if !strings.Contains(view(), want) {
+			t.Errorf("missing %q:\n%s", want, view())
+		}
+	}
+	next, _ = m.Update(eventMsg(engine.Event{Notice: "failure detected — rolling back", Rollback: true}))
+	m = next.(model)
+	if !strings.Contains(view(), "rolling back — q again forces exit") {
+		t.Errorf("during a rollback the footer must say what the second q abandons:\n%s", view())
+	}
+	m.finished = true
+	if strings.Contains(view(), "portal") {
+		t.Errorf("no portal is installed, and the closing line hands off to one:\n%s", view())
+	}
+}
+
+// gatedFailure is an in-flight phase that fails once release is closed, and records that it
+// ran to its end.
+type gatedFailure struct {
+	release chan struct{}
+	ended   *atomic.Bool
+}
+
+func (gatedFailure) ID() string                 { return "gitops" }
+func (gatedFailure) Title() string              { return "gitops" }
+func (gatedFailure) Optional() bool             { return false }
+func (gatedFailure) Enabled(*engine.State) bool { return true }
+func (p gatedFailure) Run(context.Context, *engine.State) error {
+	<-p.release
+	p.ended.Store(true)
+	return errors.New("the gitops phase failed")
+}
+func (gatedFailure) Teardown(context.Context, *engine.State) error { return nil }
+
+// A view that returns before the engine has finished, by a quit or an interrupt message, does
+// not end RunInit. The engine's outcome, its rollback included, is waited on and returned,
+// because exiting there abandoned the unwind and reported a status the run had not reached.
+func TestRunInit_AViewThatExitsEarlyWaitsForTheEngine(t *testing.T) {
+	orig := engine.PlatformExists
+	t.Cleanup(func() { engine.PlatformExists = orig })
+	engine.PlatformExists = func(context.Context, *engine.State) engine.PlatformState { return engine.PlatformAbsent }
+	for name, early := range map[string]tea.Msg{"quit": tea.QuitMsg{}, "interrupt": tea.InterruptMsg{}} {
+		t.Run(name, func(t *testing.T) {
+			var notices bytes.Buffer
+			stderr = &notices
+			t.Cleanup(func() { stderr = os.Stderr })
+			release := make(chan struct{})
+			var ended atomic.Bool
+			tornDown := false
+			sent := false
+			// The first engine event the view sees is turned into the early exit, as Bubble
+			// Tea's own signal handler would deliver one.
+			filter := tea.WithFilter(func(_ tea.Model, msg tea.Msg) tea.Msg {
+				if _, ok := msg.(eventMsg); ok && !sent {
+					sent = true
+					time.AfterFunc(100*time.Millisecond, func() { close(release) })
+					return early
+				}
+				return msg
+			})
+			st := &engine.State{Runner: exec.New(io.Discard)}
+			err := RunInit(context.Background(), "test", st,
+				[]engine.Phase{slowTeardown{done: &tornDown}, gatedFailure{release: release, ended: &ended}}, true,
+				tea.WithInput(nil), tea.WithoutRenderer(), filter)
+
+			if !ended.Load() || !tornDown {
+				t.Fatalf("RunInit returned before the engine finished (phase ended=%v, torn down=%v): %v",
+					ended.Load(), tornDown, err)
+			}
+			var run *engine.RunError
+			if !errors.As(err, &run) || run.Outcome != engine.RolledBack {
+				t.Fatalf("want the engine's rolled-back outcome, got %v", err)
+			}
+			if !strings.Contains(notices.String(), "before the run finished; waiting for it to end") {
+				t.Errorf("the wait must be said:\n%s", notices.String())
+			}
+			if !strings.Contains(notices.String(), "failure detected — rolling back provisioned resources") {
+				t.Errorf("the notices published after the view exited must be kept:\n%s", notices.String())
+			}
+		})
+	}
+}
+
+// signalsSelf is a phase that sends this process SIGTERM once the view is up, then finishes.
+type signalsSelf struct{}
+
+func (signalsSelf) ID() string                 { return "cluster" }
+func (signalsSelf) Title() string              { return "cluster" }
+func (signalsSelf) Optional() bool             { return false }
+func (signalsSelf) Enabled(*engine.State) bool { return true }
+func (signalsSelf) Run(context.Context, *engine.State) error {
+	time.Sleep(150 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		return err
+	}
+	time.Sleep(300 * time.Millisecond)
+	return nil
+}
+func (signalsSelf) Teardown(context.Context, *engine.State) error { return nil }
+
+// A signal belongs to root's forwarder, not to the view. With Bubble Tea's own handler
+// installed, a SIGTERM closed the view mid-run and rackctl exited while the engine was still
+// unwinding.
+func TestRunInit_TheViewDoesNotHandleSignals(t *testing.T) {
+	sink := make(chan os.Signal, 1)
+	signal.Notify(sink, syscall.SIGTERM) // stands in for root's forwarder
+	t.Cleanup(func() { signal.Stop(sink) })
+	var notices bytes.Buffer
+	stderr = &notices
+	t.Cleanup(func() { stderr = os.Stderr })
+
+	st := &engine.State{Runner: exec.New(io.Discard)}
+	err := RunInit(context.Background(), "test", st, []engine.Phase{signalsSelf{}}, true,
+		tea.WithInput(nil), tea.WithoutRenderer())
+	if err != nil {
+		t.Fatalf("RunInit: %v", err)
+	}
+	select {
+	case <-sink:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the signal never arrived")
+	}
+	if strings.Contains(notices.String(), "before the run finished") {
+		t.Errorf("the view handled the signal and closed mid-run:\n%s", notices.String())
 	}
 }

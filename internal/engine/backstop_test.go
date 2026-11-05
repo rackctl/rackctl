@@ -26,10 +26,11 @@ func (p sweepPhase) Teardown(_ context.Context, st *State) error {
 // A rollback ends by saying which backstops ran, found nothing, failed or did not run —
 // its own sweeps and the ones a phase teardown ran — instead of leaving that in the scroll.
 func TestRollbackEndsWithTheBackstopSummary(t *testing.T) {
+	assumePlatform(t, PlatformAbsent)
 	var out bytes.Buffer
 	run := exec.New(&out)
 	run.DryRun = true
-	t.Setenv("PATH", t.TempDir()) // no aws: the IAM and Karpenter enumerations cannot run
+	reachableCluster(t) // aws refuses the IAM and Karpenter enumerations
 
 	eng := &Engine{
 		Phases: []Phase{
@@ -70,6 +71,7 @@ func TestRollbackEndsWithTheBackstopSummary(t *testing.T) {
 // this run pointed kubectl at, so b is the only backstop that can decide the outcome.
 func rollbackWith(t *testing.T, b reap.Backstop) (string, error) {
 	t.Helper()
+	assumePlatform(t, PlatformAbsent)
 	var out bytes.Buffer
 	run := exec.New(&out)
 	run.DryRun = true

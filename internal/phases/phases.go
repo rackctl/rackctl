@@ -205,7 +205,58 @@ func apply(ctx context.Context, st *engine.State, component string) error {
 	if err != nil {
 		return err
 	}
-	return tg(ctx, st, "apply", component, env...)
+	_, recorded := st.Created[component]
+	fresh := !recorded && stateWasEmpty(ctx, st, component, env)
+	if err := tg(ctx, st, "apply", component, env...); err != nil {
+		return err
+	}
+	if st.Applied == nil {
+		st.Applied = map[string]bool{}
+	}
+	st.Applied[component] = true
+	if !recorded && forceDestroyBucketComponents[component] {
+		if st.Created == nil {
+			st.Created = map[string]bool{}
+		}
+		st.Created[component] = fresh
+	}
+	return nil
+}
+
+// stateWasEmpty reports whether a bucket-owning component held no state before this run
+// applied it, which is the only proof that this run created its buckets and druid's Aurora.
+// A successful apply is not that proof: an apply over state an earlier platform left behind
+// adopts it, data included.
+//
+// It is read only where a rollback could act on it, outside development, and any doubt is
+// false: a state that could not be listed is treated as holding something, which leaves the
+// component unpermitted and its data where it is.
+func stateWasEmpty(ctx context.Context, st *engine.State, component string, env []string) bool {
+	if !forceDestroyBucketComponents[component] || st.Config.Environment == config.EnvDev || st.Runner.DryRun {
+		return false
+	}
+	dir := componentDir(st, component)
+	prev := st.Runner.Env
+	st.Runner.Env = append(append([]string(nil), prev...), env...)
+	defer func() { st.Runner.Env = prev }()
+	// state list needs the backend initialised, and tg's own init runs only after this.
+	if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", "init"); err != nil {
+		note(st, "could not read %s's state before applying it (%v), so a rollback will not remove its "+
+			"buckets", component, err)
+		return false
+	}
+	out, err := st.Runner.Capture(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", "state", "list")
+	if err != nil {
+		note(st, "could not read %s's state before applying it (%v), so a rollback will not remove its "+
+			"buckets", component, err)
+		return false
+	}
+	if strings.TrimSpace(out) != "" {
+		note(st, "%s already holds state, so this apply adopts it and a rollback will not remove its buckets",
+			component)
+		return false
+	}
+	return true
 }
 
 func destroy(ctx context.Context, st *engine.State, component string) error {
@@ -262,9 +313,10 @@ func componentEnv(ctx context.Context, st *engine.State, component, verb string)
 		return clusterNetworkEnv(st, verb), nil
 	case "cluster":
 		// cluster_name, endpoint posture, and sizing (version + system nodes) when non-default.
-		// The endpoint builder may detect this host's egress IP, so it can fail and must be
-		// able to say so.
-		return clusterEnv(ctx, st)
+		// The endpoint builder reads the live allow-list and, on a first apply only, detects
+		// this host's egress IP, so it can fail and must be able to say so. The verb decides
+		// whether detection may run at all: a destroy never detects.
+		return clusterEnv(ctx, st, verb)
 	case "dns":
 		// domain_name + acm_certificates + enable_dnssec. All three leaf-pinned to values that
 		// fail or mislead, and two of them are what make a dns-enabled install fail after
@@ -997,17 +1049,82 @@ func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 	// Failures are joined and returned, so the engine still reports the rollback as
 	// incomplete and names what did not come down.
 	comps := substrateComponents(st.Config)
+	permitRollbackBuckets(ctx, st, comps)
 	var failed []error
+	bucketFailed := false
 	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply, no exceptions
 		if err := destroy(ctx, st, comps[i]); err != nil {
 			failed = append(failed, fmt.Errorf("%s: %w", comps[i], err))
 			note(st, "teardown %s failed — continuing with the rest", comps[i])
+			bucketFailed = bucketFailed || forceDestroyBucketComponents[comps[i]]
 		}
 	}
 	if len(failed) > 0 {
-		return fmt.Errorf("%d component(s) did not tear down: %w", len(failed), errors.Join(failed...))
+		err := fmt.Errorf("%d component(s) did not tear down: %w", len(failed), errors.Join(failed...))
+		if bucketFailed && st.Config.Environment != config.EnvDev {
+			// The remedy, named where the operator reads the failure. A bucket that refused
+			// here empties under the two-act destroy, which a rollback cannot finish for a
+			// component it did not apply.
+			err = fmt.Errorf("%w. If a bucket refused to delete (BucketNotEmpty) or druid's Aurora "+
+				"refused (deletion protection), `rackctl destroy --force-buckets` permits and removes it", err)
+		}
+		return err
 	}
 	return nil
+}
+
+// permitRollbackBuckets is act 1 of the two-act teardown, run by a rollback outside
+// development, and only for the components this same run created.
+//
+// Outside development a non-empty bucket, and druid's Aurora, refuse a destroy until an
+// apply has landed force_destroy in state, so a rollback without this stops on
+// BucketNotEmpty with everything behind it standing. Permitting it destroys what is in
+// those buckets, which is the reason for the limit: a rollback may delete data only this
+// run created. A component this run did not apply, the one that failed partway included, is
+// left unpermitted and named, because permitting is an apply and would build it, druid's
+// Aurora with it, in the middle of the rollback. So is one this run applied over state that
+// was already there, because that apply adopted buckets and an Aurora an earlier platform
+// filled. The line before it acts is the operator's notice; `rackctl destroy
+// --force-buckets` stays the deliberate path for everything else.
+func permitRollbackBuckets(ctx context.Context, st *engine.State, comps []string) {
+	if st.Config.Environment == config.EnvDev {
+		return
+	}
+	var permit, unapplied, adopted []string
+	for _, c := range comps {
+		switch {
+		case !forceDestroyBucketComponents[c]:
+		case st.Applied[c] && st.Created[c]:
+			permit = append(permit, c)
+		case st.Applied[c]:
+			adopted = append(adopted, c)
+		default:
+			unapplied = append(unapplied, c)
+		}
+	}
+	if len(unapplied) > 0 {
+		note(st, "rollback: %v own buckets that refuse a destroy while non-empty in %s, and this run did not "+
+			"finish applying them, so their teardown may fail on BucketNotEmpty. `rackctl destroy "+
+			"--force-buckets` permits and removes them", unapplied, st.Config.Environment)
+	}
+	if len(adopted) > 0 {
+		note(st, "rollback: %v own buckets that refuse a destroy while non-empty in %s, and their state was "+
+			"not proved empty before this run applied them, so what is in them may predate it and is kept. "+
+			"Their teardown may fail on BucketNotEmpty or druid's deletion protection. `rackctl destroy "+
+			"--force-buckets` permits and removes them", adopted, st.Config.Environment)
+	}
+	if len(permit) == 0 {
+		return
+	}
+	note(st, "rollback: applying force_destroy_buckets=true on %v, which this run created, so their "+
+		"buckets can be emptied and removed — this DELETES the data in them, all of it written since this "+
+		"run created them", permit)
+	for _, c := range permit {
+		if err := applyWith(ctx, st, c, "TF_VAR_force_destroy_buckets=true"); err != nil {
+			note(st, "rollback: could not permit %s (%v) — its destroy will say whether a bucket still "+
+				"refuses", c, err)
+		}
+	}
 }
 
 // --- Phase 5: ArgoCD GitOps & addon convergence ---
@@ -1164,8 +1281,16 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.LandingZone
 	err := applyWith(ctx, st, "cluster-bootstrap", "TF_VAR_enable_eval_runtime=true")
 	st.Runner.Dir = prevDir
+	// From here on the phase is CONVERGING, not provisioning: the agent-platform tree is
+	// built, and what follows republishes an annotation and waits on what the catalog
+	// delivers. A failure in that is not a reason to destroy the cloud underneath, for the
+	// same reason the gitops phase gives for its convergence wait, so each one leaves the
+	// platform standing and names the next step.
 	if err != nil {
-		return fmt.Errorf("republishing cluster-bootstrap for eval-runtime: %w", err)
+		return &engine.NoRollbackError{Err: fmt.Errorf(
+			"republishing cluster-bootstrap for eval-runtime: %w. The cloud IS provisioned and the "+
+				"cluster is left standing — fix the cause and re-run `rackctl apply`, or `rackctl destroy` "+
+				"if you want it gone", err)}
 	}
 
 	note(st, "agent operator + CRDs are owned by the GitOps catalog (addons-agent-operator); waiting for convergence")
@@ -1176,15 +1301,19 @@ func (platform) Run(ctx context.Context, st *engine.State) error {
 	for _, crd := range agentPlatformCRDs {
 		if err := st.Runner.Run(ctx, "kubectl", "wait", "--for=condition=Established",
 			"crd/"+crd, "--timeout=10m"); err != nil {
-			return fmt.Errorf("agent-platform CRD %s never established — the catalog did not deliver the operator chart "+
-				"(check the eks-agent-platform/enabled label on the ArgoCD cluster Secret, and the "+
-				"addons-agent-operator ApplicationSet): %w", crd, err)
+			return &engine.NoRollbackError{Err: fmt.Errorf(
+				"agent-platform CRD %s never established — the catalog did not deliver the operator chart "+
+					"(check the eks-agent-platform/enabled label on the ArgoCD cluster Secret, and the "+
+					"addons-agent-operator ApplicationSet): %w. The cloud IS provisioned and the cluster is "+
+					"left standing — run `rackctl check`, and `rackctl destroy` if you want it gone", crd, err)}
 		}
 	}
 
 	if err := st.Runner.Run(ctx, "kubectl", "-n", "eks-agent-platform", "wait",
 		"--for=condition=Available", "deploy/eks-agent-platform-operator", "--timeout=10m"); err != nil {
-		return fmt.Errorf("agent operator never became Available: %w", err)
+		return &engine.NoRollbackError{Err: fmt.Errorf(
+			"agent operator never became Available: %w. The cloud IS provisioned and the cluster is left "+
+				"standing — run `rackctl check`, and `rackctl destroy` if you want it gone", err)}
 	}
 	return nil
 }
@@ -1341,7 +1470,13 @@ func (fleet) Teardown(ctx context.Context, st *engine.State) error {
 	// holds because of the current phase ORDER is one accident away from not holding, and the
 	// accident — adding a required phase after fleet — is invisible at the place it is made.
 	// Making it structural costs one read-only query.
-	if spokes := reap.FleetSpokes(ctx, st.Runner); len(spokes) > 0 {
+	spokes, err := reap.FleetSpokes(ctx, st.Runner)
+	if err != nil {
+		return fmt.Errorf("refusing to tear down the eks-fleet control plane: the spoke clusters it may "+
+			"have vended could not be listed (%w), and a wrong guess that there are none strands real "+
+			"clusters that bill forever. Make the hub's API reachable and re-run", err)
+	}
+	if len(spokes) > 0 {
 		return fmt.Errorf(
 			"refusing to tear down the eks-fleet control plane: %d spoke cluster(s) are still vended "+
 				"(%s). Each is a real EKS cluster — its own control plane, VPC and NAT gateways — often "+

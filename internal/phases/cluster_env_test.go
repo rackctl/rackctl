@@ -35,7 +35,7 @@ func TestClusterEnv_DefaultInjectsNoSizing(t *testing.T) {
 	cfg.Cluster.EndpointPublicAccess = false // avoid egress autodetection in this test
 	cfg.ApplyDefaults()
 
-	env, err := clusterEnv(context.Background(), sizingState(cfg))
+	env, err := clusterEnv(context.Background(), sizingState(cfg), "apply")
 	if err != nil {
 		t.Fatalf("clusterEnv: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestClusterEnv_InjectsNonDefaultVersion(t *testing.T) {
 	cfg.Cluster.Version = "1.35"
 	cfg.Cluster.EndpointPublicAccess = false
 
-	env, err := clusterEnv(context.Background(), sizingState(cfg))
+	env, err := clusterEnv(context.Background(), sizingState(cfg), "apply")
 	if err != nil {
 		t.Fatalf("clusterEnv: %v", err)
 	}

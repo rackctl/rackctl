@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -38,6 +39,33 @@ func (p recPhase) Run(context.Context, *State) error {
 func (p recPhase) Teardown(context.Context, *State) error {
 	*p.log = append(*p.log, "teardown:"+p.id)
 	return nil
+}
+
+// assumePlatform answers PlatformExists with state for the rest of the test. The default
+// asks EKS, on a plan as much as on an apply, so a test that does not pin it is asking
+// whatever aws is on PATH.
+func assumePlatform(t *testing.T, state PlatformState) {
+	t.Helper()
+	orig := PlatformExists
+	t.Cleanup(func() { PlatformExists = orig })
+	PlatformExists = func(context.Context, *State) PlatformState { return state }
+}
+
+// reachableCluster puts an aws and a kubectl on PATH for a plan's rollback: aws answers
+// update-kubeconfig, which a plan's in-cluster preview writes a temporary kubeconfig with,
+// and refuses everything else; kubectl answers every read with nothing.
+func reachableCluster(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"aws":     "case \"$2\" in update-kubeconfig) exit 0 ;; esac\necho 'An error occurred (AccessDenied)' >&2\nexit 254\n",
+		"kubectl": "exit 0\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
 }
 
 func equal(a, b []string) bool {
@@ -273,6 +301,7 @@ func TestEngineStillRollsBackWhatItBuilt(t *testing.T) {
 // there the engine demolished a platform this run did not create, here it demolishes a
 // cluster this run never even pointed at.
 func TestEngineDoesNotReapBeforeItHasACluster(t *testing.T) {
+	assumePlatform(t, PlatformAbsent)
 	var out bytes.Buffer
 	run := exec.New(&out)
 	run.DryRun = true // the reap helpers print their intent and mutate nothing
@@ -318,6 +347,8 @@ func TestEngineDoesNotReapBeforeItHasACluster(t *testing.T) {
 // It is what stops a rollback tearing the cluster down on top of live PVCs and Platform CRs,
 // orphaning EBS volumes and IAM roles nothing will ever collect.
 func TestEngineDoesReapOnceTheKubeconfigIsOurs(t *testing.T) {
+	assumePlatform(t, PlatformAbsent)
+	reachableCluster(t)
 	var out bytes.Buffer
 	run := exec.New(&out)
 	run.DryRun = true
@@ -343,6 +374,7 @@ func TestEngineDoesReapOnceTheKubeconfigIsOurs(t *testing.T) {
 // of an account-wide, cluster-agnostic path. A blank name there reaps nothing (see
 // reap.reapOperatorRoles), so the wiring — not just the gate — has to be right.
 func TestEngineNamesTheClusterItReaps(t *testing.T) {
+	assumePlatform(t, PlatformAbsent)
 	var out bytes.Buffer
 	run := exec.New(&out)
 	run.DryRun = true
@@ -538,7 +570,7 @@ func TestOptionalPhaseFailureDoesNotCancelLaterOptionalPhasesOnReapply(t *testin
 // answer that arms the teardown.
 func TestDefaultPlatformExistsReportsUnknownWhenTheCallFails(t *testing.T) {
 	run := exec.New(io.Discard)
-	run.Dir = filepath.Join(t.TempDir(), "does-not-exist") // makes any exec fail, aws installed or not
+	t.Setenv("PATH", t.TempDir()) // no aws: the call cannot succeed
 
 	got := PlatformExists(context.Background(), &State{
 		Runner: run,
@@ -625,8 +657,8 @@ func TestTeardownRunsOnALiveContextAfterAnInterrupt(t *testing.T) {
 }
 
 // A rollback that could not finish leaves billable resources standing, which is the exact
-// outcome it exists to prevent. Under a Hook nothing is printed at all, so the failure has
-// to travel in the returned error or the operator never learns of it.
+// outcome it exists to prevent. Under a Hook the printed lines reach the transcript rather
+// than the screen, so the failure has to travel in the returned error as well.
 func TestTeardownFailureReachesTheCallerUnderAHook(t *testing.T) {
 	built := ctxPhase{id: "built", teardownErr: errors.New("DependencyViolation")}
 	boom := ctxPhase{id: "boom", fail: true}
@@ -643,8 +675,8 @@ func TestTeardownFailureReachesTheCallerUnderAHook(t *testing.T) {
 		t.Fatal("a failed required phase must return an error")
 	}
 	if !strings.Contains(err.Error(), "DependencyViolation") {
-		t.Errorf("the teardown failure must reach the caller — under a Hook it is printed "+
-			"nowhere, so this error is the only channel.\ngot: %v", err)
+		t.Errorf("the teardown failure must reach the caller — under a Hook the screen "+
+			"shows the error, not the transcript.\ngot: %v", err)
 	}
 	if !strings.Contains(err.Error(), "rollback did not complete") {
 		t.Errorf("the error must say the rollback is incomplete, not only that a phase failed.\ngot: %v", err)

@@ -290,6 +290,14 @@ func delegateSubdomain(ctx context.Context, st *engine.State) {
 // takes back out — and it runs BEFORE the component destroy, because afterwards the child
 // zone is gone and its name servers are unreadable, which is exactly the state that makes
 // the record impossible to match on.
+//
+// It deletes only what it can prove it wrote. The record at that name is rackctl's only when
+// it points at the name servers of this account's zone by the same name, the comparison
+// delegateSubdomain makes before it writes. Anything else — a child zone already gone on a
+// re-run, name servers that could not be read, a delegation pointing somewhere else — is left
+// in place, with the servers it points at and the command that removes it, because deleting
+// it blind would take down somebody else's subdomain. Every path says what it found, and a
+// dry-run reads all of it for real and stops short of the delete.
 func WithdrawSubdomainDelegation(ctx context.Context, st *engine.State) {
 	if st.Config.DNS == nil || st.Config.DNS.HostedZone == "" {
 		return
@@ -297,39 +305,63 @@ func WithdrawSubdomainDelegation(ctx context.Context, st *engine.State) {
 	zone := strings.TrimSuffix(st.Config.DNS.HostedZone, ".")
 	_, parent, found := strings.Cut(zone, ".")
 	if !found || strings.Count(parent, ".") == 0 {
-		return
-	}
-	if st.Runner.DryRun {
-		note(st, "dns: (destroy) if %s holds an NS record for %s, rackctl removes it — a "+
-			"delegation pointing at a zone this destroy is about to delete is a lame delegation "+
-			"in a zone that serves something else", parent, zone)
+		note(st, "dns: %s is an apex domain, so its delegation is at the registrar and rackctl wrote none "+
+			"to withdraw", zone)
 		return
 	}
 
 	parentID := publicZoneID(ctx, st, parent)
 	if parentID == "" {
-		return // never delegated from here, or somebody else's zone
+		note(st, "dns: %s is not a public hosted zone in this account, so rackctl wrote no delegation into "+
+			"it — nothing to withdraw", parent)
+		return
 	}
 
 	// Read the record back rather than recomposing it from the child zone. DELETE must
-	// match the existing RRSet exactly, and by now the child may already be gone — in
-	// which case its name servers are unreadable and a recomposed batch would not match.
-	out, err := st.Runner.Capture(ctx, "aws", "route53", "list-resource-record-sets",
+	// match the existing RRSet exactly.
+	out, err := st.Runner.Query(ctx, "aws", "route53", "list-resource-record-sets",
 		"--hosted-zone-id", parentID,
 		"--query", fmt.Sprintf("ResourceRecordSets[?Name=='%s.' && Type=='NS'] | [0]", zone),
 		"--output", "json")
-	if err != nil || strings.TrimSpace(out) == "" || strings.TrimSpace(out) == "null" {
-		return // nothing delegated
-	}
-	var rrset map[string]any
-	if err := json.Unmarshal([]byte(out), &rrset); err != nil || rrset == nil {
+	if err != nil {
+		note(st, "dns: could not read %s for an NS record at %s (%v) — leaving whatever is there. Check: "+
+			"aws route53 list-resource-record-sets --hosted-zone-id %s", parent, zone, err, parentID)
 		return
 	}
-	batch, err := json.Marshal(map[string]any{
+	var rrset struct {
+		Records []struct {
+			Value string `json:"Value"`
+		} `json:"ResourceRecords"`
+	}
+	if s := strings.TrimSpace(out); s == "" || s == "null" {
+		note(st, "dns: %s holds no NS record for %s — nothing to withdraw", parent, zone)
+		return
+	}
+	if err := json.Unmarshal([]byte(out), &rrset); err != nil {
+		note(st, "dns: %s's NS record for %s could not be read (%v) — leaving it", parent, zone, err)
+		return
+	}
+	var servers []string
+	for _, r := range rrset.Records {
+		servers = append(servers, r.Value)
+	}
+	// The exact record, for the DELETE and for the command printed when it is left. It was
+	// decoded from JSON a line above, so it re-encodes.
+	batch, _ := json.Marshal(map[string]any{
 		"Comment": "rackctl: withdraw delegation for " + zone,
-		"Changes": []any{map[string]any{"Action": "DELETE", "ResourceRecordSet": rrset}},
+		"Changes": []any{map[string]any{"Action": "DELETE", "ResourceRecordSet": json.RawMessage(out)}},
 	})
-	if err != nil {
+
+	if why := delegationNotOurs(ctx, st, zone, servers); why != "" {
+		note(st, "dns: leaving %s's NS record in %s, which points at %s: %s, so it cannot be proved to be "+
+			"the delegation rackctl wrote. If it is, and nothing else serves %s, remove it by hand:\n"+
+			"      aws route53 change-resource-record-sets --hosted-zone-id %s --change-batch '%s'",
+			zone, parent, strings.Join(servers, ", "), why, zone, parentID, batch)
+		return
+	}
+	if st.Runner.DryRun {
+		note(st, "dns: (destroy) would withdraw %s's delegation from %s — it points at this zone's name "+
+			"servers (%s)", zone, parent, strings.Join(servers, ", "))
 		return
 	}
 	if err := st.Runner.Run(ctx, "aws", "route53", "change-resource-record-sets",
@@ -341,6 +373,26 @@ func WithdrawSubdomainDelegation(ctx context.Context, st *engine.State) {
 	note(st, "dns: withdrew %s's delegation from %s", zone, parent)
 }
 
+// delegationNotOurs says why the NS record pointing at servers is not provably the one
+// rackctl wrote for zone, or "" when it is: this account holds a public zone by that name
+// and these are its name servers.
+func delegationNotOurs(ctx context.Context, st *engine.State, zone string, servers []string) string {
+	childID := publicZoneID(ctx, st, zone)
+	if childID == "" {
+		return "this account holds no public zone " + zone + " any more"
+	}
+	out, err := st.Runner.Query(ctx, "aws", "route53", "get-hosted-zone", "--id", childID,
+		"--query", "DelegationSet.NameServers", "--output", "json")
+	if err != nil {
+		return "the name servers of " + zone + " could not be read (" + err.Error() + ")"
+	}
+	var child []string
+	if err := json.Unmarshal([]byte(out), &child); err != nil || !sameServers(servers, child) {
+		return "they are not the name servers of this account's " + zone + " zone (" + strings.TrimSpace(out) + ")"
+	}
+	return ""
+}
+
 // publicZoneID resolves a zone name to its id, or "" when this account has no PUBLIC
 // hosted zone by that exact name.
 //
@@ -349,8 +401,10 @@ func WithdrawSubdomainDelegation(ctx context.Context, st *engine.State) {
 // dev.nanohype.dev and anything else sorting after it; and a private zone by the same name
 // is a split-horizon view that resolves for the VPC and for nobody on the internet, which
 // is precisely the audience ACM validates from.
+//
+// A read, through Query, so a dry-run of the withdrawal finds the zones for real.
 func publicZoneID(ctx context.Context, st *engine.State, name string) string {
-	out, err := st.Runner.Capture(ctx, "aws", "route53", "list-hosted-zones-by-name",
+	out, err := st.Runner.Query(ctx, "aws", "route53", "list-hosted-zones-by-name",
 		"--dns-name", name+".",
 		"--query", fmt.Sprintf("HostedZones[?Name=='%s.' && Config.PrivateZone==`false`].Id | [0]", name),
 		"--output", "text")
