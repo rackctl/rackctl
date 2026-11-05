@@ -52,6 +52,18 @@ func alive(pid int) bool {
 	return len(fields) < 3 || fields[2] != "Z"
 }
 
+// diesWithin reports whether pid is gone, or a zombie, before d runs out.
+func diesWithin(pid int, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for alive(pid) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true
+}
+
 // A cancelled mutation gets ONE SIGINT and time to release its state, not SIGKILL.
 //
 // tofu treats a first interrupt as a graceful stop and a second as a forced one, and a
@@ -114,7 +126,10 @@ wait
 	if err != nil {
 		t.Fatal(err)
 	}
-	if alive(pid) {
+	// The group's SIGKILL is queued for every member at once, but Run returns as soon as the
+	// leader is reaped, and a loaded machine may not have scheduled the grandchild's death
+	// yet. A grandchild outside the group never dies, so a bounded wait still catches that.
+	if !diesWithin(pid, 5*time.Second) {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 		t.Fatal("the grandchild survived the grace — only the leader was killed, not its group")
 	}
