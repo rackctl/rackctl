@@ -136,7 +136,11 @@ The usual causes, in order of likelihood:
   Look under `aws iam list-roles --path-prefix /eks-agent-platform/`.
 - **`BucketNotEmpty`** — outside development several buckets refuse a destroy while
   non-empty. Re-run with `--force-buckets`, which applies `force_destroy` into state first
-  and then destroys. `force_destroy` has no effect until an apply has landed it.
+  and then destroys. `force_destroy` has no effect until an apply has landed it. A rollback
+  outside development permits it itself, on the components this same run applied and no
+  others, and prints `rollback: applying force_destroy_buckets=true on …` before it acts;
+  a component it did not apply is named, and the incomplete rollback's error names
+  `rackctl destroy --force-buckets`.
 - **`could not point kubectl at <cluster>`** — the in-cluster sweeps were skipped. The
   component teardown still ran and terraform state is scoped by state key, so nothing
   belonging to another cluster was touched. Fix the kubeconfig and re-run the destroy.

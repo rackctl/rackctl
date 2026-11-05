@@ -205,7 +205,14 @@ func apply(ctx context.Context, st *engine.State, component string) error {
 	if err != nil {
 		return err
 	}
-	return tg(ctx, st, "apply", component, env...)
+	if err := tg(ctx, st, "apply", component, env...); err != nil {
+		return err
+	}
+	if st.Applied == nil {
+		st.Applied = map[string]bool{}
+	}
+	st.Applied[component] = true
+	return nil
 }
 
 func destroy(ctx context.Context, st *engine.State, component string) error {
@@ -997,17 +1004,73 @@ func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 	// Failures are joined and returned, so the engine still reports the rollback as
 	// incomplete and names what did not come down.
 	comps := substrateComponents(st.Config)
+	permitRollbackBuckets(ctx, st, comps)
 	var failed []error
+	bucketFailed := false
 	for i := len(comps) - 1; i >= 0; i-- { // reverse of apply, no exceptions
 		if err := destroy(ctx, st, comps[i]); err != nil {
 			failed = append(failed, fmt.Errorf("%s: %w", comps[i], err))
 			note(st, "teardown %s failed — continuing with the rest", comps[i])
+			bucketFailed = bucketFailed || forceDestroyBucketComponents[comps[i]]
 		}
 	}
 	if len(failed) > 0 {
-		return fmt.Errorf("%d component(s) did not tear down: %w", len(failed), errors.Join(failed...))
+		err := fmt.Errorf("%d component(s) did not tear down: %w", len(failed), errors.Join(failed...))
+		if bucketFailed && st.Config.Environment != config.EnvDev {
+			// The remedy, named where the operator reads the failure. A bucket that refused
+			// here empties under the two-act destroy, which a rollback cannot finish for a
+			// component it did not apply.
+			err = fmt.Errorf("%w. If a bucket refused to delete (BucketNotEmpty) or druid's Aurora "+
+				"refused (deletion protection), `rackctl destroy --force-buckets` permits and removes it", err)
+		}
+		return err
 	}
 	return nil
+}
+
+// permitRollbackBuckets is act 1 of the two-act teardown, run by a rollback outside
+// development, and only for the components this same run applied.
+//
+// Outside development a non-empty bucket, and druid's Aurora, refuse a destroy until an
+// apply has landed force_destroy in state, so a rollback without this stops on
+// BucketNotEmpty with everything behind it standing. Permitting it destroys what is in
+// those buckets, which is the reason for the limit: a rollback may delete data only this
+// run created. A component this run did not apply, the one that failed partway included, is
+// left unpermitted and named, because permitting is an apply and would build it, druid's
+// Aurora with it, in the middle of the rollback. The line before it acts is the operator's
+// notice; `rackctl destroy --force-buckets` stays the deliberate path for everything else.
+func permitRollbackBuckets(ctx context.Context, st *engine.State, comps []string) {
+	if st.Config.Environment == config.EnvDev {
+		return
+	}
+	var permit, unpermitted []string
+	for _, c := range comps {
+		if !forceDestroyBucketComponents[c] {
+			continue
+		}
+		if st.Applied[c] {
+			permit = append(permit, c)
+		} else {
+			unpermitted = append(unpermitted, c)
+		}
+	}
+	if len(unpermitted) > 0 {
+		note(st, "rollback: %v own buckets that refuse a destroy while non-empty in %s, and this run did not "+
+			"finish applying them, so their teardown may fail on BucketNotEmpty. `rackctl destroy "+
+			"--force-buckets` permits and removes them", unpermitted, st.Config.Environment)
+	}
+	if len(permit) == 0 {
+		return
+	}
+	note(st, "rollback: applying force_destroy_buckets=true on %v, which this run applied, so their "+
+		"buckets can be emptied and removed — this DELETES the data in them, all of it written since this "+
+		"run created them", permit)
+	for _, c := range permit {
+		if err := applyWith(ctx, st, c, "TF_VAR_force_destroy_buckets=true"); err != nil {
+			note(st, "rollback: could not permit %s (%v) — its destroy will say whether a bucket still "+
+				"refuses", c, err)
+		}
+	}
 }
 
 // --- Phase 5: ArgoCD GitOps & addon convergence ---

@@ -180,6 +180,7 @@ CRITICAL = [
     ("cmd/misc.go", "confirmDestroy"),
     ("internal/phases/agentplatform.go", "createBucketArgs"),
     ("internal/phases/agentplatform.go", "agentPlatformStateHolders"),
+    ("internal/phases/phases.go", "permitRollbackBuckets"),
 ]
 
 

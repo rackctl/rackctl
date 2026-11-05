@@ -50,6 +50,11 @@ type State struct {
 	// that explained the absence had already been discarded.
 	CaptureErr map[string]error
 
+	// Applied records each landing-zone component this run applied successfully. A rollback
+	// reads it: permitting force_destroy is an apply, and applying a component this run did
+	// not build, druid's Aurora above all, would create it in the middle of the rollback.
+	Applied map[string]bool
+
 	// Backstops collects what each teardown sweep reported about itself, in the order they
 	// ran — the in-cluster reap and the IAM and EC2 backstops the rollback runs, and the
 	// volume sweep a phase teardown runs. The rollback prints them as one summary at its end,
