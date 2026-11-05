@@ -189,9 +189,13 @@ the object rather than at the flag.`,
 		// rackctl will not delete them either — tearing down someone else's cluster as a
 		// side effect of tearing down this one is not a decision an installer gets to make.
 		// So it stops and says what is there.
+		//
+		// A refusal: nothing has been destroyed, so it exits refused rather than as a
+		// teardown that stopped partway. The one thing that did change is the kubeconfig,
+		// which the repoint above aimed at this cluster, and the message says so.
 		if reaping {
 			if spokes := reap.FleetSpokes(ctx, run); len(spokes) > 0 {
-				return fmt.Errorf(
+				return withExit(ExitRefused, fmt.Errorf(
 					"this cluster is an eks-fleet hub with %d spoke cluster(s) still vended:\n\n"+
 						"    %s\n\n"+
 						"Each one is a real EKS cluster — its own control plane, VPC and NAT gateways, "+
@@ -203,9 +207,17 @@ the object rather than at the flag.`,
 						"    kubectl delete clusters.fleet.nanohype.dev --all -A --wait\n\n"+
 						"Watch them go (a spoke takes as long as any EKS teardown), then re-run this "+
 						"destroy. rackctl does not delete them for you — that is a different cluster's "+
-						"lifecycle, and often a different account's bill",
-					len(spokes), strings.Join(spokes, "\n    "))
+						"lifecycle, and often a different account's bill.\n\n"+
+						"Nothing was destroyed. kubectl's current context now points at %s",
+					len(spokes), strings.Join(spokes, "\n    "), cfg.ClusterName()))
 			}
+		}
+
+		// The last point at which nothing has been destroyed. An interrupt that landed before
+		// it is an abort with nothing to unwind; one after it is a teardown that stopped
+		// partway, and the end of this command classifies it as one.
+		if ctx.Err() != nil {
+			return withExit(ExitAborted, fmt.Errorf("interrupted before anything was destroyed: %w", ctx.Err()))
 		}
 
 		// Let the operator delete the AWS resources it — not Terraform — created,
@@ -388,11 +400,23 @@ the object rather than at the flag.`,
 		// backstop that guards something ran clean.
 		clean := reap.Summarize(os.Stdout, backstops)
 
+		// An interrupt after the teardown began is a teardown that stopped partway, which is
+		// what every failure below reports; the prefix says why it stopped.
+		interrupted := ctx.Err() != nil
+		said := func(err error) error {
+			if interrupted {
+				return fmt.Errorf("interrupted: %w", err)
+			}
+			return err
+		}
 		if len(failed) > 0 {
 			fmt.Println(ui.Fail(fmt.Sprintf("%d component(s) failed to destroy — resources may "+
 				"still be billing. Fix the cause and re-run `rackctl destroy`; it is idempotent.",
 				len(failed))))
-			return errors.Join(failed...)
+			// Resources may remain: the components behind a failure are standing, and an
+			// automation that read this as a generic failure could not tell it from a config
+			// that did not load.
+			return withExit(ExitStranded, said(errors.Join(failed...)))
 		}
 		// A guard that did not hold can leave a Karpenter node billing or an operator role
 		// standing, which is the same fact a component that failed to destroy reports. So it
@@ -402,9 +426,9 @@ the object rather than at the flag.`,
 			fmt.Println(ui.Warn("every component was destroyed, but not every backstop ran clean — " +
 				"resources outside terraform's state may remain. The summary above names which; fix the " +
 				"cause and re-run `rackctl destroy`, which is idempotent"))
-			return withExit(ExitStranded, fmt.Errorf(
+			return withExit(ExitStranded, said(fmt.Errorf(
 				"every component was destroyed, but these backstops did not hold: %s — resources "+
-					"outside terraform's state may remain", strings.Join(reap.Unheld(backstops), ", ")))
+					"outside terraform's state may remain", strings.Join(reap.Unheld(backstops), ", "))))
 		}
 		fmt.Println(ui.OK("platform destroyed"))
 		return nil

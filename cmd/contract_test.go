@@ -25,13 +25,14 @@ func TestExitCodes_AreStableAndDistinct(t *testing.T) {
 	want := map[string]int{
 		"ExitOK": 0, "ExitFailure": 1, "ExitConfig": 2, "ExitPreflight": 3,
 		"ExitDeclined": 4, "ExitStanding": 5, "ExitRolledBack": 6,
-		"ExitStranded": 7, "ExitAborted": 8,
+		"ExitStranded": 7, "ExitAborted": 8, "ExitRefused": 9, "ExitUnhealthy": 10,
 	}
 	got := map[string]int{
 		"ExitOK": ExitOK, "ExitFailure": ExitFailure, "ExitConfig": ExitConfig,
 		"ExitPreflight": ExitPreflight, "ExitDeclined": ExitDeclined,
 		"ExitStanding": ExitStanding, "ExitRolledBack": ExitRolledBack,
 		"ExitStranded": ExitStranded, "ExitAborted": ExitAborted,
+		"ExitRefused": ExitRefused, "ExitUnhealthy": ExitUnhealthy,
 	}
 	for name, w := range want {
 		if got[name] != w {
@@ -68,28 +69,145 @@ func TestExitCode_SurvivesWrapping(t *testing.T) {
 	}
 }
 
-// The three engine outcomes a caller has to act on differently must not collapse. "The
-// rollback ran and there is nothing to clean up", "the platform is up and usable" and
-// "something may still be billing" call for opposite next moves.
-func TestClassifyRun_SeparatesTheThreeCloudStates(t *testing.T) {
+// The engine outcomes a caller has to act on differently must not collapse. "The rollback
+// ran and there is nothing to clean up", "the platform is up and usable", "something may
+// still be billing" and "nothing was touched" call for opposite next moves.
+//
+// Each case drives a real Engine.Run, so what is pinned is the outcome the engine records
+// rather than a hand-written string that happens to match a classifier.
+func TestClassifyRun_SeparatesTheCloudStates(t *testing.T) {
+	boom := errors.New("boom")
 	for _, tc := range []struct {
-		name string
-		err  error
-		want int
+		name    string
+		state   engine.PlatformState
+		noClean bool
+		dryRun  bool
+		phases  []engine.Phase
+		want    int
 	}{
-		{"clean", nil, ExitOK},
-		{"rolled back", errors.New(`phase "cluster" failed: boom`), ExitRolledBack},
-		{"left standing, no rollback", fmt.Errorf("phase %q failed: %w", "gitops",
-			&engine.NoRollbackError{Err: errors.New("not converged")}), ExitStanding},
-		{"left standing, optional", errors.New("optional phase(s) failed: portal"), ExitStanding},
-		{"stranded", errors.New(`phase "substrate" failed: boom (and the rollback did not complete: x)`), ExitStranded},
-		{"aborted", fmt.Errorf("run: %w", tui.ErrAborted), ExitAborted},
+		{"clean", engine.PlatformAbsent, false, false,
+			[]engine.Phase{outcomePhase{id: "cluster"}}, ExitOK},
+		{"rolled back", engine.PlatformAbsent, false, false,
+			[]engine.Phase{outcomePhase{id: "cluster"}, outcomePhase{id: "gitops", err: boom}}, ExitRolledBack},
+		// The classifier used to match this text in the message. A tool that prints it to
+		// stderr is not a rollback that did not complete.
+		{"rolled back, stderr naming an incomplete rollback", engine.PlatformAbsent, false, false,
+			[]engine.Phase{outcomePhase{id: "gitops", err: errors.New("helm: rollback did not complete")}}, ExitRolledBack},
+		{"left standing, no rollback", engine.PlatformAbsent, false, false,
+			[]engine.Phase{outcomePhase{id: "gitops", err: &engine.NoRollbackError{Err: errors.New("not converged")}}}, ExitStanding},
+		{"left standing, optional", engine.PlatformAbsent, false, false,
+			[]engine.Phase{outcomePhase{id: "cluster"}, outcomePhase{id: "portal", optional: true, err: boom}}, ExitStanding},
+		{"left standing, preexisting", engine.PlatformPresent, false, false,
+			[]engine.Phase{outcomePhase{id: "gitops", err: boom}}, ExitStanding},
+		{"platform state unknown", engine.PlatformUnknown, false, false,
+			[]engine.Phase{outcomePhase{id: "gitops", err: boom}}, ExitStranded},
+		{"--no-clean-on-failure", engine.PlatformAbsent, true, false,
+			[]engine.Phase{outcomePhase{id: "cluster"}, outcomePhase{id: "gitops", err: boom}}, ExitStranded},
+		{"stranded", engine.PlatformAbsent, false, false,
+			[]engine.Phase{outcomePhase{id: "cluster", teardownErr: errors.New("DependencyViolation")},
+				outcomePhase{id: "substrate", err: boom}}, ExitStranded},
+		{"refused before spend", engine.PlatformAbsent, false, false,
+			[]engine.Phase{outcomePhase{id: "acquire", err: engine.Refuse(errors.New("no ref v9"))}}, ExitRefused},
+		{"refused before spend, over a standing platform", engine.PlatformPresent, false, false,
+			[]engine.Phase{outcomePhase{id: "acquire", err: engine.Refuse(errors.New("no ref v9"))}}, ExitStanding},
+		{"a failed plan", engine.PlatformAbsent, false, true,
+			[]engine.Phase{outcomePhase{id: "cluster"}, outcomePhase{id: "gitops", err: boom}}, ExitFailure},
+		{"a failed plan whose rollback would not complete", engine.PlatformAbsent, false, true,
+			[]engine.Phase{outcomePhase{id: "cluster", teardownErr: errors.New("x")}, outcomePhase{id: "gitops", err: boom}}, ExitFailure},
 	} {
-		if got := ExitCode(classifyRun(tc.err)); got != tc.want {
-			t.Errorf("%s: exit %d, want %d", tc.name, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			err := runEngine(t, context.Background(), tc.state, tc.noClean, tc.dryRun, tc.phases...)
+			if got := ExitCode(classifyRun(context.Background(), err)); got != tc.want {
+				t.Errorf("exit %d, want %d (%v)", got, tc.want, err)
+			}
+		})
 	}
 }
+
+// A plain-path interrupt cancels the command context, and the run unwinds. It is aborted
+// when that unwind finished, and resources-may-remain when it did not: what may still be
+// billing is the more urgent fact. Either way the message says it was interrupted.
+func TestClassifyRun_AnInterruptIsAbortedUnlessTheUnwindDidNotFinish(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		teardownErr error
+		want        int
+	}{
+		{"unwind finished", nil, ExitAborted},
+		{"unwind did not finish", errors.New("DependencyViolation"), ExitStranded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			err := runEngine(t, ctx, engine.PlatformAbsent, false, false,
+				outcomePhase{id: "cluster", teardownErr: tc.teardownErr},
+				outcomePhase{id: "substrate", err: errors.New("terragrunt: signal: interrupt"), cancel: cancel})
+			classified := classifyRun(ctx, err)
+			if got := ExitCode(classified); got != tc.want {
+				t.Errorf("exit %d, want %d (%v)", got, tc.want, classified)
+			}
+			if !strings.HasPrefix(classified.Error(), "interrupted: ") {
+				t.Errorf("the message must say the run was interrupted: %v", classified)
+			}
+			// The engine's own record carries it too, for a caller whose context is not the
+			// one that was cancelled — the TUI cancels a context of its own.
+			if got := ExitCode(classifyRun(context.Background(), err)); got != tc.want {
+				t.Errorf("from the engine's record alone: exit %d, want %d (%v)", got, tc.want, err)
+			}
+		})
+	}
+
+	// A cancelled command context with an error that carries no engine outcome, the TUI's
+	// quit, and an error that carries no outcome and no interrupt at all.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := ExitCode(classifyRun(cancelled, errors.New("tui: no terminal"))); got != ExitAborted {
+		t.Errorf("an interrupted command: exit %d, want %d", got, ExitAborted)
+	}
+	if got := ExitCode(classifyRun(context.Background(), fmt.Errorf("run: %w", tui.ErrAborted))); got != ExitAborted {
+		t.Errorf("a TUI abort: exit %d, want %d", got, ExitAborted)
+	}
+	if got := ExitCode(classifyRun(context.Background(), errors.New("tui: no terminal"))); got != ExitFailure {
+		t.Errorf("an error with no recorded outcome is not evidence of a rollback: exit %d, want %d", got, ExitFailure)
+	}
+}
+
+// runEngine runs phases through a real Engine against the production Runner, with the
+// platform-exists answer fixed. No phase here shells out, and no cluster was pointed at,
+// so the rollback's sweeps have nothing to act on.
+func runEngine(t *testing.T, ctx context.Context, state engine.PlatformState, noClean, dryRun bool, phases ...engine.Phase) error {
+	t.Helper()
+	orig := engine.PlatformExists
+	t.Cleanup(func() { engine.PlatformExists = orig })
+	engine.PlatformExists = func(context.Context, *engine.State) engine.PlatformState { return state }
+	t.Setenv("PATH", t.TempDir())
+	run := rackexec.New(io.Discard)
+	run.DryRun = dryRun
+	eng := &engine.Engine{Phases: phases, Out: io.Discard, CleanOnFail: !noClean}
+	return eng.Run(ctx, &engine.State{Runner: run, Config: &config.Config{}})
+}
+
+// outcomePhase fails with err when it is set, and its teardown fails with teardownErr.
+// cancel, when set, is called from inside Run: the interrupt arriving mid-phase.
+type outcomePhase struct {
+	id          string
+	optional    bool
+	err         error
+	teardownErr error
+	cancel      context.CancelFunc
+}
+
+func (p outcomePhase) ID() string                 { return p.id }
+func (p outcomePhase) Title() string              { return p.id }
+func (p outcomePhase) Optional() bool             { return p.optional }
+func (p outcomePhase) Enabled(*engine.State) bool { return true }
+func (p outcomePhase) Run(context.Context, *engine.State) error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	return p.err
+}
+func (p outcomePhase) Teardown(context.Context, *engine.State) error { return p.teardownErr }
 
 // A rollback whose guard did not hold leaves something that may be billing, so the engine's
 // outcome classifies as resources-may-remain, not rolled-back. An informational report that
@@ -104,16 +222,9 @@ func TestClassifyRun_ARollbackWhoseGuardDidNotHoldIsStranded(t *testing.T) {
 		{reap.Backstop{Name: "unprovable EBS volumes", Outcome: reap.NotRun, Informational: true}, ExitRolledBack},
 		{reap.Backstop{Name: "orphaned EBS volumes", Outcome: reap.FoundNothing}, ExitRolledBack},
 	} {
-		run := rackexec.New(io.Discard)
-		run.DryRun = true
-		t.Setenv("PATH", t.TempDir())
-		eng := &engine.Engine{
-			Phases:      []engine.Phase{backstopPhase{id: "cluster", b: tc.b}, backstopPhase{id: "gitops", fail: true}},
-			Out:         io.Discard,
-			CleanOnFail: true,
-		}
-		err := eng.Run(context.Background(), &engine.State{Runner: run, Config: &config.Config{}})
-		if got := ExitCode(classifyRun(err)); got != tc.want {
+		err := runEngine(t, context.Background(), engine.PlatformAbsent, false, false,
+			backstopPhase{id: "cluster", b: tc.b}, backstopPhase{id: "gitops", fail: true})
+		if got := ExitCode(classifyRun(context.Background(), err)); got != tc.want {
 			t.Errorf("%s %s: exit %d, want %d (%v)", tc.b.Name, tc.b.Outcome, got, tc.want, err)
 		}
 	}
@@ -153,6 +264,8 @@ func TestClassify_NamesMatchTheirCodes(t *testing.T) {
 	}{
 		{withExit(ExitStranded, errors.New("x")), "resources-may-remain (exit 7)"},
 		{withExit(ExitPreflight, errors.New("x")), "preflight (exit 3)"},
+		{withExit(ExitRefused, errors.New("x")), "refused (exit 9)"},
+		{withExit(ExitUnhealthy, errors.New("x")), "unhealthy (exit 10)"},
 		{errors.New("x"), "failure (exit 1)"},
 	} {
 		if got := Classify(tc.err); got != tc.want {
@@ -175,10 +288,12 @@ func TestCheckJSON_ShapeIsStable(t *testing.T) {
 		t.Fatalf("pipe: %v", err)
 	}
 	os.Stdout = w
-	emitErr := emitCheckJSON(cfg, "asserted",
+	report := newCheckReport(cfg, "asserted",
 		[]doctor.Result{{Name: "vcpu quota", Status: doctor.Fail, Detail: "32 vCPU"}},
 		[]doctor.Result{{Name: "applications", Status: doctor.OK, Detail: "44 Healthy"}},
 		true)
+	report.ClusterExists = "present"
+	emitErr := writeCheckReport(report)
 	_ = w.Close()
 	os.Stdout = old
 	if emitErr != nil {
@@ -200,7 +315,7 @@ func TestCheckJSON_ShapeIsStable(t *testing.T) {
 		t.Fatalf("the report must be valid JSON: %v\n%s", err, buf.String())
 	}
 	for _, key := range []string{"cluster", "environment", "account", "region",
-		"clusterHealth", "passed", "preflight", "platform"} {
+		"clusterHealth", "passed", "preflight", "platform", "clusterExists"} {
 		if _, ok := doc[key]; !ok {
 			t.Errorf("the report lost the %q field — docs/exit-codes.md publishes this shape", key)
 		}

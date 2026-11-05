@@ -71,9 +71,9 @@ func TestEKSClusterName_HandlesOtherPartitions(t *testing.T) {
 	}
 }
 
-// currentKubeCluster drives the production Runner, so a kubeconfig holding an ARN must
-// come back as the bare name the caller compares against cfg.ClusterName().
-func TestCurrentKubeCluster_ReturnsTheBareName(t *testing.T) {
+// currentKubeCluster drives the production Runner, and a kubeconfig holding an ARN comes
+// back whole: the account and the region in it are what the wrong-cluster guard compares.
+func TestCurrentKubeCluster_ReturnsTheWholeEntry(t *testing.T) {
 	dir := t.TempDir()
 	script := "#!/bin/sh\necho 'arn:aws:eks:us-east-1:111111111111:cluster/development-platform'\n"
 	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
@@ -85,8 +85,8 @@ func TestCurrentKubeCluster_ReturnsTheBareName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != "development-platform" {
-		t.Fatalf("got %q, want %q", got, "development-platform")
+	if want := "arn:aws:eks:us-east-1:111111111111:cluster/development-platform"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 

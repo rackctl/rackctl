@@ -1,9 +1,9 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/rackctl/rackctl/internal/engine"
 	"github.com/rackctl/rackctl/internal/tui"
@@ -42,9 +42,17 @@ const (
 	// This is the one that needs a human: resources this run created may still exist.
 	// docs/runbook.md covers what to look for.
 	ExitStranded = 7
-	// ExitAborted means the operator interrupted. Whether the unwind completed depends on
-	// how far it got before a second interrupt.
+	// ExitAborted means the operator interrupted, and whatever unwind the run owed has
+	// finished. An interrupted run whose unwind did not finish exits ExitStranded instead:
+	// the more urgent cloud state wins, and the message still says it was interrupted.
 	ExitAborted = 8
+	// ExitRefused means a command refused before it touched anything: an apply that refused
+	// before any spend, or a destroy that refused before any destroy. Nothing changed.
+	ExitRefused = 9
+	// ExitUnhealthy means `rackctl check` ran and found the platform unhealthy, found
+	// kubectl pointed at a different cluster, or found the cluster in EKS and could not
+	// reach it from this shell.
+	ExitUnhealthy = 10
 )
 
 // exitError carries an exit status alongside an error, so a command can classify its own
@@ -95,6 +103,10 @@ func exitCodeName(code int) string {
 		return "resources-may-remain"
 	case ExitAborted:
 		return "aborted"
+	case ExitRefused:
+		return "refused"
+	case ExitUnhealthy:
+		return "unhealthy"
 	default:
 		return "failure"
 	}
@@ -110,25 +122,55 @@ func Classify(err error) string {
 // The three cases an operator or an agent has to act on differently: the rollback ran and
 // there is nothing to clean up, the platform was deliberately left standing and is usable,
 // or the rollback could not finish and something may still be billing.
-func classifyRun(err error) error {
-	switch {
-	case err == nil:
+//
+// It reads the outcome the engine recorded, never the message: that text carries
+// subprocess stderr, and a tool that printed "rollback did not complete" would otherwise
+// decide the status. An error that carries no outcome is not evidence of a rollback, so it
+// stays the generic failure.
+//
+// ctx is the command's context. Its cancellation is how a plain-path interrupt arrives, so
+// it is checked as well as the engine's own record of it.
+func classifyRun(ctx context.Context, err error) error {
+	if err == nil {
 		return nil
-	case errors.Is(err, tui.ErrAborted):
-		return withExit(ExitAborted, err)
-	case strings.Contains(err.Error(), "rollback did not complete"):
-		return withExit(ExitStranded, err)
-	case isLeftStanding(err):
-		return withExit(ExitStanding, err)
-	default:
-		return withExit(ExitRolledBack, err)
 	}
+	interrupted := ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, tui.ErrAborted)
+	var run *engine.RunError
+	if !errors.As(err, &run) {
+		if interrupted {
+			return withExit(ExitAborted, err)
+		}
+		return err
+	}
+	interrupted = interrupted || run.Interrupted
+	code := runOutcomeCode(run)
+	if interrupted {
+		// An interrupt is aborted unless the unwind it triggered did not finish, in which
+		// case what may still be billing is the more urgent fact.
+		if code != ExitStranded {
+			code = ExitAborted
+		}
+		return withExit(code, fmt.Errorf("interrupted: %w", err))
+	}
+	return withExit(code, err)
 }
 
-// isLeftStanding reports whether the engine declined to roll back. A NoRollbackError, an
-// optional-phase failure and a run against a pre-existing platform all leave the cloud in
-// place, which is the fact the caller needs.
-func isLeftStanding(err error) bool {
-	var noRollback *engine.NoRollbackError
-	return errors.As(err, &noRollback) || strings.Contains(err.Error(), "optional phase(s) failed")
+// runOutcomeCode maps a recorded outcome to its status. A plan built nothing, so whatever
+// its rollback would have been, it is never a claim about the cloud.
+func runOutcomeCode(run *engine.RunError) int {
+	if run.DryRun {
+		return ExitFailure
+	}
+	switch run.Outcome {
+	case engine.RolledBack:
+		return ExitRolledBack
+	case engine.LeftStanding:
+		return ExitStanding
+	case engine.Refused:
+		return ExitRefused
+	case engine.Stranded, engine.PlatformUnknownState, engine.CleanDisabled:
+		return ExitStranded
+	default:
+		return ExitFailure
+	}
 }

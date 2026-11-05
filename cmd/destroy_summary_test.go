@@ -21,15 +21,24 @@ func runDestroyDryRun(t *testing.T, awsBody string) (string, error) {
 // landing-zone checkout to run terragrunt in; the stubs answer every component with success.
 func runDestroy(t *testing.T, awsBody string, flags ...string) (string, error) {
 	t.Helper()
+	out, err := destroyCommand(t, map[string]string{"aws": awsBody}, flags...).CombinedOutput()
+	return string(out), err
+}
+
+// destroyCommand builds the destroy invocation without running it. Each tool's stub body is
+// taken from bodies when present, and answers success otherwise.
+func destroyCommand(t *testing.T, bodies map[string]string, flags ...string) *exec.Cmd {
+	t.Helper()
 	bin := buildRackctl(t)
 	stubs := t.TempDir()
-	for _, tool := range []string{"tofu", "terragrunt", "kubectl", "helm", "git", "gh"} {
-		if err := os.WriteFile(filepath.Join(stubs, tool), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	for _, tool := range []string{"tofu", "terragrunt", "kubectl", "helm", "git", "gh", "aws"} {
+		body, ok := bodies[tool]
+		if !ok {
+			body = "exit 0\n"
+		}
+		if err := os.WriteFile(filepath.Join(stubs, tool), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := os.WriteFile(filepath.Join(stubs, "aws"), []byte("#!/bin/sh\n"+awsBody), 0o755); err != nil {
-		t.Fatal(err)
 	}
 	cfg := filepath.Join(t.TempDir(), "rackctl.yaml")
 	if err := os.WriteFile(cfg, []byte(`org:
@@ -56,8 +65,7 @@ agentPlatform:
 	}
 	cmd := exec.Command(bin, append([]string{"destroy", "-c", cfg}, flags...)...)
 	cmd.Env = append(os.Environ(), "PATH="+stubs, "HOME="+home)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	return cmd
 }
 
 func TestDestroy_PlatformDestroyedOnlyWhenTheBackstopsHeld(t *testing.T) {
