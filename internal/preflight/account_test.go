@@ -485,3 +485,55 @@ esac`)
 		t.Fatalf("an expired token must leave the names unchecked: got %s %s", r.Status, r.Detail)
 	}
 }
+
+// sessionFake answers `configure get <key>` with sso when the key is set, and an export with
+// a session that has the whole day left.
+func sessionFake(t *testing.T, ssoKey string) {
+	t.Helper()
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "configure get") if [ "$3" = "`+ssoKey+`" ]; then echo https://example.awsapps.com/start; else exit 1; fi ;;
+  "configure export-credentials") echo '{"Expiration":"2999-01-01T00:00:00Z"}' ;;
+  *) exit 1 ;;
+esac`)
+}
+
+// A role assumed from SSO credentials is chained, and STS caps a chained session at an hour.
+// Each mutating call starts with a new session, so the warning names the one case that
+// cannot cover: one call longer than the hour.
+func TestSessionLifetime_SSOChainingIsAWarning(t *testing.T) {
+	for _, key := range []string{"sso_start_url", "sso_session"} {
+		sessionFake(t, key)
+		env := testEnv()
+		env.Cfg.Cloud.AssumeRole = &config.AssumeRole{RoleARN: "arn:aws:iam::111111111111:role/rackctl"}
+		r := CheckSessionLifetime(context.Background(), env)
+		if r.Status != doctor.Warn || !strings.Contains(r.Detail, "3600s") || !strings.Contains(r.Detail, "single call") {
+			t.Errorf("%s: an SSO-chained session must warn about the hour cap: %s %s", key, r.Status, r.Detail)
+		}
+	}
+}
+
+// Above an hour, STS refuses a chained assume outright, and the warning says what to set.
+func TestSessionLifetime_SSOChainingAboveAnHourNamesTheRefusal(t *testing.T) {
+	sessionFake(t, "sso_start_url")
+	env := testEnv()
+	env.Cfg.Cloud.AssumeRole = &config.AssumeRole{RoleARN: "arn:aws:iam::111111111111:role/rackctl", DurationSeconds: 14400}
+	r := CheckSessionLifetime(context.Background(), env)
+	if r.Status != doctor.Warn || !strings.Contains(r.Detail, "refuses above it") || !strings.Contains(r.Detail, "14400s") {
+		t.Errorf("got %s %s", r.Status, r.Detail)
+	}
+}
+
+// A profile that is not SSO is not chained, and without a role nothing is assumed at all.
+func TestSessionLifetime_NoChainingIsOK(t *testing.T) {
+	sessionFake(t, "none")
+	env := testEnv()
+	env.Cfg.Cloud.AssumeRole = &config.AssumeRole{RoleARN: "arn:aws:iam::111111111111:role/rackctl"}
+	if r := CheckSessionLifetime(context.Background(), env); r.Status != doctor.OK {
+		t.Errorf("a non-SSO profile: got %s %s", r.Status, r.Detail)
+	}
+	sessionFake(t, "sso_start_url")
+	if r := CheckSessionLifetime(context.Background(), testEnv()); r.Status != doctor.OK {
+		t.Errorf("no role is assumed, so nothing is chained: got %s %s", r.Status, r.Detail)
+	}
+}

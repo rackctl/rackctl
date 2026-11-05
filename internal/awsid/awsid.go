@@ -32,12 +32,12 @@ import (
 	"github.com/rackctl/rackctl/internal/exec"
 )
 
-// refreshWindow is how long before expiry a session is treated as spent.
+// refreshWindow is how long before expiry a session is treated as spent, for a read.
 //
-// A single terragrunt apply can run for many minutes, and credentials that expire
-// mid-apply fail somewhere arbitrary — after resources are created and before
-// state is written. Re-assuming early costs one sts call and removes that class of
-// failure, so the window is generous rather than tight.
+// A read finishes in seconds, so a session with ten minutes left outlives it. A mutation
+// does not take this path: a single terragrunt apply can run for most of the hour Run allows
+// it, so every mutating call starts with a session from Fresh instead. A window as long as
+// the run ceiling would re-assume on nearly every call anyway, and say less about why.
 const refreshWindow = 10 * time.Minute
 
 // defaultDuration is what rackctl requests when the config does not say. It is
@@ -104,6 +104,31 @@ func (i *Identity) Env(ctx context.Context) ([]string, error) {
 	if i.creds != nil && i.now().Before(i.expires.Add(-refreshWindow)) {
 		return i.creds, nil
 	}
+	creds, expires, err := i.assume(ctx)
+	if err != nil {
+		return nil, err
+	}
+	i.creds, i.expires = creds, expires
+	return creds, nil
+}
+
+// Fresh returns the environment of a newly assumed session, whatever the cache holds, and
+// caches it for the reads after.
+//
+// It is what every mutating call runs with. A session cached for reads can have as little as
+// the refresh window left, and a terragrunt apply that outlives its credentials fails after
+// resources are created and before state is written. A newly assumed session gives the call
+// the role's full duration. Where that duration is itself an hour, as it is for a role
+// assumed from SSO credentials, one call that runs longer can still outlive it; preflight
+// says so.
+func (i *Identity) Fresh(ctx context.Context) ([]string, error) {
+	if !i.Enabled() {
+		return Base(i.cfg), nil
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
 	creds, expires, err := i.assume(ctx)
 	if err != nil {
 		return nil, err

@@ -62,6 +62,10 @@ recur:
   `cloud.assumeRole.durationSeconds` set below an hour. A token that lapses mid-phase leaves
   a half-applied run that cannot roll itself back, because the rollback needs the same
   credentials. Run `aws sso login --profile <profile>`, or raise `durationSeconds`.
+  rackctl assumes the role anew before every mutating call, so each call starts with the
+  role's whole duration. A role assumed from an SSO profile is chained, and STS caps a
+  chained session at 3600s and refuses a longer one; the check warns when that applies,
+  because one call that runs past the hour outlives its credentials.
 - **`bucket names`** — an S3 name this run would create is already taken. S3 names are
   globally unique across every AWS account, so this is unrecoverable by retry: rename the
   cluster.

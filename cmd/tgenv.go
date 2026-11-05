@@ -49,7 +49,9 @@ func resolveEnv(ctx context.Context, cfg *config.Config, run *exec.Runner) ([]st
 // EKS control plane alone takes a quarter of that, and the rollback that would clean up
 // needs the same credentials the run just lost. awsid.Identity caches its session and
 // re-assumes inside a refresh window — machinery that only runs if something asks it
-// again, which is what Runner.EnvSource does.
+// again, which is what Runner.EnvSource does. A read reuses the cached session; a mutating
+// call is given a newly assumed one every time, because one terragrunt apply can run for
+// longer than the refresh window leaves.
 //
 // The first resolve happens here rather than lazily so a role that cannot be assumed
 // fails before preflight and before any spend, not as a permissions error partway
@@ -60,6 +62,10 @@ func bindIdentity(ctx context.Context, cfg *config.Config, run *exec.Runner) ([]
 		return nil, err
 	}
 	run.EnvSource = func(ctx context.Context) ([]string, error) {
+		// A mutation starts with a newly assumed session; a read reuses the cached one.
+		if exec.Mutating(ctx) {
+			return identity.Fresh(ctx)
+		}
 		return identity.Env(ctx)
 	}
 	return base, nil
