@@ -171,6 +171,10 @@ func TestClassifyRun_AnInterruptIsAbortedUnlessTheUnwindDidNotFinish(t *testing.
 	if got := ExitCode(classifyRun(context.Background(), fmt.Errorf("run: %w", tui.ErrAborted))); got != ExitAborted {
 		t.Errorf("a TUI abort: exit %d, want %d", got, ExitAborted)
 	}
+	// The second q abandoned the unwind, so what the run built may remain.
+	if got := ExitCode(classifyRun(context.Background(), fmt.Errorf("run: %w", tui.ErrForced))); got != ExitStranded {
+		t.Errorf("a forced TUI exit: exit %d, want %d", got, ExitStranded)
+	}
 	if got := ExitCode(classifyRun(context.Background(), errors.New("tui: no terminal"))); got != ExitFailure {
 		t.Errorf("an error with no recorded outcome is not evidence of a rollback: exit %d, want %d", got, ExitFailure)
 	}

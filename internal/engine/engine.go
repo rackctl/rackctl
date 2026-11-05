@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/ui"
 )
@@ -20,23 +21,41 @@ const (
 	StatusOK
 	StatusSkip
 	StatusFail
+	// StatusTornDown is a completed phase the rollback has undone.
+	StatusTornDown
+	// StatusTeardownFail is a phase the rollback could not undo.
+	StatusTeardownFail
 )
 
 // Event is emitted for each phase transition when Engine.Hook is set.
+//
+// A notice event carries Notice and no phase: a line the operator must see whatever
+// renders the rows, such as the rollback posture, a platform left standing, or the run's
+// closing line. Every notice is also written to Engine.Out.
 type Event struct {
 	Index, Total int
 	ID, Title    string
 	Status       Status
 	Err          error
+	// Notice is a line for the operator. Index is zero on a notice.
+	Notice string
+	// Posture marks the notice that says whether a failure will roll back.
+	Posture bool
+	// Rollback marks the notice that a rollback has begun. Every teardown row follows it.
+	Rollback bool
 }
 
 // Engine runs an ordered pipeline of phases with cleanup-on-failure discipline
 // (mirroring the always-teardown pattern in eks-agent-platform's `task e2e`).
+//
+// Every line the run prints goes to Out, Hook or not: under the TUI, Out is the transcript,
+// so the posture, the rollback and each teardown are on record there too. Hook decides only
+// how the rows render.
 type Engine struct {
 	Phases      []Phase
 	Out         io.Writer
 	CleanOnFail bool
-	Hook        func(Event) // if set, receives events and suppresses default printing
+	Hook        func(Event) // if set, receives every phase transition and notice
 }
 
 // PlatformState answers "was the platform already standing when this run began?" —
@@ -72,12 +91,16 @@ func (s PlatformState) rollbackBlocked() bool { return s != PlatformAbsent }
 // without needing stderr: the call either succeeds — in which case membership is
 // definitive either way — or it fails, which is the unknown.
 //
+// It asks on a plan too, through Query, which runs in a dry-run: whether a failed apply would
+// roll back is the one thing about a rollback a plan can show for real, and a plan that
+// assumed a fresh install would hide both "existing platform" and the fail-closed warning.
+//
 // Overridable for tests; the default asks EKS.
 var PlatformExists = func(ctx context.Context, st *State) PlatformState {
-	if st.Runner == nil || st.Config == nil || st.Runner.DryRun {
+	if st.Runner == nil || st.Config == nil {
 		return PlatformAbsent
 	}
-	out, err := st.Runner.Capture(ctx, "aws", "eks", "list-clusters",
+	out, err := st.Runner.Query(ctx, "aws", "eks", "list-clusters",
 		"--region", st.Config.Cloud.Region,
 		"--query", fmt.Sprintf("contains(clusters, '%s')", st.Config.ClusterName()),
 		"--output", "text")
@@ -119,24 +142,32 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 	// `rackctl destroy` — an explicit, separate act.
 	state := PlatformExists(ctx, st)
 	preexisting := state.rollbackBlocked()
-	if e.Hook == nil {
-		switch state {
-		case PlatformPresent:
-			fmt.Fprintln(e.Out, ui.Step("existing platform detected — a failure will NOT roll it back"))
-		case PlatformUnknown:
-			// Say it out loud. The operator is the only one who can tell whether this
-			// run is building from zero, and a silent fail-closed would leave a genuine
-			// first install without the cleanup it expects.
-			fmt.Fprintln(e.Out, ui.Warn(
-				"could not determine whether a platform already exists — rollback is DISABLED "+
-					"for this run. A failure will leave everything standing rather than risk "+
-					"destroying a platform this run did not build. Fix the credentials or "+
-					"connectivity and re-run to restore normal cleanup."))
-		}
+	plan := st.Runner != nil && st.Runner.DryRun
+	switch {
+	case state == PlatformPresent && plan:
+		e.posture(ui.Step("existing platform detected — plan only: apply would NOT roll back a failure over it"))
+	case state == PlatformPresent:
+		e.posture(ui.Step("existing platform detected — a failure will NOT roll it back"))
+	case state == PlatformUnknown && plan:
+		e.posture(ui.Warn(
+			"could not determine whether a platform already exists — plan only: apply would NOT roll " +
+				"back, because rollback is DISABLED for a run that cannot tell. Fix the credentials or " +
+				"connectivity before applying."))
+	case state == PlatformUnknown:
+		// Say it out loud. The operator is the only one who can tell whether this
+		// run is building from zero, and a silent fail-closed would leave a genuine
+		// first install without the cleanup it expects.
+		e.posture(ui.Warn(
+			"could not determine whether a platform already exists — rollback is DISABLED " +
+				"for this run. A failure will leave everything standing rather than risk " +
+				"destroying a platform this run did not build. Fix the credentials or " +
+				"connectivity and re-run to restore normal cleanup."))
 	}
 
 	total := len(e.Phases)
-	var completed []Phase
+	// Indices into e.Phases of the phases that completed, so a teardown row is reported
+	// against the phase it undoes.
+	var completed []int
 	// Optional phases that failed. Collected rather than returned, so one of them
 	// failing does not cancel the others — see the Optional() case below.
 	var optionalFailed []error
@@ -206,13 +237,11 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				// collected and reported together at the end, and the run still exits
 				// non-zero: continuing is not forgiving them.
 				optionalFailed = append(optionalFailed, fmt.Errorf("%s: %w", p.ID(), err))
-				if e.Hook == nil {
-					fmt.Fprintln(e.Out, ui.Warn(
-						"this is an optional phase and the platform underneath it is provisioned — "+
-							"leaving it standing. Nothing was rolled back, and the remaining phases "+
-							"still run. Run `rackctl check` to see what is wrong, or `rackctl destroy` "+
-							"to tear it down deliberately."))
-				}
+				e.notice(ui.Warn(
+					"this is an optional phase and the platform underneath it is provisioned — " +
+						"leaving it standing. Nothing was rolled back, and the remaining phases " +
+						"still run. Run `rackctl check` to see what is wrong, or `rackctl destroy` " +
+						"to tear it down deliberately."))
 				continue
 			case errors.As(err, &noRollback) && noRollback.BeforeSpend:
 				// A refusal before anything was spent left nothing at all, whatever was or was
@@ -237,10 +266,17 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				if state == PlatformUnknown {
 					fail.Outcome, fail.Reason = PlatformUnknownState, ""
 				}
-				if e.Hook == nil {
-					fmt.Fprintln(e.Out, ui.Warn(
-						"the platform was already provisioned before this run — leaving it standing. "+
-							"Nothing was rolled back. Run `rackctl check` to see what is wrong, or "+
+				switch {
+				case plan && state == PlatformUnknown:
+					e.notice(ui.Warn("plan only: whether a platform exists could not be told, so apply " +
+						"would leave everything standing on this failure and would NOT roll back."))
+				case plan:
+					e.notice(ui.Warn("plan only: the platform was already provisioned, so apply would " +
+						"leave it standing on this failure and would NOT roll back."))
+				default:
+					e.notice(ui.Warn(
+						"the platform was already provisioned before this run — leaving it standing. " +
+							"Nothing was rolled back. Run `rackctl check` to see what is wrong, or " +
 							"`rackctl destroy` to tear it down deliberately."))
 				}
 			case errors.As(err, &noRollback):
@@ -250,11 +286,9 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				// --no-clean-on-failure. What this run built before the failure is still
 				// there, and a half-built platform is not one anybody can call usable.
 				fail.Outcome = CleanDisabled
-				if e.Hook == nil {
-					fmt.Fprintln(e.Out, ui.Warn(
-						"--no-clean-on-failure: leaving what this run built in place. Nothing was rolled "+
-							"back. `rackctl destroy` removes it."))
-				}
+				e.notice(ui.Warn(
+					"--no-clean-on-failure: leaving what this run built in place. Nothing was rolled " +
+						"back. `rackctl destroy` removes it."))
 			default:
 				// The phase that FAILED is torn down too. It failed partway, which
 				// means it may have created resources before it died — a terragrunt
@@ -264,12 +298,12 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 				// behind, because its Teardown (which destroys the component) was
 				// never called.
 				fail.Outcome = RolledBack
-				if tf := e.teardown(ctx, st, append(completed, p)); len(tf) > 0 {
+				if tf := e.teardown(ctx, st, append(completed, i)); len(tf) > 0 {
 					// A teardown that could not finish leaves billable resources standing,
 					// which is the outcome the rollback exists to prevent — so it travels
-					// with the phase failure rather than only being printed. Under a Hook
-					// nothing is printed at all, so returning it is the only way the
-					// operator hears about it.
+					// with the phase failure rather than only being printed: under a Hook the
+					// printed lines reach the transcript, not the screen, so the returned
+					// error is what the operator reads.
 					fail.Outcome, fail.TeardownErrs = Stranded, tf
 				}
 			}
@@ -277,23 +311,29 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 		}
 		ev.Status = StatusOK
 		e.report(ev, ui.OK(label))
-		completed = append(completed, p)
+		completed = append(completed, i)
 	}
 	// A platform whose optional layers failed is still a platform, and saying so is not
 	// the same as calling the run a success. Both, in that order.
 	if len(optionalFailed) > 0 {
-		if e.Hook == nil {
-			fmt.Fprintln(e.Out, ui.Warn(
-				"the core platform is up; optional phases failed and are listed below. Nothing "+
-					"was rolled back."))
-		}
+		e.notice(ui.Warn(
+			"the core platform is up; optional phases failed and are listed below. Nothing " +
+				"was rolled back."))
 		return e.finish(ctx, st, &RunError{Outcome: LeftStanding, Reason: ReasonOptional,
 			Err: errors.Join(optionalFailed...)})
 	}
-	if e.Hook == nil {
-		fmt.Fprintln(e.Out, ui.OK("platform is up — hand off to the portal for day-2 operations"))
-	}
+	e.notice(ui.OK(SuccessLine(st.Config)))
 	return nil
+}
+
+// SuccessLine is what a run that finished says. The portal is named only when this config
+// installs one: an operator told to hand off to a portal that was never installed has
+// nowhere to go.
+func SuccessLine(cfg *config.Config) string {
+	if cfg != nil && cfg.ControlPlane.Portal {
+		return "platform is up — hand off to the portal for day-2 operations"
+	}
+	return "platform is up — `rackctl check` reports its health"
 }
 
 // finish stamps what is true of the whole run onto a failure: whether it was a plan, and
@@ -304,12 +344,31 @@ func (e *Engine) finish(ctx context.Context, st *State, fail *RunError) error {
 	return fail
 }
 
+// report writes a phase transition to Out and hands it to the Hook.
 func (e *Engine) report(ev Event, line string) {
+	e.print(line)
 	if e.Hook != nil {
 		e.Hook(ev)
-		return
 	}
-	fmt.Fprintln(e.Out, line)
+}
+
+// notice writes a line the operator must see to Out and hands it to the Hook.
+func (e *Engine) notice(line string) { e.emit(Event{Notice: line}) }
+
+// posture is the notice that says whether a failure will roll back.
+func (e *Engine) posture(line string) { e.emit(Event{Notice: line, Posture: true}) }
+
+func (e *Engine) emit(ev Event) {
+	e.print(ev.Notice)
+	if e.Hook != nil {
+		e.Hook(ev)
+	}
+}
+
+func (e *Engine) print(line string) {
+	if e.Out != nil {
+		fmt.Fprintln(e.Out, line)
+	}
 }
 
 // teardownBudget bounds a whole rollback. It is a reverse walk of the completed phases,
@@ -341,19 +400,17 @@ const teardownBudget = 3 * time.Hour
 //
 // Detaching keeps a ceiling rather than removing one. An operator who wants out during a
 // rollback interrupts a second time, which takes the default signal disposition.
-func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) []error {
+func (e *Engine) teardown(parent context.Context, st *State, completed []int) []error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), teardownBudget)
 	defer cancel()
 
-	if e.Hook == nil {
-		// A plan provisioned nothing, so its teardown is the walk a rollback WOULD take, and
-		// says so rather than announcing a demolition that is not happening.
-		if st.Runner != nil && st.Runner.DryRun {
-			fmt.Fprintln(e.Out, ui.Warn("failure detected — plan only: would roll back provisioned resources "+
-				"(nothing is destroyed)"))
-		} else {
-			fmt.Fprintln(e.Out, ui.Warn("failure detected — rolling back provisioned resources"))
-		}
+	// A plan provisioned nothing, so its teardown is the walk a rollback WOULD take, and
+	// says so rather than announcing a demolition that is not happening.
+	if st.Runner != nil && st.Runner.DryRun {
+		e.emit(Event{Rollback: true, Notice: ui.Warn("failure detected — plan only: would roll back provisioned resources " +
+			"(nothing is destroyed)")})
+	} else {
+		e.emit(Event{Rollback: true, Notice: ui.Warn("failure detected — rolling back provisioned resources")})
 	}
 
 	// Let the controllers delete what they — not Terraform — created, while they are
@@ -424,17 +481,19 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) 
 	// says nothing about the ones behind it, and stopping at the first would strand them.
 	// Same posture as `rackctl destroy`.
 	var failed []error
-	for i := len(completed) - 1; i >= 0; i-- {
-		p := completed[i]
-		if e.Hook == nil {
-			fmt.Fprintln(e.Out, ui.Step("teardown: "+p.Title()))
-		}
+	for j := len(completed) - 1; j >= 0; j-- {
+		i := completed[j]
+		p := e.Phases[i]
+		ev := Event{Index: i + 1, Total: len(e.Phases), ID: p.ID(), Title: p.Title()}
+		e.print(ui.Step("teardown: " + p.Title()))
 		if err := p.Teardown(ctx, st); err != nil {
 			failed = append(failed, fmt.Errorf("teardown %s: %w", p.ID(), err))
-			if e.Hook == nil {
-				fmt.Fprintln(e.Out, ui.Fail("teardown "+p.ID()+": "+err.Error()))
-			}
+			ev.Status, ev.Err = StatusTeardownFail, err
+			e.report(ev, ui.Fail("teardown "+p.ID()+": "+err.Error()))
+			continue
 		}
+		ev.Status = StatusTornDown
+		e.report(ev, ui.OK("torn down: "+p.Title()))
 	}
 	// Which guards held, said once at the end. A guard that failed or did not run can leave a
 	// Karpenter node billing or an operator role standing, which is a rollback that did not
@@ -445,10 +504,8 @@ func (e *Engine) teardown(parent context.Context, st *State, completed []Phase) 
 		reap.Summarize(e.Out, st.Backstops)
 	}
 	if unheld := reap.Unheld(st.Backstops); len(unheld) > 0 {
-		if e.Out != nil {
-			fmt.Fprintln(e.Out, ui.Warn("not every backstop ran clean — resources outside terraform's state "+
-				"may remain; the summary above names which"))
-		}
+		e.notice(ui.Warn("not every backstop ran clean — resources outside terraform's state " +
+			"may remain; the summary above names which"))
 		failed = append(failed, fmt.Errorf("these backstops did not hold: %s", strings.Join(unheld, ", ")))
 	}
 	return failed

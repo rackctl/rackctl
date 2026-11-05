@@ -31,6 +31,7 @@ On a failed phase, `rackctl apply` tears down the phases it completed, in revers
 |---|---|---:|---|
 | `failure detected — rolling back provisioned resources` | The rollback ran. Cloud created by this run is being destroyed. | `6`, or `7` | Wait for it to finish. If it reports `the rollback did not complete`, see *A teardown that stopped partway*. |
 | `failure detected — plan only: would roll back provisioned resources` | A `rackctl plan` failed. Nothing was created and nothing is destroyed; this is the walk an apply would take. | `1` | Fix the failure and plan again. |
+| `existing platform detected — plan only: apply would NOT roll back a failure over it`, or `could not determine whether a platform already exists — plan only: apply would NOT roll back` | A `rackctl plan` asked EKS for real and found an apply would not roll back. Nothing was created. | `1` | Expected on a re-apply. On a first install, fix credentials or connectivity before applying. |
 | `existing platform detected — a failure will NOT roll it back` | The platform was already up before this run. Nothing was destroyed. | `5` | Fix the failure and re-run `rackctl apply`. It is re-runnable. |
 | `could not determine whether a platform already exists — rollback is DISABLED` | The EKS list call failed, so rackctl could not tell a fresh install from a re-apply, and fails closed. Nothing was destroyed, and a half-built first install may be standing. | `7` | Fix credentials or connectivity, then `rackctl check`; re-run, or `rackctl destroy` what was built. |
 | `--no-clean-on-failure: leaving what this run built in place` | The rollback was turned off. What the run built before the failure is still there. | `7` | `rackctl destroy` to remove it, or fix and re-run. |
@@ -111,6 +112,10 @@ it does. Then the rollback runs. **The second Ctrl-C forces exit**: rackctl kill
 it started, process group and all, starts nothing more, and exits `7`, because the unwind
 did not finish and what the run built may remain. Use it only if the unwind itself has hung.
 
+Under `--tui`, `q` does the same, and the footer says so before you press it. The first `q`
+stops the run and keeps the view up while the rollback runs to its end, each phase it undoes
+marked torn down; the second `q` forces exit, exactly as a second Ctrl-C does.
+
 An interrupted run exits `8` when its unwind finished, and `7` when it did not; the message
 starts with `interrupted:` either way. An interrupted `rackctl destroy` exits `8` only when
 nothing had been destroyed yet. Once the teardown has begun it leaves components standing,
@@ -178,8 +183,10 @@ problem surfaces later.
 transcript: ~/.rackctl/<org>/logs/apply-1234567890.log
 ```
 
-The most recent line is also rendered under the running phase, so a long wait shows what it
-is waiting on. Without `--tui`, output goes to stdout as it happens and no transcript is
+The transcript also carries every line the run prints without `--tui`: the rollback
+posture, a platform left standing, the rollback and each teardown. Those lines are printed
+again after the view exits. The most recent line is rendered under the running phase, so a
+long wait shows what it is waiting on. Without `--tui`, output goes to stdout as it happens and no transcript is
 written.
 
 ## Diagnosing after the fact

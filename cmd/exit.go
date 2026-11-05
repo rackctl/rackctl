@@ -135,6 +135,11 @@ func classifyRun(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
+	// A forced exit abandoned the unwind, whatever it was, so nobody can vouch for what is
+	// left.
+	if errors.Is(err, tui.ErrForced) {
+		return withExit(ExitStranded, err)
+	}
 	interrupted := ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, tui.ErrAborted)
 	var run *engine.RunError
 	if !errors.As(err, &run) {
