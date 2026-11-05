@@ -320,21 +320,14 @@ func CheckBucketNames(ctx context.Context, env *Env) doctor.Result {
 		}
 	}
 
-	if len(tooLong) == 0 {
-		switch {
-		case listErr != nil:
-			return warn(name, "could not list this account's buckets ("+truncate(listErr.Error(), 160)+
-				") — without that, a bucket that already exists cannot be told apart as this account's or "+
-				"another's, so name collisions are UNCHECKED for this run. Lengths were checked and fit")
-		case len(ours) > 0 && clusterErr != nil:
-			return warn(name, fmt.Sprintf(
-				"these buckets already exist in this account — %s — and whether %s is live could not be "+
-					"read (%s). A live cluster makes them its own; a missing one makes them wreckage. "+
-					"UNCHECKED: fix the credentials or connectivity and re-run.",
-				strings.Join(ours, ", "), clusterName(cfg), truncate(clusterErr.Error(), 120)))
-		}
+	if len(tooLong) == 0 && listErr != nil {
+		return warn(name, "could not list this account's buckets ("+truncate(listErr.Error(), 160)+
+			") — without that, a bucket that already exists cannot be told apart as this account's or "+
+			"another's, so name collisions are UNCHECKED for this run. Lengths were checked and fit")
 	}
 
+	// The order below is the order of how recoverable each finding is. A name another account
+	// owns is decided by S3 alone, so no unanswered cluster read can soften it into a warning.
 	switch {
 	case len(tooLong) > 0:
 		return fail(name, fmt.Sprintf(
@@ -348,6 +341,12 @@ func CheckBucketNames(ctx context.Context, env *Env) doctor.Result {
 				"is global, so these names are gone and nothing you delete here will free them. The "+
 				"only fix is a different cluster.name. (Discovering this at apply time costs a VPC and "+
 				"an EKS control plane first.)", strings.Join(taken, ", ")))
+	case len(ours) > 0 && clusterErr != nil:
+		return warn(name, fmt.Sprintf(
+			"these buckets already exist in this account — %s — and whether %s is live could not be "+
+				"read (%s). A live cluster makes them its own; a missing one makes them wreckage. "+
+				"UNCHECKED: fix the credentials or connectivity and re-run.",
+			strings.Join(ours, ", "), clusterName(cfg), truncate(clusterErr.Error(), 120)))
 	case len(ours) > 0:
 		return fail(name, fmt.Sprintf(
 			"these buckets already exist in this account and %s is not live — %s. They are wreckage "+

@@ -209,6 +209,26 @@ esac`)
 	mustWarn(t, CheckBucketNames(context.Background(), testEnv()), "velero", "AccessDenied")
 }
 
+// A name another account owns is decided by S3 alone. A leftover of this account's and an
+// unreadable cluster beside it must not soften that refusal into the unchecked warning.
+func TestBucketNames_AnotherAccountsBucketFailsWhateverTheClusterRead(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "s3api list-buckets")   echo "development-platform-111122223333-us-west-2-velero" ;;
+  "eks describe-cluster") `+denied+` ;;
+  "s3api head-bucket")
+    case "$4" in
+      *-loki) echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2; exit 254 ;;
+      *)      `+s3Absent+` ;;
+    esac ;;
+esac`)
+	r := CheckBucketNames(context.Background(), testEnv())
+	mustFail(t, r, "NOT owned by this account")
+	if !strings.Contains(r.Detail, "-loki") {
+		t.Errorf("the refusal must name the taken bucket:\n%s", r.Detail)
+	}
+}
+
 // An account-scoped bucket alongside an unanswered probe still warns, and names both.
 func TestBucketNames_SharedWarningCarriesUnansweredProbes(t *testing.T) {
 	fakeBin(t, "aws", `
