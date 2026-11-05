@@ -70,14 +70,23 @@ func CheckSessionLifetime(ctx context.Context, env *Env) doctor.Result {
 	raw, err := env.Run.Capture(ctx, "aws", "configure", "export-credentials",
 		"--profile", env.Cfg.Cloud.Profile, "--format", "process")
 	if err != nil {
-		// Static credentials, an instance role, or an env-var pair have no expiry to read and
-		// no expiry to worry about. Not being able to answer is not the same as a short session.
-		return ok(name, "no expiring session credentials to check")
+		// Static credentials, an instance role and an env-var pair all export cleanly and carry
+		// no Expiration, which is the ok branch below. An export that FAILS is something else:
+		// an SSO token that can no longer be refreshed, a profile that does not resolve. Either
+		// way the session's lifetime went unread, and that is not the same as a long one.
+		return warn(name, "could not read the session's expiry ("+truncate(err.Error(), 160)+
+			") — the session lifetime is UNCHECKED for this run. A token that lapses mid-phase "+
+			"leaves a half-applied run that cannot roll itself back; refresh it with `aws sso login "+
+			"--profile "+env.Cfg.Cloud.Profile+"` and re-run")
 	}
 	var creds struct {
 		Expiration string `json:"Expiration"`
 	}
-	if json.Unmarshal([]byte(raw), &creds) != nil || creds.Expiration == "" {
+	if err := json.Unmarshal([]byte(raw), &creds); err != nil {
+		return warn(name, "could not parse the exported credentials ("+truncate(err.Error(), 80)+
+			") — the session lifetime is UNCHECKED for this run")
+	}
+	if creds.Expiration == "" {
 		return ok(name, "credentials carry no expiry")
 	}
 	exp, err := time.Parse(time.RFC3339, creds.Expiration)
@@ -246,24 +255,36 @@ func CheckBucketNames(ctx context.Context, env *Env) doctor.Result {
 	// Every bucket this account already owns, in one call. list-buckets is global and returns
 	// buckets in every region regardless of the --region flag, which is exactly the property
 	// that makes a name-pattern sweep cross regions whether it means to or not.
+	//
+	// When it fails, ownership is unknown for every name, and head-bucket alone cannot tell
+	// this account's bucket from another's — both answer. The length check still stands; the
+	// collision check does not, and the verdict says so rather than guessing.
 	owned := map[string]bool{}
-	if raw, err := env.Run.Capture(ctx, "aws", "s3api", "list-buckets",
-		"--query", "Buckets[].Name", "--output", "text"); err == nil {
+	raw, listErr := env.Run.Capture(ctx, "aws", "s3api", "list-buckets",
+		"--query", "Buckets[].Name", "--output", "text")
+	if listErr == nil {
 		for _, b := range strings.Fields(raw) {
 			owned[b] = true
 		}
 	}
 
-	// A live cluster means this is a re-apply and its own buckets are not collisions.
+	// A live cluster means this is a re-apply and its own buckets are not collisions. Only
+	// ResourceNotFoundException says the cluster is absent; any other error leaves it unknown.
 	reapply := false
+	var clusterErr error
 	if _, err := env.aws(ctx, "eks", "describe-cluster", "--name", clusterName(cfg), "--query", "cluster.status"); err == nil {
 		reapply = true
+	} else if !eksNotFound(err) {
+		clusterErr = err
 	}
 
-	var tooLong, taken, ours, shared []string
+	var tooLong, taken, ours, shared, unchecked []string
 	for _, b := range planned {
 		if len(b.name) > 63 {
 			tooLong = append(tooLong, fmt.Sprintf("%s (%d chars, %s)", b.name, len(b.name), b.owner))
+			continue
+		}
+		if listErr != nil {
 			continue
 		}
 		if owned[b.name] {
@@ -282,11 +303,35 @@ func CheckBucketNames(ctx context.Context, env *Env) doctor.Result {
 			}
 			continue
 		}
-		// Not ours. Ask S3 whether it exists at all — a 403 means it does and belongs to
-		// another account, which no cleanup here can undo.
-		if _, err := env.Run.Capture(ctx, "aws", "s3api", "head-bucket", "--bucket", b.name); err == nil {
-			// Reachable and not in list-buckets: an access grant rather than ownership.
+		// Not ours. Ask S3 whether it exists at all. A 404 is free. A 200 is reachable and
+		// not in list-buckets — an access grant rather than ownership. A 403 is a bucket that
+		// exists in another account, which no cleanup here can undo. Anything else is a probe
+		// that did not answer.
+		_, err := env.Run.Capture(ctx, "aws", "s3api", "head-bucket", "--bucket", b.name)
+		switch {
+		case err == nil:
 			taken = append(taken, fmt.Sprintf("%s (%s)", b.name, b.owner))
+		case strings.Contains(err.Error(), "(403)") || strings.Contains(err.Error(), "Forbidden"):
+			taken = append(taken, fmt.Sprintf("%s (%s)", b.name, b.owner))
+		case s3NotFound(err):
+			// free
+		default:
+			unchecked = append(unchecked, fmt.Sprintf("%s (%s)", b.name, truncate(err.Error(), 80)))
+		}
+	}
+
+	if len(tooLong) == 0 {
+		switch {
+		case listErr != nil:
+			return warn(name, "could not list this account's buckets ("+truncate(listErr.Error(), 160)+
+				") — without that, a bucket that already exists cannot be told apart as this account's or "+
+				"another's, so name collisions are UNCHECKED for this run. Lengths were checked and fit")
+		case len(ours) > 0 && clusterErr != nil:
+			return warn(name, fmt.Sprintf(
+				"these buckets already exist in this account — %s — and whether %s is live could not be "+
+					"read (%s). A live cluster makes them its own; a missing one makes them wreckage. "+
+					"UNCHECKED: fix the credentials or connectivity and re-run.",
+				strings.Join(ours, ", "), clusterName(cfg), truncate(clusterErr.Error(), 120)))
 		}
 	}
 
@@ -325,9 +370,22 @@ func CheckBucketNames(ctx context.Context, env *Env) doctor.Result {
 				"shared by every environment, so if another environment is already installed here "+
 				"this is the expected steady state and the apply will adopt them through their own "+
 				"state. If this is the first install in this account, they are wreckage from an "+
-				"earlier attempt and the org roots will fail at create.", strings.Join(shared, ", ")))
+				"earlier attempt and the org roots will fail at create.%s", strings.Join(shared, ", "),
+			uncheckedNames(unchecked)))
+	}
+	if len(unchecked) > 0 {
+		return warn(name, strings.TrimSpace(uncheckedNames(unchecked)))
 	}
 	return ok(name, fmt.Sprintf("all %d bucket names are free", len(planned)))
+}
+
+// uncheckedNames renders the bucket probes S3 did not answer, or nothing when it answered all.
+func uncheckedNames(unchecked []string) string {
+	if len(unchecked) == 0 {
+		return ""
+	}
+	return " S3 did not answer for " + strings.Join(unchecked, ", ") +
+		", so whether those names are free is UNCHECKED."
 }
 
 // ─────────────────────────── route53 ───────────────────────────
@@ -349,7 +407,7 @@ func CheckHostedZone(ctx context.Context, env *Env) doctor.Result {
 
 	cfg := env.Cfg
 	if cfg.DNS == nil || cfg.DNS.HostedZone == "" {
-		return ok(name, "no dns block — the dns component is not applied")
+		return skip(name, "no dns block — the dns component is not applied")
 	}
 	want := strings.TrimSuffix(cfg.DNS.HostedZone, ".") + "."
 
@@ -487,12 +545,20 @@ func CheckBedrockLogging(ctx context.Context, env *Env) doctor.Result {
 
 	cfg := env.Cfg
 	if !cfg.AgentPlatform.Enabled() {
-		return ok(name, "agent platform disabled — the bedrock component is not applied")
+		return skip(name, "agent platform disabled — the bedrock component is not applied")
 	}
 
 	bucket, err := env.aws(ctx, "bedrock", "get-model-invocation-logging-configuration",
 		"--query", "loggingConfig.s3Config.bucketName")
-	if err != nil || bucket == "" || bucket == "None" {
+	if err != nil {
+		// Unread is not unconfigured. The singleton this guards is account-global, and reading
+		// a denied or throttled call as "nothing configured" waves through the takeover the
+		// check exists to stop.
+		return warn(name, "could not read the Bedrock invocation logging configuration in "+cfg.Cloud.Region+
+			" ("+truncate(err.Error(), 160)+") — whether this run would repoint another estate's "+
+			"logging is UNCHECKED")
+	}
+	if bucket == "" || bucket == "None" {
 		return ok(name, "no invocation logging configured in "+cfg.Cloud.Region)
 	}
 
@@ -560,7 +626,7 @@ func CheckCostAllocationTags(ctx context.Context, env *Env) doctor.Result {
 	const name = "cost allocation"
 
 	if !env.Cfg.AgentPlatform.Enabled() {
-		return ok(name, "agent platform disabled — no budget pipeline to feed")
+		return skip(name, "agent platform disabled — no budget pipeline to feed")
 	}
 
 	// Cost Explorer is global and only answers in us-east-1, whatever the deployment region is.

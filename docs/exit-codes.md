@@ -48,6 +48,19 @@ rackctl check -c rackctl.yaml --output json | jq '.preflight[] | select(.status=
 }
 ```
 
+Each result's `status` is one of:
+
+| Status | Meaning |
+|---|---|
+| `ok` | The check asked its question and the answer is good. |
+| `warn` | Worth reading, and not a reason to refuse. This includes a read that did not answer: a check that could not find out says so here, naming what went unchecked, rather than reporting `ok`. |
+| `fail` | The install would not succeed, or the platform is unhealthy. `passed` is false. |
+| `skip` | The check does not apply to this config — a disabled feature asked nothing. `passed` treats it like `ok`, because nothing failed. |
+
+A consumer that filtered on `status=="ok"` to mean "not a problem" should read `skip` the
+same way. Checks for disabled features reported `ok` before `skip` existed; they now report
+`skip`, so a filter that accepts only `ok` counts them as findings.
+
 `clusterHealth` is `asserted`, `unreachable`, `wrong-cluster` or `not-asserted`. It is
 load-bearing: an empty `platform` list means "no findings" only when `clusterHealth` is
 `asserted` — otherwise it means nobody looked, and the two are the same document without it.

@@ -57,6 +57,34 @@ func ok(n, d string) doctor.Result   { return doctor.Result{Name: n, Status: doc
 func warn(n, d string) doctor.Result { return doctor.Result{Name: n, Status: doctor.Warn, Detail: d} }
 func fail(n, d string) doctor.Result { return doctor.Result{Name: n, Status: doctor.Fail, Detail: d} }
 
+// skip is the verdict for a check that does not apply to this config. It is not ok: ok says
+// a question was asked and answered well, and a disabled feature asked nothing. A consumer
+// filtering on status still reads skip as passing, because nothing failed.
+func skip(n, d string) doctor.Result { return doctor.Result{Name: n, Status: doctor.Skip, Detail: d} }
+
+// eksNotFound reports whether an EKS error is the service answering "no such cluster".
+// Anything else — AccessDenied, a throttle, an expired token — means the question went
+// unanswered, and reading that as an absent cluster picks the answer that lets a run proceed.
+func eksNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "ResourceNotFoundException")
+}
+
+// s3NotFound reports whether an S3 error is the service answering "not there": a missing key
+// or a missing bucket. A 403 is NOT absence — S3 answers 403 for an object or bucket the
+// caller may not read, which says nothing about whether it exists.
+func s3NotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, m := range []string{"(404)", "NoSuchKey", "NoSuchBucket", "Not Found"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // Run executes every check and returns results in a stable order. Like doctor, it does
 // not stop at the first failure: the whole point is to hand back the complete list of
 // what must be cleared, so it can be cleared in one pass rather than one run per bug.
@@ -176,36 +204,84 @@ func CheckStaleState(ctx context.Context, env *Env) doctor.Result {
 	envName := string(cfg.Environment)
 	bucket := fmt.Sprintf("%s-%s-tfstate", cfg.Cloud.AccountID, cfg.Cloud.Region)
 
-	// Does the cluster the state describes actually exist?
-	clusterLive := true
+	// Does the cluster the state describes actually exist? Only ResourceNotFoundException
+	// says no. Any other error leaves the question open, and a failure verdict built on an
+	// unanswered describe would send an operator to destroy a platform that is standing.
+	clusterLive, clusterKnown := true, true
+	var clusterErr error
 	if _, err := env.aws(ctx, "eks", "describe-cluster", "--name", clusterName(cfg), "--query", "cluster.status"); err != nil {
-		clusterLive = false
+		if eksNotFound(err) {
+			clusterLive = false
+		} else {
+			clusterKnown, clusterErr = false, err
+		}
 	}
 
-	var stale []string
+	var stale, unread []string
 	for _, comp := range phases.CoreComponents(cfg) {
 		key := fmt.Sprintf("%s/aws/workload-%s/%s/%s/%s/terraform.tfstate",
 			envName, envName, cfg.Cloud.Region, envName, comp)
 
-		// s3 cp to stdout: absent state is the normal case on a clean account.
+		// s3 cp to stdout: absent state is the normal case on a clean account. Absent means
+		// S3 said so — a 404 or NoSuchKey. A 403 or a network fault is a state object this
+		// check did not read, and counting it as "no state" reports a clean provision over
+		// state nobody looked at.
 		raw, err := env.Run.Capture(ctx, "aws", "s3", "cp",
 			"s3://"+bucket+"/"+key, "-", "--region", cfg.Cloud.Region)
-		if err != nil || strings.TrimSpace(raw) == "" {
+		if err != nil {
+			if !s3NotFound(err) {
+				unread = append(unread, comp+" ("+truncate(err.Error(), 120)+")")
+			}
+			continue
+		}
+		if strings.TrimSpace(raw) == "" {
 			continue
 		}
 		var st tfState
-		if json.Unmarshal([]byte(raw), &st) != nil || len(st.Resources) == 0 {
+		if err := json.Unmarshal([]byte(raw), &st); err != nil {
+			unread = append(unread, comp+" (state is not readable JSON: "+truncate(err.Error(), 80)+")")
+			continue
+		}
+		if len(st.Resources) == 0 {
 			continue
 		}
 		stale = append(stale, fmt.Sprintf("%s (%d)", comp, len(st.Resources)))
 	}
 
+	// What this check does not cover, said rather than implied. The agent-platform tree keeps
+	// its state in its own bucket, which this check does not read.
+	var scope string
+	if cfg.AgentPlatform.Enabled() {
+		scope = " The agent-platform tree's own backend (" +
+			fmt.Sprintf("eks-agent-platform-tfstate-%s-%s", cfg.Cloud.AccountID, cfg.Cloud.Region) +
+			") is not covered by this check."
+	}
+	var unreadNote string
+	if len(unread) > 0 {
+		unreadNote = " State could not be read for " + strings.Join(unread, ", ") +
+			", so those components are UNCHECKED, not confirmed empty."
+	}
+
+	if len(stale) > 0 && !clusterKnown {
+		return warn(name, fmt.Sprintf(
+			"these components hold state — %s — but whether %s still exists could not be read (%s). "+
+				"A live cluster makes this a re-apply and a missing one makes it a partly torn-down "+
+				"platform; the check cannot tell which, so it is UNCHECKED. Fix the credentials or "+
+				"connectivity and re-run.%s%s",
+			strings.Join(stale, ", "), clusterName(cfg), truncate(clusterErr.Error(), 160), unreadNote, scope))
+	}
+	// Unread state is a warning unless the failure below is already the verdict, which then
+	// carries the same note.
+	if len(unread) > 0 && (len(stale) == 0 || clusterLive) {
+		return warn(name, strings.TrimSpace(unreadNote)+scope)
+	}
+
 	switch {
 	case len(stale) == 0:
-		return ok(name, "no state — a clean provision")
+		return ok(name, "no state — a clean provision."+scope)
 	case clusterLive:
 		// State AND cluster exist: this is a re-apply, which is legitimate.
-		return ok(name, fmt.Sprintf("%s exists and state tracks it", clusterName(cfg)))
+		return ok(name, fmt.Sprintf("%s exists and state tracks it.%s", clusterName(cfg), scope))
 	default:
 		// The cluster is gone but components still hold state. Do NOT assume the state is
 		// stale and tell the operator to purge it.
@@ -227,8 +303,8 @@ func CheckStaleState(ctx context.Context, env *Env) doctor.Result {
 				"exist and still be billing. Run `rackctl destroy` first; it tears "+
 				"down what is actually there. Purge the state objects under s3://%s/%s/ ONLY "+
 				"if destroy leaves state behind with no resources under it — purging state "+
-				"that still tracks live resources orphans them permanently.",
-			clusterName(cfg), strings.Join(stale, ", "), bucket, envName))
+				"that still tracks live resources orphans them permanently.%s",
+			clusterName(cfg), strings.Join(stale, ", "), bucket, envName, unreadNote))
 	}
 }
 
@@ -269,8 +345,22 @@ func CheckCollisions(ctx context.Context, env *Env) doctor.Result {
 		}
 	}
 
-	var found []string
+	var found, unread []string
 	add := func(what string) { found = append(found, what) }
+	// A probe that errored did not look. Skipping it silently and reporting "no orphans"
+	// over the rest is a clean verdict resting on fewer observations than it claims.
+	missed := func(what string, err error) {
+		unread = append(unread, what+" ("+truncate(err.Error(), 100)+")")
+	}
+	// count reads a `length(...)` answer. An unparseable one is a probe that did not answer.
+	count := func(what, out string) (int, bool) {
+		n, err := strconv.Atoi(strings.TrimSpace(out))
+		if err != nil {
+			unread = append(unread, fmt.Sprintf("%s (unreadable count %q)", what, truncate(out, 40)))
+			return 0, false
+		}
+		return n, true
+	}
 
 	// KMS aliases — the create-time conflict that cannot be retried out of.
 	//
@@ -285,8 +375,13 @@ func CheckCollisions(ctx context.Context, env *Env) doctor.Result {
 		"alias/" + envName + "-platform-secrets",
 		"alias/" + cluster + "-alerts", // observability's alert-topic CMK
 	} {
-		if out, err := env.aws(ctx, "kms", "list-aliases", "--query",
-			fmt.Sprintf("length(Aliases[?AliasName=='%s'])", alias)); err == nil && strings.TrimSpace(out) != "0" {
+		out, err := env.aws(ctx, "kms", "list-aliases", "--query",
+			fmt.Sprintf("length(Aliases[?AliasName=='%s'])", alias))
+		if err != nil {
+			missed("KMS "+alias, err)
+			continue
+		}
+		if n, ok := count("KMS "+alias, out); ok && n > 0 {
 			add("KMS " + alias)
 		}
 	}
@@ -294,35 +389,54 @@ func CheckCollisions(ctx context.Context, env *Env) doctor.Result {
 	// The EKS audit log group. Terraform owns it, so it is deleted on a real destroy —
 	// but it survives a console delete, and then the cluster apply hits
 	// ResourceAlreadyExistsException.
+	lg := "log group /aws/eks/" + cluster + "/cluster"
 	if out, err := env.aws(ctx, "logs", "describe-log-groups",
 		"--log-group-name-prefix", "/aws/eks/"+cluster+"/cluster",
-		"--query", "length(logGroups)"); err == nil && strings.TrimSpace(out) != "0" {
-		add("log group /aws/eks/" + cluster + "/cluster")
+		"--query", "length(logGroups)"); err != nil {
+		missed(lg, err)
+	} else if n, ok := count(lg, out); ok && n > 0 {
+		add(lg)
 	}
 
-	// Karpenter's interruption queue.
+	// Karpenter's interruption queue. An account with no matching queue answers with no
+	// QueueUrls key at all, and length() of a missing key is a query error rather than a
+	// zero — so the query supplies the empty list itself, and an error then means the call
+	// failed rather than that the queue is absent.
+	q := "SQS Karpenter-" + cluster
 	if out, err := env.aws(ctx, "sqs", "list-queues",
-		"--queue-name-prefix", "Karpenter-"+cluster, "--query", "length(QueueUrls)"); err == nil &&
-		strings.TrimSpace(out) != "0" && strings.TrimSpace(out) != "" {
-		add("SQS Karpenter-" + cluster)
+		"--queue-name-prefix", "Karpenter-"+cluster, "--query", "length(QueueUrls || `[]`)"); err != nil {
+		missed(q, err)
+	} else if n, ok := count(q, out); ok && n > 0 {
+		add(q)
 	}
 
 	// IAM roles the cluster and the operator mint. The operator's tenant baseline policy
 	// attaches to two roles, so a stale one also blocks agent-iam on DeleteConflict.
+	roles := "IAM roles named " + envName + "-*"
 	if out, err := env.Run.Capture(ctx, "aws", "iam", "list-roles", "--query",
-		fmt.Sprintf("length(Roles[?starts_with(RoleName,'%s-')])", envName), "--output", "text"); err == nil {
-		if n, _ := strconv.Atoi(strings.TrimSpace(out)); n > 0 {
-			add(fmt.Sprintf("%d IAM role(s) named %s-*", n, envName))
-		}
+		fmt.Sprintf("length(Roles[?starts_with(RoleName,'%s-')])", envName), "--output", "text"); err != nil {
+		missed(roles, err)
+	} else if n, ok := count(roles, out); ok && n > 0 {
+		add(fmt.Sprintf("%d IAM role(s) named %s-*", n, envName))
 	}
 
 	// The cluster's OIDC provider outlives it.
 	if out, err := env.Run.Capture(ctx, "aws", "iam", "list-open-id-connect-providers",
 		"--query", fmt.Sprintf("length(OpenIDConnectProviderList[?contains(Arn,'oidc.eks.%s')])", cfg.Cloud.Region),
-		"--output", "text"); err == nil && strings.TrimSpace(out) != "0" {
+		"--output", "text"); err != nil {
+		missed("EKS OIDC provider", err)
+	} else if n, ok := count("EKS OIDC provider", out); ok && n > 0 {
 		add("EKS OIDC provider")
 	}
 
+	var unreadNote string
+	if len(unread) > 0 {
+		unreadNote = " These probes did not answer, so they are UNCHECKED, not confirmed clear: " +
+			strings.Join(unread, ", ") + "."
+	}
+	if len(found) == 0 && len(unread) > 0 {
+		return warn(name, strings.TrimSpace(unreadNote))
+	}
 	if len(found) == 0 {
 		return ok(name, "no orphans from a previous run")
 	}
@@ -330,7 +444,7 @@ func CheckCollisions(ctx context.Context, env *Env) doctor.Result {
 		"a previous cluster left resources that will collide on create — %s. Note that "+
 			"scheduling a KMS key for deletion does NOT free its alias: the alias must be "+
 			"deleted explicitly or the next install fails on AliasAlreadyExists against a key "+
-			"that can no longer be revived.", strings.Join(found, ", ")))
+			"that can no longer be revived.%s", strings.Join(found, ", "), unreadNote))
 }
 
 // ─────────────────────────── soft-deleted secrets ───────────────────────────
@@ -461,7 +575,7 @@ func CheckGitHubToken(ctx context.Context, env *Env) doctor.Result {
 
 	repo := env.Cfg.Org.GitOps.TenantsRepo
 	if repo == "" {
-		return ok(name, "org.gitops.tenantsRepo is unset — cluster-bootstrap's github provider is never called")
+		return skip(name, "org.gitops.tenantsRepo is unset — cluster-bootstrap's github provider is never called")
 	}
 	if os.Getenv("GITHUB_TOKEN") != "" {
 		return ok(name, "GITHUB_TOKEN is exported")
@@ -512,17 +626,24 @@ func CheckVendFreshness(ctx context.Context, env *Env) doctor.Result {
 		dirs = append(dirs, struct{ repo, dir string }{"eks-fleet", repos.EKSFleet})
 	}
 
-	var behind, diverged []string
+	// examined counts the checkouts this check actually compared with their remote, and
+	// unchecked names the ones it could not, with why. "Current" is a statement about the
+	// examined set only, so the verdict says how large that set was — four `continue`s that
+	// each skipped a repo used to end in "checkouts are current" over a set of zero.
+	var behind, diverged, unchecked, uncloned []string
+	examined := 0
 	prev := env.Run.Dir
 	defer func() { env.Run.Dir = prev }()
 
 	for _, d := range dirs {
 		env.Run.Dir = d.dir
 		if _, err := env.Run.Capture(ctx, "git", "rev-parse", "--git-dir"); err != nil {
-			continue // not cloned yet — init will clone it
+			uncloned = append(uncloned, d.repo) // not cloned yet — init will clone it
+			continue
 		}
 		if _, err := env.Run.Capture(ctx, "git", "fetch", "--quiet", "origin"); err != nil {
-			continue // offline; not preflight's business to fail on
+			unchecked = append(unchecked, d.repo+" (fetch failed: "+truncate(err.Error(), 80)+")")
+			continue
 		}
 		// Both sides in one call. Counting only HEAD..upstream measures lag and is blind
 		// to the case that actually matters: a checkout carrying commits the remote does
@@ -530,14 +651,21 @@ func CheckVendFreshness(ctx context.Context, env *Env) doctor.Result {
 		// the install provisions from code no tag can ever name.
 		out, err := env.Run.Capture(ctx, "git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
 		if err != nil {
+			unchecked = append(unchecked, d.repo+" (cannot compare with upstream: "+truncate(err.Error(), 80)+")")
 			continue
 		}
 		fields := strings.Fields(strings.TrimSpace(out))
-		if len(fields) != 2 {
+		var ahead, lag int
+		var errA, errL error
+		if len(fields) == 2 {
+			ahead, errA = strconv.Atoi(fields[0])
+			lag, errL = strconv.Atoi(fields[1])
+		}
+		if len(fields) != 2 || errA != nil || errL != nil {
+			unchecked = append(unchecked, fmt.Sprintf("%s (unreadable ahead/behind count %q)", d.repo, truncate(out, 40)))
 			continue
 		}
-		ahead, _ := strconv.Atoi(fields[0])
-		lag, _ := strconv.Atoi(fields[1])
+		examined++
 		switch {
 		case ahead > 0:
 			diverged = append(diverged, fmt.Sprintf("%s (+%d/-%d)", d.repo, ahead, lag))
@@ -546,24 +674,34 @@ func CheckVendFreshness(ctx context.Context, env *Env) doctor.Result {
 		}
 	}
 
+	var uncheckedNote string
+	if len(unchecked) > 0 {
+		uncheckedNote = " Not compared with their remote, so UNCHECKED: " + strings.Join(unchecked, ", ") + "."
+	}
+
 	switch {
 	case len(diverged) > 0:
 		return warn(name, fmt.Sprintf(
 			"%s carry local commits their remote does not have — init cannot fast-forward these, so "+
 				"the install provisions from whatever is on disk. Nothing published names that state, "+
-				"which means the run is not reproducible and cannot be tagged.%s",
+				"which means the run is not reproducible and cannot be tagged.%s%s",
 			strings.Join(diverged, ", "),
 			func() string {
 				if len(behind) == 0 {
 					return ""
 				}
 				return " Also behind: " + strings.Join(behind, ", ") + "."
-			}()))
+			}(), uncheckedNote))
 	case len(behind) > 0:
 		return warn(name, fmt.Sprintf(
-			"%s behind their remote — init fast-forwards them", strings.Join(behind, ", ")))
+			"%s behind their remote — init fast-forwards them.%s", strings.Join(behind, ", "), uncheckedNote))
+	case len(unchecked) > 0:
+		return warn(name, fmt.Sprintf("%d of %d checkout(s) compared and current.%s",
+			examined, len(dirs)-len(uncloned), uncheckedNote))
+	case examined == 0:
+		return ok(name, "nothing cloned yet — init clones "+strings.Join(uncloned, ", "))
 	}
-	return ok(name, "checkouts are current")
+	return ok(name, fmt.Sprintf("%d checkout(s) compared with their remote and current", examined))
 }
 
 // ─────────────────────────── cost pipeline prerequisite ───────────────────────────
@@ -603,10 +741,10 @@ func CheckCostPipelinePrerequisite(ctx context.Context, env *Env) doctor.Result 
 	const name = "cost pipeline"
 
 	if !env.Cfg.AgentPlatform.Enabled() {
-		return ok(name, "agent platform is off — no cost roots to apply")
+		return skip(name, "agent platform is off — no cost roots to apply")
 	}
 	if !env.Cfg.AgentPlatform.CostPipelineEnabled() {
-		return ok(name, "agentPlatform.costPipeline is false — cost-pipeline and cost-access are "+
+		return skip(name, "agentPlatform.costPipeline is false — cost-pipeline and cost-access are "+
 			"not applied, so BudgetPolicy has no per-tenant spend to measure")
 	}
 
