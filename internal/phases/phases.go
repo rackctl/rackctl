@@ -715,10 +715,37 @@ func (acquire) Run(ctx context.Context, st *engine.State) error {
 			return err
 		}
 	}
-	// Every component this config will apply must have a live root in the tree just
-	// cloned. This is the first phase at which a tree exists to check, and the last
-	// before anything is provisioned.
-	return assertComponentRoots(st)
+	return assertBeforeSpend(st)
+}
+
+// assertBeforeSpend checks what the trees just cloned must hold for this config to apply.
+// This is the first phase at which a tree exists to check, and the last before anything is
+// provisioned, so each finding here is a refusal that touched nothing.
+func assertBeforeSpend(st *engine.State) error {
+	// Every component this config will apply must have a live root in landing-zone.
+	if err := assertComponentRoots(st); err != nil {
+		return err
+	}
+	// The same holds for the agent-platform tree, which phase 6 applies after a VPC and an
+	// EKS control plane exist. Finding a root missing there costs both and their teardown.
+	if st.Config.AgentPlatform.Enabled() {
+		if err := assertAgentPlatformRoots(st); err != nil {
+			return engine.Refuse(err)
+		}
+	}
+	// portal's datastore declaration is rendered for tenant-substrate in phase 4. A key the
+	// rendering cannot map is refused here, before any tofu run, rather than in phase 4 with
+	// the network and the cluster already built.
+	if st.Config.ControlPlane.Portal {
+		if _, err := portalTenantsVar(st); err != nil {
+			if st.Runner.DryRun {
+				note(st, "PLAN ONLY: %v", err)
+				return nil
+			}
+			return engine.Refuse(err)
+		}
+	}
+	return nil
 }
 
 // --- Phase 2: identity & state backend ---
@@ -760,6 +787,15 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 	// all, so a terragrunt output read here is the only channel.
 	captureOutputs(ctx, st, "network")
 	captureOutputs(ctx, st, "cluster")
+	// Asserted here, where they are produced, rather than in phase 6 where they are first
+	// read: a missing one found there costs the substrate and the GitOps phases on top of
+	// this one, and nothing has converged yet to argue against a rollback.
+	if err := requireOutputs(st, "network", "vpc_id", "private_subnet_ids", "private_route_table_ids"); err != nil {
+		return err
+	}
+	if err := requireOutputs(st, "cluster", "cluster_security_group_id"); err != nil {
+		return err
+	}
 	if err := st.Runner.Run(ctx, "aws", "eks", "update-kubeconfig", "--name", st.Config.ClusterName()); err != nil {
 		return err
 	}
@@ -960,6 +996,9 @@ func (substrate) Run(ctx context.Context, st *engine.State) error {
 		// the only channel for either.
 		if comp == "secrets" {
 			captureOutputs(ctx, st, "secrets")
+			if err := requireOutputs(st, "secrets", "kms_key_arn"); err != nil {
+				return err
+			}
 		}
 		// The zone exists now, so its name servers are readable — and the certificate this
 		// component just requested cannot validate until something points at them.

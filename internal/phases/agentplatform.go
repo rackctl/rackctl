@@ -347,6 +347,23 @@ func needOutput(st *engine.State, key, producer string) (string, error) {
 	return v, nil
 }
 
+// requireOutputs asserts, right after producer's outputs are read, every one of keys that
+// the agent-platform substrate cannot run without. needOutput is where they are consumed, in
+// phase 6; this is where they are produced, and failing here names the producer before the
+// phases in between spend anything on a run that cannot finish. A plan captures nothing, and
+// a config without the agent platform reads none of them.
+func requireOutputs(st *engine.State, producer string, keys ...string) error {
+	if st.Runner.DryRun || !st.Config.AgentPlatform.Enabled() {
+		return nil
+	}
+	for _, k := range keys {
+		if _, err := needOutput(st, k, producer); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // routeTableIDs concatenates the private and public route table lists into the single JSON
 // array agent-egress takes. Public may legitimately be empty — an adopted VPC re-exports no
 // public route tables, and a private-only cluster has none — so only the private half is
@@ -462,7 +479,8 @@ func ensureAgentPlatformBackend(ctx context.Context, st *engine.State) error {
 // which is what the operator's budget reconciler queries — leaving it with no data source at
 // all.
 func applyAgentPlatform(ctx context.Context, st *engine.State) error {
-	const untouched = "nothing in eks-agent-platform/terraform has been applied yet, so nothing needs unwinding"
+	const untouched = "nothing in eks-agent-platform/terraform has been applied yet, so a rollback " +
+		"has nothing of that tree to unwind"
 	clusterEnv, err := agentPlatformEnv(st)
 	if err != nil {
 		return fmt.Errorf("%w. %s", err, untouched)

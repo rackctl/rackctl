@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -98,6 +99,19 @@ func datastoresOf(raw []byte, name string) ([]map[string]any, error) {
 				"be nothing for tenant-substrate to provision, and portal bundles no database, "+
 				"cache or object store of its own (%s)", name)
 		}
+		var unmapped []string
+		for i, d := range cr.Spec.Datastores {
+			unmapped = append(unmapped, unmappedKeys(d, fmt.Sprintf("spec.datastores[%d]", i))...)
+		}
+		if len(unmapped) > 0 {
+			return nil, fmt.Errorf("portal's Platform CR declares datastore key(s) rackctl has no "+
+				"snake_case mapping for: %s. tenant-substrate's variable is a typed object, so an "+
+				"unmapped camelCase key would be dropped by terraform without a word and the setting "+
+				"it carries ignored. The gap is in rackctl's mapping rather than in the CR: landing-zone's "+
+				"scripts/render-tenants.py is the source of truth for it, and the mapping has to follow "+
+				"that renderer before this tenant can be provisioned. Nothing has been applied for it",
+				strings.Join(unmapped, ", "))
+		}
 		out := make([]map[string]any, 0, len(cr.Spec.Datastores))
 		for _, d := range cr.Spec.Datastores {
 			out = append(out, toSnake(d))
@@ -110,7 +124,8 @@ func datastoresOf(raw []byte, name string) ([]map[string]any, error) {
 }
 
 // crToTF maps the CR's camelCase datastore vocabulary onto the variable's snake_case.
-// Only the keys that differ; anything else passes through unchanged.
+// Only the keys that differ; anything else passes through unchanged, so a key that is not
+// here and is not already lowercase is refused by datastoresOf rather than passed through.
 var crToTF = map[string]string{
 	"deletionPolicy":         "deletion_policy",
 	"objectStore":            "object_store",
@@ -128,6 +143,37 @@ var crToTF = map[string]string{
 	"ttlAttribute":           "ttl_attribute",
 	"pointInTimeRecovery":    "point_in_time_recovery",
 	"globalSecondaryIndexes": "global_secondary_indexes",
+}
+
+// unmappedKeys returns the path of every key toSnake would pass through verbatim while it
+// still carries an uppercase letter. It walks the same levels toSnake does, and reads keys
+// only: a value such as `kind: objectStore` is data, not a field name.
+func unmappedKeys(v any, path string) []string {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []string
+	for _, k := range keys {
+		p := path + "." + k
+		if _, mapped := crToTF[k]; !mapped && strings.ToLower(k) != k {
+			out = append(out, p)
+		}
+		switch t := m[k].(type) {
+		case map[string]any:
+			out = append(out, unmappedKeys(t, p)...)
+		case []any:
+			for i, e := range t {
+				out = append(out, unmappedKeys(e, fmt.Sprintf("%s[%d]", p, i))...)
+			}
+		}
+	}
+	return out
 }
 
 func toSnake(v any) map[string]any {

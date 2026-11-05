@@ -36,7 +36,7 @@ See [`examples/rackctl.yaml`](examples/rackctl.yaml) for the full config surface
 | # | Phase | What it does |
 |---|-------|--------------|
 | 0 | preflight | tools, caller identity, EC2 vCPU quota (`apply` files a short quota's increase before its preflight gate, and refuses until AWS grants it) |
-| 1 | acquire | clone `landing-zone` + `eks-agent-platform`, fork `eks-gitops` into the org, then verify a live root exists for every component this config will apply |
+| 1 | acquire | clone `landing-zone` + `eks-agent-platform`, fork `eks-gitops` into the org, then verify a live root exists in both trees for every component this config will apply, and that every key of portal's datastore declaration has a mapping |
 | 2 | identity | versioned S3 tfstate backend |
 | 3 | cluster | VPC → EKS control plane (strict ordering) → kubeconfig |
 | 4 | substrate | `secrets` → `agent-iam` → `managed-monitoring` → `observability` → `dns` → `model-import` → `cluster-addons` — every AWS resource ArgoCD will consume, built before ArgoCD exists |
@@ -62,7 +62,9 @@ than it saves:
   failing. The agent-platform tree is built by then, so this is a convergence failure; a
   failure to apply that tree is a failure to provision, and still rolls back
 - a **refusal issued before anything was applied** — the acquire phase stating that a
-  component this config will apply has no live root in this environment, or the fleet phase
+  component this config will apply has no live root in this environment, in landing-zone or
+  in eks-agent-platform, or that portal's datastore declaration carries a key rackctl cannot
+  map onto tenant-substrate's variable, or the fleet phase
   refusing to install a Crossplane provider whose account-id placeholder did not substitute
 
 Each prints why it stopped and leaves `rackctl destroy` as the explicit next step. A phase

@@ -25,7 +25,15 @@ exit 0
 	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte(aws), 0o755); err != nil {
 		t.Fatalf("write fake aws: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	// `output -json` answers with every output the agent-platform substrate needs, so the
+	// phase's own assertion on them passes.
+	tg := `#!/bin/sh
+if [ "$3" = "output" ]; then
+  echo '{"vpc_id":{"value":"vpc-0abc"},"private_subnet_ids":{"value":["subnet-a"]},"private_route_table_ids":{"value":["rtb-a"]},"cluster_security_group_id":{"value":"sg-0abc"}}'
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "terragrunt"), []byte(tg), 0o755); err != nil {
 		t.Fatalf("write fake terragrunt: %v", err)
 	}
 	// The API answers. TestClusterPhase_AnUnreachableAPIIsLeftStanding replaces it.
@@ -40,9 +48,10 @@ exit 0
 	cfg.Cluster.Network = config.ClusterNet{VPCCIDR: "10.0.0.0/16", NATGateways: 1}
 	// A real directory, because tg() chdirs into the checkout before invoking terragrunt.
 	return &engine.State{
-		Config: cfg,
-		Runner: exec.New(io.Discard),
-		Repos:  engine.Repos{Workdir: dir, LandingZone: dir},
+		Config:  cfg,
+		Runner:  exec.New(io.Discard),
+		Repos:   engine.Repos{Workdir: dir, LandingZone: dir},
+		Outputs: map[string]string{},
 	}
 }
 
