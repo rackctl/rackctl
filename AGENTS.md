@@ -24,12 +24,15 @@ every human line to stderr, so it pipes without filtering. The shape is publishe
 [`docs/exit-codes.md`](docs/exit-codes.md) and pinned by `TestCheckJSON_ShapeIsStable`;
 fields are added, never renamed.
 
-**Exit status classifies the outcome.** Nine codes, documented in
+**Exit status classifies the outcome.** Eleven codes, `0` to `10`, documented in
 [`docs/exit-codes.md`](docs/exit-codes.md) and pinned by
 `TestExitCodes_AreStableAndDistinct`. The three you must branch on: `5`
 platform-left-standing (usable), `6` rolled-back (nothing remains), `7`
-resources-may-remain (needs a human). The name is printed alongside the message, so a
-terminal and a `$?` carry the same vocabulary.
+resources-may-remain (needs a human). `9` refused means nothing was touched, and `10`
+unhealthy is a `check` that ran and found the platform unhealthy or unreachable. The name is
+printed alongside the message, so a terminal and a `$?` carry the same vocabulary. The
+engine records each failure's outcome in a typed `engine.RunError`; classify on that with
+`errors.As`, never on message text, which carries subprocess stderr.
 
 **A dry-run queries for real.** `plan` and `destroy --dry-run` make read-only AWS calls
 deliberately: the sweeps that delete resources outside Terraform's state enumerate live and
@@ -77,7 +80,9 @@ inherit a Runner's ceilings.
 3. If the phase applies a landing-zone component, add it to `CoreComponents` and give it a
    `componentEnv` case. Derive from `CoreComponents`; never restate the list.
 4. A failure that must NOT destroy the cloud returns `engine.NoRollbackError`. A failure to
-   PROVISION may roll back; a failure to CONVERGE may not.
+   PROVISION may roll back; a failure to CONVERGE may not. A refusal made before anything is
+   spent returns `engine.Refuse(err)`, so a first install that stops there exits `9`
+   refused rather than claiming a platform was left standing.
 5. Tests drive the production `exec.Runner` against fake executables on `PATH` — see
    `internal/phases/kubeconfig_test.go`. That exercises the argv you actually build.
 
