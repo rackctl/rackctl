@@ -137,10 +137,11 @@ The usual causes, in order of likelihood:
 - **`BucketNotEmpty`** — outside development several buckets refuse a destroy while
   non-empty. Re-run with `--force-buckets`, which applies `force_destroy` into state first
   and then destroys. `force_destroy` has no effect until an apply has landed it. A rollback
-  outside development permits it itself, on the components this same run applied and no
-  others, and prints `rollback: applying force_destroy_buckets=true on …` before it acts;
-  a component it did not apply is named, and the incomplete rollback's error names
-  `rackctl destroy --force-buckets`.
+  outside development permits it itself, on the components this same run created and no
+  others, and prints `rollback: applying force_destroy_buckets=true on …` before it acts.
+  Created means the component's state was empty before this run first applied it; one it
+  did not apply, or applied over state already there, is named, and the incomplete
+  rollback's error names `rackctl destroy --force-buckets`.
 - **`could not point kubectl at <cluster>`** — the in-cluster sweeps were skipped. The
   component teardown still ran and terraform state is scoped by state key, so no other
   cluster's Terraform-managed resources were touched. Fix the kubeconfig and re-run the

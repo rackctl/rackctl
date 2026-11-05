@@ -55,6 +55,13 @@ type State struct {
 	// not build, druid's Aurora above all, would create it in the middle of the rollback.
 	Applied map[string]bool
 
+	// Created records, for each bucket-owning component this run applied, whether its state
+	// was proved empty before that first apply. Only a true entry lets a rollback permit
+	// force_destroy on it: an apply over state that was already there adopted buckets and an
+	// Aurora this run did not create, and emptying them would destroy an earlier platform's
+	// data.
+	Created map[string]bool
+
 	// Backstops collects what each teardown sweep reported about itself, in the order they
 	// ran — the in-cluster reap and the IAM and EC2 backstops the rollback runs, and the
 	// volume sweep a phase teardown runs. The rollback prints them as one summary at its end,

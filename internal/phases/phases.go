@@ -205,6 +205,8 @@ func apply(ctx context.Context, st *engine.State, component string) error {
 	if err != nil {
 		return err
 	}
+	_, recorded := st.Created[component]
+	fresh := !recorded && stateWasEmpty(ctx, st, component, env)
 	if err := tg(ctx, st, "apply", component, env...); err != nil {
 		return err
 	}
@@ -212,7 +214,49 @@ func apply(ctx context.Context, st *engine.State, component string) error {
 		st.Applied = map[string]bool{}
 	}
 	st.Applied[component] = true
+	if !recorded && forceDestroyBucketComponents[component] {
+		if st.Created == nil {
+			st.Created = map[string]bool{}
+		}
+		st.Created[component] = fresh
+	}
 	return nil
+}
+
+// stateWasEmpty reports whether a bucket-owning component held no state before this run
+// applied it, which is the only proof that this run created its buckets and druid's Aurora.
+// A successful apply is not that proof: an apply over state an earlier platform left behind
+// adopts it, data included.
+//
+// It is read only where a rollback could act on it, outside development, and any doubt is
+// false: a state that could not be listed is treated as holding something, which leaves the
+// component unpermitted and its data where it is.
+func stateWasEmpty(ctx context.Context, st *engine.State, component string, env []string) bool {
+	if !forceDestroyBucketComponents[component] || st.Config.Environment == config.EnvDev || st.Runner.DryRun {
+		return false
+	}
+	dir := componentDir(st, component)
+	prev := st.Runner.Env
+	st.Runner.Env = append(append([]string(nil), prev...), env...)
+	defer func() { st.Runner.Env = prev }()
+	// state list needs the backend initialised, and tg's own init runs only after this.
+	if err := st.Runner.Run(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", "init"); err != nil {
+		note(st, "could not read %s's state before applying it (%v), so a rollback will not remove its "+
+			"buckets", component, err)
+		return false
+	}
+	out, err := st.Runner.Capture(ctx, "terragrunt", "--working-dir", dir, "--non-interactive", "state", "list")
+	if err != nil {
+		note(st, "could not read %s's state before applying it (%v), so a rollback will not remove its "+
+			"buckets", component, err)
+		return false
+	}
+	if strings.TrimSpace(out) != "" {
+		note(st, "%s already holds state, so this apply adopts it and a rollback will not remove its buckets",
+			component)
+		return false
+	}
+	return true
 }
 
 func destroy(ctx context.Context, st *engine.State, component string) error {
@@ -1030,7 +1074,7 @@ func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 }
 
 // permitRollbackBuckets is act 1 of the two-act teardown, run by a rollback outside
-// development, and only for the components this same run applied.
+// development, and only for the components this same run created.
 //
 // Outside development a non-empty bucket, and druid's Aurora, refuse a destroy until an
 // apply has landed force_destroy in state, so a rollback without this stops on
@@ -1038,32 +1082,41 @@ func (substrate) Teardown(ctx context.Context, st *engine.State) error {
 // those buckets, which is the reason for the limit: a rollback may delete data only this
 // run created. A component this run did not apply, the one that failed partway included, is
 // left unpermitted and named, because permitting is an apply and would build it, druid's
-// Aurora with it, in the middle of the rollback. The line before it acts is the operator's
-// notice; `rackctl destroy --force-buckets` stays the deliberate path for everything else.
+// Aurora with it, in the middle of the rollback. So is one this run applied over state that
+// was already there, because that apply adopted buckets and an Aurora an earlier platform
+// filled. The line before it acts is the operator's notice; `rackctl destroy
+// --force-buckets` stays the deliberate path for everything else.
 func permitRollbackBuckets(ctx context.Context, st *engine.State, comps []string) {
 	if st.Config.Environment == config.EnvDev {
 		return
 	}
-	var permit, unpermitted []string
+	var permit, unapplied, adopted []string
 	for _, c := range comps {
-		if !forceDestroyBucketComponents[c] {
-			continue
-		}
-		if st.Applied[c] {
+		switch {
+		case !forceDestroyBucketComponents[c]:
+		case st.Applied[c] && st.Created[c]:
 			permit = append(permit, c)
-		} else {
-			unpermitted = append(unpermitted, c)
+		case st.Applied[c]:
+			adopted = append(adopted, c)
+		default:
+			unapplied = append(unapplied, c)
 		}
 	}
-	if len(unpermitted) > 0 {
+	if len(unapplied) > 0 {
 		note(st, "rollback: %v own buckets that refuse a destroy while non-empty in %s, and this run did not "+
 			"finish applying them, so their teardown may fail on BucketNotEmpty. `rackctl destroy "+
-			"--force-buckets` permits and removes them", unpermitted, st.Config.Environment)
+			"--force-buckets` permits and removes them", unapplied, st.Config.Environment)
+	}
+	if len(adopted) > 0 {
+		note(st, "rollback: %v own buckets that refuse a destroy while non-empty in %s, and their state was "+
+			"not proved empty before this run applied them, so what is in them may predate it and is kept. "+
+			"Their teardown may fail on BucketNotEmpty or druid's deletion protection. `rackctl destroy "+
+			"--force-buckets` permits and removes them", adopted, st.Config.Environment)
 	}
 	if len(permit) == 0 {
 		return
 	}
-	note(st, "rollback: applying force_destroy_buckets=true on %v, which this run applied, so their "+
+	note(st, "rollback: applying force_destroy_buckets=true on %v, which this run created, so their "+
 		"buckets can be emptied and removed — this DELETES the data in them, all of it written since this "+
 		"run created them", permit)
 	for _, c := range permit {
