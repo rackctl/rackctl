@@ -53,10 +53,18 @@ func waitCatalogConverged(ctx context.Context, st *engine.State, timeout time.Du
 	deadline := time.Now().Add(timeout)
 	var lastCount, clean int
 	var nextReport time.Time
+	// What the wait saw, kept so a timeout can say which of its states it ended in rather than
+	// collapsing them into "0 application(s) not Healthy": a list never readable, a catalog
+	// that generated nothing, or named Applications that did not settle.
+	var everRead bool
+	var lastErr error
+	var lastUnhealthy []string
 
 	for time.Now().Before(deadline) {
 		count, unhealthy, err := catalogHealth(ctx, st)
+		lastErr = err
 		if err == nil {
+			everRead, lastUnhealthy = true, unhealthy
 			switch {
 			case count == 0:
 				clean = 0
@@ -91,8 +99,29 @@ func waitCatalogConverged(ctx context.Context, st *engine.State, timeout time.Du
 		}
 	}
 
-	_, unhealthy, _ := catalogHealth(ctx, st)
-	return fmt.Errorf("%d application(s) not Healthy: %s", len(unhealthy), strings.Join(unhealthy, " "))
+	if count, unhealthy, err := catalogHealth(ctx, st); err == nil {
+		everRead, lastCount, lastUnhealthy, lastErr = true, count, unhealthy, nil
+	} else {
+		lastErr = err
+	}
+	return catalogVerdict(timeout, everRead, lastCount, lastUnhealthy, lastErr)
+}
+
+// catalogVerdict classifies an expired convergence wait by what it last saw.
+func catalogVerdict(timeout time.Duration, everRead bool, count int, unhealthy []string, lastErr error) error {
+	switch {
+	case !everRead:
+		return fmt.Errorf("the Application list was never readable in %s, so nothing about the catalog "+
+			"is known: %w", timeout, lastErr)
+	case count == 0:
+		return fmt.Errorf("app-of-apps generated no child Applications in %s — the catalog source, or the "+
+			"credential to read it, is the place to look", timeout)
+	}
+	err := fmt.Errorf("%d of %d application(s) not Healthy: %s", len(unhealthy), count, strings.Join(unhealthy, " "))
+	if lastErr != nil {
+		err = fmt.Errorf("%w (as of the last good read; the final read failed: %w)", err, lastErr)
+	}
+	return err
 }
 
 // catalogHealth returns how many Applications exist and which are not Healthy.

@@ -711,7 +711,40 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 	// sweep disabled, which is the correct posture: kubectl still resolves the operator's
 	// previous context, and the sweep deletes everything it can see there.
 	st.KubeconfigCluster = st.Config.ClusterName()
+
+	// Ask the API server whether it answers from here, before anything depends on it. The
+	// cluster component builds the endpoint with the posture this config chose, and a private
+	// endpoint, or an allow-list that does not hold this host's egress, is unreachable from
+	// where rackctl runs. Without the probe that surfaced in cluster-bootstrap as a provider
+	// dial error naming neither the endpoint nor its posture, after the substrate was built.
+	//
+	// The cloud is provisioned and correct, so this is not a reason to destroy it: the remedy
+	// is to run from somewhere that can reach it, or to change the posture.
+	if !st.Runner.DryRun {
+		if _, err := st.Runner.Capture(ctx, "kubectl", "get", "--raw", "/readyz", "--request-timeout=30s"); err != nil {
+			return &engine.NoRollbackError{Err: fmt.Errorf(
+				"the EKS API for %s does not answer from this host after update-kubeconfig: %w. %s "+
+					"The cluster is built and left standing; the GitOps phase needs this API, so re-run "+
+					"`rackctl apply` from a host that can reach it",
+				st.Config.ClusterName(), err, endpointPosture(st.Config.Cluster))}
+		}
+	}
 	return nil
+}
+
+// endpointPosture says, in one sentence, which hosts this config's EKS endpoint admits.
+func endpointPosture(c config.Cluster) string {
+	switch {
+	case !c.EndpointPublicAccess:
+		return "Its endpoint is PRIVATE (cluster.endpointPublicAccess is false), so only hosts inside " +
+			"the VPC reach it — run from a bastion or over a VPN, or make it public with an allow-list."
+	case len(c.EndpointAllowlist) > 0:
+		return "Its endpoint is public and allow-listed to " + strings.Join(c.EndpointAllowlist, ", ") +
+			" (cluster.endpointAllowlist) — this host's egress IP must fall inside that list."
+	default:
+		return "Its endpoint is public and allow-listed to the egress IP this host had when the cluster " +
+			"was applied — a different egress now (a VPN, another NAT) is outside that allow-list."
+	}
 }
 
 func (cluster) Teardown(ctx context.Context, st *engine.State) error {
@@ -1019,25 +1052,21 @@ func (gitopsPhase) Run(ctx context.Context, st *engine.State) error {
 	// `Available` on a Deployment are both written by Kubernetes itself.
 	note(st, "waiting for ArgoCD applications to converge (sync-waves 0→52)")
 	if err := waitCatalogConverged(ctx, st, 30*time.Minute); err != nil {
-		// The cloud is provisioned. ArgoCD is running and has generated the catalog.
-		// Something on the cluster has not settled — which is NOT a reason to destroy
-		// the cluster.
+		// The cloud is provisioned. ArgoCD is running, or was meant to be. Something on the
+		// cluster has not settled — which is NOT a reason to destroy the cluster.
 		//
-		// `kubectl wait` fails with a bare "exit status 1" and names nothing, so say
-		// what is actually unhealthy. Some apps legitimately converge slowly: opencost
+		// The wait's error says which of three things it saw, and they want different next
+		// moves: the Application list was never readable (the API, not the catalog), app-of-
+		// apps generated nothing (the catalog source or its credentials), or named
+		// Applications are not Healthy. Some apps legitimately converge slowly: opencost
 		// crashloops until metrics reach AMP, which cannot happen until alloy has been
 		// scraping for a few minutes. A 30-minute wait that expires with 42 of 44
 		// Applications Healthy is not a failed install — and rolling the cluster back
 		// destroys the only surface the remaining two can be diagnosed on.
-		unhealthy, _ := st.Runner.Capture(ctx, "kubectl", "-n", "argocd", "get", "applications",
-			"-o", `jsonpath={range .items[?(@.status.health.status!='Healthy')]}{.metadata.name}{" ("}{.status.health.status}{"/"}{.status.sync.status}{") "}{end}`)
-		if s := strings.TrimSpace(unhealthy); s != "" {
-			note(st, "not converged: %s", s)
-		}
 		return &engine.NoRollbackError{Err: fmt.Errorf(
-			"ArgoCD applications did not all reach Healthy within 30m. The cloud IS provisioned and " +
-				"the cluster is left standing — run `rackctl check` to see what has not settled, and " +
-				"`rackctl destroy` if you want it gone")}
+			"ArgoCD applications did not all reach Healthy within 30m: %w. The cloud IS provisioned and "+
+				"the cluster is left standing — run `rackctl check` to see what has not settled, and "+
+				"`rackctl destroy` if you want it gone", err)}
 	}
 	return nil
 }
@@ -1334,13 +1363,16 @@ func (fleet) Teardown(ctx context.Context, st *engine.State) error {
 // --- Phase 8 (optional): operator portal ---
 type portal struct{ base }
 
+// portalNamespace is the tenant namespace the operator derives from the portal Platform's
+// name. portal's pods run there so its Pod Identity association binds, and so the AppProject
+// and default-deny NetworkPolicy the operator reconciles actually cover them. Installing into
+// `default` — which is what a helm command with no --namespace does — put the release outside
+// every boundary its own Platform CR declares. The teardown uninstalls from the same place,
+// for the same reason: Helm looks for a release only in the namespace it is told.
+const portalNamespace = "tenants-portal"
+
 func (portal) Run(ctx context.Context, st *engine.State) error {
-	// The tenant namespace the operator derives from the Platform's name. portal's pods run
-	// there so its Pod Identity association binds, and so the AppProject and default-deny
-	// NetworkPolicy the operator reconciles actually cover them. Installing into `default`
-	// — which is what a helm command with no --namespace does — put the release outside
-	// every boundary its own Platform CR declares.
-	const ns = "tenants-portal"
+	const ns = portalNamespace
 
 	sub, err := readPortalSubstrate(st)
 	if err != nil {
@@ -1503,7 +1535,7 @@ func portalEnvironment(st *engine.State) string {
 }
 
 func (portal) Teardown(ctx context.Context, st *engine.State) error {
-	return st.Runner.Run(ctx, "helm", "uninstall", "portal", "--ignore-not-found")
+	return st.Runner.Run(ctx, "helm", "uninstall", "portal", "-n", portalNamespace, "--ignore-not-found")
 }
 
 // --- Phase 9 (optional): first-tenant smoke test ---
