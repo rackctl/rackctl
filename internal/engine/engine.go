@@ -214,6 +214,17 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 							"to tear it down deliberately."))
 				}
 				continue
+			case errors.As(err, &noRollback) && noRollback.BeforeSpend:
+				// A refusal before anything was spent left nothing at all, whatever was or was
+				// not standing when the run began. It is decided ahead of the preexisting arm,
+				// and the order is load-bearing: with the platform state unknown, a refusal
+				// there would record that nobody can vouch for what was left, which reads as
+				// something that may be billing over a run that touched nothing. An interrupt
+				// that lands while the platform is being detected is the ordinary way to get
+				// there: the detection fails, so the state is unknown, and preflight then
+				// refuses on the cancelled context. Neither arm rolls back, so safety does not
+				// rest on the order; only the recorded outcome does.
+				fail.Outcome = Refused
 			case preexisting:
 				// The platform was already up before this run touched it — or we could not
 				// establish that it wasn't. Whatever just failed, destroying it is not the
@@ -233,12 +244,8 @@ func (e *Engine) Run(ctx context.Context, st *State) error {
 							"`rackctl destroy` to tear it down deliberately."))
 				}
 			case errors.As(err, &noRollback):
-				// A refusal before anything was spent, on a run that found nothing standing,
-				// left nothing at all. Any other NoRollbackError is a platform left up.
+				// Any NoRollbackError that is not a refusal before spend is a platform left up.
 				fail.Outcome, fail.Reason = LeftStanding, ReasonNoRollback
-				if noRollback.BeforeSpend {
-					fail.Outcome, fail.Reason = Refused, ""
-				}
 			case !e.CleanOnFail:
 				// --no-clean-on-failure. What this run built before the failure is still
 				// there, and a half-built platform is not one anybody can call usable.

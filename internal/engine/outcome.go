@@ -20,7 +20,8 @@ const (
 	Stranded
 	// LeftStanding means the run deliberately did not roll back over a platform that is
 	// there to use: an optional phase failed, a phase declared its failure must not
-	// destroy the cloud, or the platform was already standing when the run began.
+	// destroy the cloud, or the platform was already standing when the run began. A
+	// refusal before spend is Refused instead, even over a standing platform.
 	LeftStanding
 	// PlatformUnknownState means the run could not establish whether a platform already
 	// existed, so it disabled the rollback. Nobody can vouch for what was left.
@@ -28,8 +29,8 @@ const (
 	// CleanDisabled means the operator turned the rollback off with --no-clean-on-failure,
 	// so whatever the run built before the failure is still there.
 	CleanDisabled
-	// Refused means a phase refused before anything was spent, on a run that found no
-	// platform standing. Nothing was touched.
+	// Refused means a phase refused before anything was spent. Nothing was touched, so it
+	// is recorded whatever the run found standing, including when it could not tell.
 	Refused
 )
 
@@ -82,9 +83,10 @@ func (e *RunError) Unwrap() []error {
 
 // Refuse marks err as a refusal made before anything was spent: a pin that does not
 // resolve, a live root that is missing, a tool or an identity the run cannot proceed
-// without. It does not roll back, like any NoRollbackError, and on a run that found no
-// platform standing it classifies as refused rather than as a platform left standing,
-// because there is no platform. A nil error stays nil.
+// without. It does not roll back, like any NoRollbackError, and it classifies as refused
+// rather than as a platform left standing, because the run touched nothing. That holds on
+// a re-apply over a standing platform and on a run that could not tell whether one was
+// there. A nil error stays nil.
 func Refuse(err error) error {
 	if err == nil {
 		return nil

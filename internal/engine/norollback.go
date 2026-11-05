@@ -21,9 +21,10 @@ package engine
 // A phase returning this says: the cloud is provisioned, something on it has not
 // settled, leave it standing and let `rackctl check` say what.
 //
-// BeforeSpend says more: the phase refused before anything was provisioned. On a run that
-// found no platform standing there is then nothing to leave standing, and the outcome is a
-// refusal rather than a platform left up. Refuse builds one.
+// BeforeSpend says more: the phase refused before anything was provisioned. The run touched
+// nothing, so the outcome is a refusal rather than a platform left up, whether or not a
+// platform was standing when the run began and whether or not the run could tell. Refuse
+// builds one.
 type NoRollbackError struct {
 	Err         error
 	BeforeSpend bool

@@ -66,7 +66,12 @@ func TestRun_RecordsWhatEachFailureLeftTheCloudIn(t *testing.T) {
 		{"unknown", PlatformUnknown, true, []Phase{phase("gitops", boom)}, PlatformUnknownState, ""},
 		{"clean disabled", PlatformAbsent, false, []Phase{phase("cluster", nil), phase("gitops", boom)}, CleanDisabled, ""},
 		{"refused", PlatformAbsent, true, []Phase{phase("acquire", Refuse(boom))}, Refused, ""},
-		{"refused over a standing platform", PlatformPresent, true, []Phase{phase("acquire", Refuse(boom))}, LeftStanding, ReasonPreexisting},
+		// A refusal touched nothing, so it is a refusal whatever the run found standing. With
+		// the platform state unknown it used to record that nobody could vouch for what was
+		// left, over a run that left nothing.
+		{"refused over a standing platform", PlatformPresent, true, []Phase{phase("acquire", Refuse(boom))}, Refused, ""},
+		{"refused, platform state unknown", PlatformUnknown, true, []Phase{phase("acquire", Refuse(boom))}, Refused, ""},
+		{"no rollback over a standing platform", PlatformPresent, true, []Phase{phase("gitops", &NoRollbackError{Err: boom})}, LeftStanding, ReasonPreexisting},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			re := runWith(t, tc.state, tc.cleanOnFail, false, io.Discard, tc.phases...)

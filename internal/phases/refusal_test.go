@@ -9,7 +9,7 @@ import (
 )
 
 // assertRefusal fails unless err is a refusal made before anything was spent. Without the
-// mark, a first install that stops here exits platform-left-standing — or, with no
+// mark, a run that stops here exits platform-left-standing — or, with no
 // NoRollbackError at all, rolled-back — over a platform that does not exist.
 func assertRefusal(t *testing.T, err error) {
 	t.Helper()

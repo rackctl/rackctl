@@ -40,9 +40,12 @@ teardown can finish clean.
 **`rackctl apply`** classifies on what the engine recorded about the failure, never on the
 message, which carries subprocess stderr. The rollback arm decides it: `6` only when the
 rollback ran and held, `5` for a platform deliberately left standing, `7` when nobody can
-vouch for what is left, `9` for a refusal before any spend on a run that found no platform
-standing. An interrupt exits `8`, or `7` when the unwind it triggered did not finish; the
-message starts with `interrupted:` either way.
+vouch for what is left, `9` for a refusal before any spend. A refusal is `9` whatever the run
+found: over a platform already standing, and when it could not tell whether one exists,
+because either way it touched nothing. An interrupt exits `8`, or `7` when the unwind it
+triggered did not finish; the message starts with `interrupted:` either way. An interrupt
+that lands while the run is still asking EKS whether a platform exists touched nothing, and
+exits `8`.
 
 **`rackctl plan`** builds nothing, so a failed plan exits `1` whatever its rollback would
 have been, and its teardown is printed as what an apply `would roll back`.

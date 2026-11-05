@@ -14,6 +14,7 @@ import (
 	"github.com/rackctl/rackctl/internal/doctor"
 	"github.com/rackctl/rackctl/internal/engine"
 	rackexec "github.com/rackctl/rackctl/internal/exec"
+	"github.com/rackctl/rackctl/internal/phases"
 	"github.com/rackctl/rackctl/internal/reap"
 	"github.com/rackctl/rackctl/internal/tui"
 )
@@ -108,8 +109,11 @@ func TestClassifyRun_SeparatesTheCloudStates(t *testing.T) {
 				outcomePhase{id: "substrate", err: boom}}, ExitStranded},
 		{"refused before spend", engine.PlatformAbsent, false, false,
 			[]engine.Phase{outcomePhase{id: "acquire", err: engine.Refuse(errors.New("no ref v9"))}}, ExitRefused},
+		// A refusal touched nothing, whatever the run found standing or could not find out.
 		{"refused before spend, over a standing platform", engine.PlatformPresent, false, false,
-			[]engine.Phase{outcomePhase{id: "acquire", err: engine.Refuse(errors.New("no ref v9"))}}, ExitStanding},
+			[]engine.Phase{outcomePhase{id: "acquire", err: engine.Refuse(errors.New("no ref v9"))}}, ExitRefused},
+		{"refused before spend, platform state unknown", engine.PlatformUnknown, false, false,
+			[]engine.Phase{outcomePhase{id: "acquire", err: engine.Refuse(errors.New("no ref v9"))}}, ExitRefused},
 		{"a failed plan", engine.PlatformAbsent, false, true,
 			[]engine.Phase{outcomePhase{id: "cluster"}, outcomePhase{id: "gitops", err: boom}}, ExitFailure},
 		{"a failed plan whose rollback would not complete", engine.PlatformAbsent, false, true,
@@ -169,6 +173,35 @@ func TestClassifyRun_AnInterruptIsAbortedUnlessTheUnwindDidNotFinish(t *testing.
 	}
 	if got := ExitCode(classifyRun(context.Background(), errors.New("tui: no terminal"))); got != ExitFailure {
 		t.Errorf("an error with no recorded outcome is not evidence of a rollback: exit %d, want %d", got, ExitFailure)
+	}
+}
+
+// An interrupt that lands while the run is asking EKS whether a platform exists makes that
+// question fail, so the platform state is unknown, and the preflight phase then refuses.
+// Nothing was touched, so the run is aborted, not resources-may-remain.
+func TestClassifyRun_AnInterruptDuringPlatformDetectionIsAborted(t *testing.T) {
+	orig := engine.PlatformExists
+	t.Cleanup(func() { engine.PlatformExists = orig })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var state engine.PlatformState
+	engine.PlatformExists = func(ctx context.Context, st *engine.State) engine.PlatformState {
+		cancel()
+		state = orig(ctx, st)
+		return state
+	}
+	t.Setenv("PATH", t.TempDir())
+	eng := &engine.Engine{Phases: phases.All()[:1], Out: io.Discard, CleanOnFail: true}
+	err := eng.Run(ctx, &engine.State{Runner: rackexec.New(io.Discard), Config: &config.Config{}})
+	if state != engine.PlatformUnknown {
+		t.Fatalf("the interrupted detection must read as unknown, got %v", state)
+	}
+	classified := classifyRun(ctx, err)
+	if got := ExitCode(classified); got != ExitAborted {
+		t.Errorf("exit %d, want %d (%v)", got, ExitAborted, classified)
+	}
+	if !strings.HasPrefix(classified.Error(), "interrupted: ") {
+		t.Errorf("the message must say the run was interrupted: %v", classified)
 	}
 }
 

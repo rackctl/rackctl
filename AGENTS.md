@@ -81,8 +81,8 @@ inherit a Runner's ceilings.
    `componentEnv` case. Derive from `CoreComponents`; never restate the list.
 4. A failure that must NOT destroy the cloud returns `engine.NoRollbackError`. A failure to
    PROVISION may roll back; a failure to CONVERGE may not. A refusal made before anything is
-   spent returns `engine.Refuse(err)`, so a first install that stops there exits `9`
-   refused rather than claiming a platform was left standing.
+   spent returns `engine.Refuse(err)`, so a run that stops there exits `9` refused rather
+   than claiming a platform was left standing, whatever it found already up.
 5. Tests drive the production `exec.Runner` against fake executables on `PATH` — see
    `internal/phases/kubeconfig_test.go`. That exercises the argv you actually build.
 

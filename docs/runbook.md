@@ -38,8 +38,10 @@ On a failed phase, `rackctl apply` tears down the phases it completed, in revers
 | `the core platform is up; optional phases failed` | Same, reported at the end. The exit status is still non-zero. | `5` | As above. |
 
 A refusal before anything is spent — a pin that does not resolve, a landing-zone checkout
-missing a live root, the preflight phase's tool or identity check — exits `9` on a first
-install: nothing was touched, so there is nothing to roll back or leave standing.
+missing a live root, the preflight phase's tool or identity check — exits `9`, on a first
+install and on a re-apply alike: nothing was touched, so there is nothing to roll back or
+leave standing. That holds when the run could not tell whether a platform already exists,
+too, and an interrupt that arrives before anything was touched exits `8`.
 
 A phase that returns `NoRollbackError` never rolls back — a workload that has not converged
 is not a reason to destroy the cloud it runs on.
