@@ -395,3 +395,39 @@ func TestReconcile_DoesNotRetryANonTransientFailure(t *testing.T) {
 			"delays the answer", strings.TrimSpace(string(n)))
 	}
 }
+
+// Every mutating call resolves its identity with a context that says so, and no read does.
+// An EnvSource reads that to start each mutation with a freshly assumed session.
+func TestEnvSource_SeesWhichCallsMutate(t *testing.T) {
+	r := New(&bytes.Buffer{})
+	var seen []bool
+	r.EnvSource = func(ctx context.Context) ([]string, error) {
+		seen = append(seen, Mutating(ctx))
+		return nil, nil
+	}
+	ctx := context.Background()
+	if err := r.Run(ctx, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Reconcile(ctx, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Capture(ctx, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Query(ctx, "true"); err != nil {
+		t.Fatal(err)
+	}
+	want := []bool{true, true, false, false}
+	if len(seen) != len(want) {
+		t.Fatalf("EnvSource ran %d times, want %d", len(seen), len(want))
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Errorf("call %d (Run, Reconcile, Capture, Query): Mutating = %v, want %v", i, seen[i], want[i])
+		}
+	}
+	if Mutating(ctx) {
+		t.Error("a plain context is not a mutating one")
+	}
+}

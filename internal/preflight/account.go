@@ -52,6 +52,7 @@ func CheckSessionLifetime(ctx context.Context, env *Env) doctor.Result {
 	//
 	// The source profile still has to outlive the run too, because rackctl re-assumes from
 	// it as the session nears expiry — so both are checked, shortest first.
+	var chained string
 	if ar := env.Cfg.Cloud.AssumeRole; ar != nil && ar.RoleARN != "" {
 		d := time.Duration(ar.DurationSeconds) * time.Second
 		if ar.DurationSeconds == 0 {
@@ -65,6 +66,14 @@ func CheckSessionLifetime(ctx context.Context, env *Env) doctor.Result {
 					"back — the rollback needs the same credentials. Raise it (the role's own "+
 					"MaxSessionDuration may cap it, which only sts can tell you)", d))
 		}
+		chained = chainedSessionNote(ctx, env, d)
+	}
+	// pass is the verdict when nothing failed: ok, or a warning when the role is chained.
+	pass := func(detail string) doctor.Result {
+		if chained != "" {
+			return warn(name, detail+". "+chained)
+		}
+		return ok(name, detail)
 	}
 
 	raw, err := env.Run.Capture(ctx, "aws", "configure", "export-credentials",
@@ -87,7 +96,7 @@ func CheckSessionLifetime(ctx context.Context, env *Env) doctor.Result {
 			") — the session lifetime is UNCHECKED for this run")
 	}
 	if creds.Expiration == "" {
-		return ok(name, "credentials carry no expiry")
+		return pass("credentials carry no expiry")
 	}
 	exp, err := time.Parse(time.RFC3339, creds.Expiration)
 	if err != nil {
@@ -106,7 +115,38 @@ func CheckSessionLifetime(ctx context.Context, env *Env) doctor.Result {
 				"rollback needs the same credentials. Refresh first: aws sso login --profile %s",
 			left, env.Cfg.Cloud.Profile))
 	}
-	return ok(name, fmt.Sprintf("%s of session left", left))
+	return pass(fmt.Sprintf("%s of session left", left))
+}
+
+// chainedSessionNote says what role chaining does to the assumed session, or "" when the
+// source profile is not an SSO profile.
+//
+// SSO credentials are themselves a role session, so assuming cloud.assumeRole from them is
+// role chaining, and STS caps a chained session at an hour and refuses a longer one.
+// rackctl assumes a new session before every mutating call, so each starts with the whole
+// hour; what that cannot cover is one call that runs longer, which outlives its credentials.
+// A profile whose kind could not be read says nothing: absence of evidence is not chaining.
+func chainedSessionNote(ctx context.Context, env *Env, d time.Duration) string {
+	sso := false
+	for _, key := range []string{"sso_start_url", "sso_session"} {
+		out, err := env.Run.Capture(ctx, "aws", "configure", "get", key, "--profile", env.Cfg.Cloud.Profile)
+		if err == nil && strings.TrimSpace(out) != "" {
+			sso = true
+			break
+		}
+	}
+	if !sso {
+		return ""
+	}
+	if d > time.Hour {
+		return fmt.Sprintf("profile %q is an SSO profile, so assuming cloud.assumeRole from it is role "+
+			"chaining, which STS caps at 3600s and refuses above it. durationSeconds is %ds; set it "+
+			"to 3600 or less", env.Cfg.Cloud.Profile, int(d.Seconds()))
+	}
+	return fmt.Sprintf("profile %q is an SSO profile, so the assumed role is chained and STS caps its "+
+		"session at 3600s. Each mutating call starts with a newly assumed session, so each gets the "+
+		"whole hour, and a single call that runs longer than that outlives its credentials",
+		env.Cfg.Cloud.Profile)
 }
 
 // ─────────────────────────── bucket names ───────────────────────────

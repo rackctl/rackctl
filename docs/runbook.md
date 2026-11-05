@@ -62,11 +62,20 @@ recur:
   `cloud.assumeRole.durationSeconds` set below an hour. A token that lapses mid-phase leaves
   a half-applied run that cannot roll itself back, because the rollback needs the same
   credentials. Run `aws sso login --profile <profile>`, or raise `durationSeconds`.
+  rackctl assumes the role anew before every mutating call, so each call starts with the
+  role's whole duration. A role assumed from an SSO profile is chained, and STS caps a
+  chained session at 3600s and refuses a longer one; the check warns when that applies,
+  because one call that runs past the hour outlives its credentials.
 - **`bucket names`** — an S3 name this run would create is already taken. S3 names are
   globally unique across every AWS account, so this is unrecoverable by retry: rename the
   cluster.
-- **`vcpu quota`** — a fresh account caps at ~32 vCPU. rackctl files the increase itself
-  unless `quotas.autoRequest` is false; AWS takes minutes to hours to grant it.
+- **`vcpu quota`** — a fresh account caps at ~32 vCPU. With `quotas.autoRequest` on,
+  `rackctl apply` files the increase before the gate, or finds the request already open,
+  and exits `9` refused naming the request id and its case id. It files only once the
+  credentials match `cloud.accountId`; a mismatch files nothing and the gate's `aws
+  identity` check refuses it. AWS takes minutes to days to
+  grant it; re-run `rackctl apply` once it has. `rackctl check` names the open request too,
+  and with `autoRequest` off it prints the `aws service-quotas` command to file it yourself.
 - **`github token`** — `org.gitops.tenantsRepo` is set, which arms cluster-bootstrap's
   GitHub provider, and that provider authenticates from `GITHUB_TOKEN` and nothing else.
   `gh auth login` stores the credential in gh's keyring and exports nothing. Export

@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"context"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -139,7 +140,8 @@ func TestBucketNames_OwnedByAnotherAccountIsUnrecoverable(t *testing.T) {
 case "$1 $2" in
   "s3api list-buckets") echo "" ;;       # we own none of them
   "eks describe-cluster") `+eksAbsent+` ;;
-  "s3api head-bucket")    exit 0 ;;      # ...but they all exist. Reachable, not ours
+  "s3api head-bucket")                   # ...but they all exist, in another account
+    echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2; exit 254 ;;
   *) exit 1 ;;
 esac`)
 	r := CheckBucketNames(context.Background(), testEnv())
@@ -429,5 +431,109 @@ func TestSessionLifetime_UnsetDurationTakesTheHourDefault(t *testing.T) {
 
 	if r := CheckSessionLifetime(context.Background(), env); r.Status == doctor.Fail {
 		t.Fatalf("the default hour is the floor, not under it.\ngot: %s", r.Detail)
+	}
+}
+
+// A state-backend name another account owns is taken like any other. The backend's scope
+// excuses only a bucket THIS account already has; a 403 from head-bucket is someone else's.
+func TestBucketNames_ABackendNameAnotherAccountOwnsFails(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "s3api list-buckets")   echo "" ;;
+  "eks describe-cluster") `+eksAbsent+` ;;
+  "s3api head-bucket")
+    case "$4" in
+      *-tfstate) echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2; exit 254 ;;
+      *)         `+s3Absent+` ;;
+    esac ;;
+esac`)
+	r := CheckBucketNames(context.Background(), testEnv())
+	mustFail(t, r, "NOT owned by this account")
+	if !strings.Contains(r.Detail, "111122223333-us-west-2-tfstate (terraform backend)") {
+		t.Errorf("the refusal must name the backend bucket:\n%s", r.Detail)
+	}
+}
+
+// A 403 is an answer, not a transient fault: each name is asked once.
+func TestBucketNames_AForbiddenHeadIsNotRetried(t *testing.T) {
+	log := t.TempDir() + "/calls"
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "s3api list-buckets")   echo "" ;;
+  "eks describe-cluster") `+eksAbsent+` ;;
+  "s3api head-bucket")    echo "$4" >> `+log+`; echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2; exit 254 ;;
+esac`)
+	env := testEnv()
+	mustFail(t, CheckBucketNames(context.Background(), env), "NOT owned by this account")
+	b, _ := os.ReadFile(log)
+	asked := strings.Fields(string(b))
+	if want := len(plannedBuckets(env.Cfg)); len(asked) != want {
+		t.Errorf("head-bucket ran %d times for %d names — a 403 was retried:\n%s", len(asked), want, b)
+	}
+}
+
+// An expired token is neither free nor taken: the name went unchecked, and the verdict says so.
+func TestBucketNames_AnExpiredTokenIsUnchecked(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "s3api list-buckets")   echo "" ;;
+  "eks describe-cluster") `+eksAbsent+` ;;
+  "s3api head-bucket")    echo "An error occurred (ExpiredToken) when calling the HeadBucket operation" >&2; exit 254 ;;
+esac`)
+	r := CheckBucketNames(context.Background(), testEnv())
+	if r.Status != doctor.Warn || !strings.Contains(r.Detail, "ExpiredToken") {
+		t.Fatalf("an expired token must leave the names unchecked: got %s %s", r.Status, r.Detail)
+	}
+}
+
+// sessionFake answers `configure get <key>` with sso when the key is set, and an export with
+// a session that has the whole day left.
+func sessionFake(t *testing.T, ssoKey string) {
+	t.Helper()
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "configure get") if [ "$3" = "`+ssoKey+`" ]; then echo https://example.awsapps.com/start; else exit 1; fi ;;
+  "configure export-credentials") echo '{"Expiration":"2999-01-01T00:00:00Z"}' ;;
+  *) exit 1 ;;
+esac`)
+}
+
+// A role assumed from SSO credentials is chained, and STS caps a chained session at an hour.
+// Each mutating call starts with a new session, so the warning names the one case that
+// cannot cover: one call longer than the hour.
+func TestSessionLifetime_SSOChainingIsAWarning(t *testing.T) {
+	for _, key := range []string{"sso_start_url", "sso_session"} {
+		sessionFake(t, key)
+		env := testEnv()
+		env.Cfg.Cloud.AssumeRole = &config.AssumeRole{RoleARN: "arn:aws:iam::111111111111:role/rackctl"}
+		r := CheckSessionLifetime(context.Background(), env)
+		if r.Status != doctor.Warn || !strings.Contains(r.Detail, "3600s") || !strings.Contains(r.Detail, "single call") {
+			t.Errorf("%s: an SSO-chained session must warn about the hour cap: %s %s", key, r.Status, r.Detail)
+		}
+	}
+}
+
+// Above an hour, STS refuses a chained assume outright, and the warning says what to set.
+func TestSessionLifetime_SSOChainingAboveAnHourNamesTheRefusal(t *testing.T) {
+	sessionFake(t, "sso_start_url")
+	env := testEnv()
+	env.Cfg.Cloud.AssumeRole = &config.AssumeRole{RoleARN: "arn:aws:iam::111111111111:role/rackctl", DurationSeconds: 14400}
+	r := CheckSessionLifetime(context.Background(), env)
+	if r.Status != doctor.Warn || !strings.Contains(r.Detail, "refuses above it") || !strings.Contains(r.Detail, "14400s") {
+		t.Errorf("got %s %s", r.Status, r.Detail)
+	}
+}
+
+// A profile that is not SSO is not chained, and without a role nothing is assumed at all.
+func TestSessionLifetime_NoChainingIsOK(t *testing.T) {
+	sessionFake(t, "none")
+	env := testEnv()
+	env.Cfg.Cloud.AssumeRole = &config.AssumeRole{RoleARN: "arn:aws:iam::111111111111:role/rackctl"}
+	if r := CheckSessionLifetime(context.Background(), env); r.Status != doctor.OK {
+		t.Errorf("a non-SSO profile: got %s %s", r.Status, r.Detail)
+	}
+	sessionFake(t, "sso_start_url")
+	if r := CheckSessionLifetime(context.Background(), testEnv()); r.Status != doctor.OK {
+		t.Errorf("no role is assumed, so nothing is chained: got %s %s", r.Status, r.Detail)
 	}
 }

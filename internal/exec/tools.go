@@ -139,6 +139,18 @@ type Runner struct {
 	InterruptGrace time.Duration
 }
 
+// mutatingKey marks the context a mutating child's identity is resolved with.
+type mutatingKey struct{}
+
+// Mutating reports whether ctx is the one Run or Reconcile resolves a mutating child's
+// identity with. An EnvSource reads it to start every mutation with a freshly assumed
+// session: a session cached for reads may have less left than one mutation can take, and a
+// token that lapses mid-apply fails after resources are created and before state is written.
+func Mutating(ctx context.Context) bool {
+	v, _ := ctx.Value(mutatingKey{}).(bool)
+	return v
+}
+
 // New returns a Runner writing to out.
 func New(out io.Writer) *Runner {
 	if out == nil {
@@ -321,7 +333,7 @@ func (r *Runner) runTee(ctx context.Context, name string, args ...string) error 
 	timeout := r.runTimeout()
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	env, err := r.env(ctx)
+	env, err := r.env(context.WithValue(ctx, mutatingKey{}, true))
 	if err != nil {
 		return fmt.Errorf("%s: resolving the identity to run as: %w", name, err)
 	}
@@ -368,7 +380,7 @@ func (r *Runner) Run(ctx context.Context, name string, args ...string) error {
 	timeout := r.runTimeout()
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	env, err := r.env(ctx)
+	env, err := r.env(context.WithValue(ctx, mutatingKey{}, true))
 	if err != nil {
 		return fmt.Errorf("%s: resolving the identity to run as: %w", name, err)
 	}

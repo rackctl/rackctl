@@ -240,3 +240,64 @@ func TestDryRunStillAssumes(t *testing.T) {
 		t.Error("dry-run assumed nothing — plan would read the account as the operator")
 	}
 }
+
+// Every mutating call starts with a newly assumed session, however much the cached one has
+// left. A session cached for reads may have only the refresh window left, which one apply
+// outlives.
+func TestFreshAlwaysReassumesAndRefreshesTheCache(t *testing.T) {
+	run, logPath := fakeSTS(t, time.Hour)
+	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::123456789012:role/rackctl-deploy"}), run)
+	ctx := context.Background()
+
+	if _, err := id.Env(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := id.Fresh(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := id.Env(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assumes := 0
+	for _, c := range stsCalls(t, logPath) {
+		if strings.Contains(c, "assume-role") {
+			assumes++
+		}
+	}
+	if assumes != 3 {
+		t.Errorf("assume-role ran %d times, want 3: one for the first read, one per Fresh, and "+
+			"none for the read after, which reuses Fresh's session", assumes)
+	}
+}
+
+// Without a role there is nothing to assume, and Fresh is the profile.
+func TestFreshWithoutARoleIsTheProfile(t *testing.T) {
+	run, logPath := fakeSTS(t, time.Hour)
+	env, err := New(cfgWithRole(nil), run).Fresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envMap(env)["AWS_PROFILE"] != "workload-development" {
+		t.Errorf("env = %v, want the profile", env)
+	}
+	if calls := stsCalls(t, logPath); len(calls) != 0 {
+		t.Errorf("no role is configured; sts must not be called: %v", calls)
+	}
+}
+
+// A failed assume fails the call rather than falling back to the cached session.
+func TestFreshFailsWhenTheAssumeFails(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte("#!/bin/sh\necho denied >&2\nexit 254\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	run := exec.New(io.Discard)
+	run.ReadAttempts = 1
+	id := New(cfgWithRole(&config.AssumeRole{RoleARN: "arn:aws:iam::123456789012:role/rackctl-deploy"}), run)
+	if _, err := id.Fresh(context.Background()); err == nil {
+		t.Fatal("a failed assume must fail the call")
+	}
+}

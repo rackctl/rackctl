@@ -222,14 +222,19 @@ esac
 	}
 }
 
-// The apply path still says the tree is untouched, which there is true.
+// The apply path says the tree is untouched, which there is true, and no more than that: the
+// failure is a plain one, so the rollback still unwinds what the earlier phases built, and a
+// message saying nothing needs unwinding contradicted what happened next.
 func TestApplyAgentPlatform_MissingOutputSaysNothingWasApplied(t *testing.T) {
 	st, _ := apState(t)
 	st.Runner.DryRun = false
 	delete(st.Outputs, "vpc_id")
 	err := applyAgentPlatform(context.Background(), st)
-	if err == nil || !strings.Contains(err.Error(), "nothing needs unwinding") {
+	if err == nil || !strings.Contains(err.Error(), "nothing of that tree to unwind") {
 		t.Fatalf("the apply path must say nothing in the tree was applied: %v", err)
+	}
+	if strings.Contains(err.Error(), "nothing needs unwinding") {
+		t.Errorf("a failure that rolls back must not say nothing needs unwinding: %v", err)
 	}
 	delete(st.Outputs, "kms_key_arn")
 	st.Outputs["vpc_id"] = "vpc-0abc"

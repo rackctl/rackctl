@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/doctor"
 )
 
@@ -26,13 +27,16 @@ import (
 //
 // A fresh install has no skew — any supported version is a valid starting point — so no live
 // cluster means nothing to check rather than a failure.
+//
+// A cluster.version equal to rackctl's default is never sent, so the version the cluster
+// phase applies is the leaf's own default, which nothing here can read. Judging rackctl's
+// mirror of it would refuse or pass on a number the apply does not use, so that case is a
+// warning naming what went unverified, and never a refusal.
 func CheckVersionSkew(ctx context.Context, env *Env) doctor.Result {
 	const name = "version skew"
 
 	want := strings.TrimSpace(env.Cfg.Cluster.Version)
-	if want == "" {
-		return ok(name, "no cluster.version pinned — landing-zone's default applies")
-	}
+	leafDefault := want == "" || want == config.Default().Cluster.Version
 
 	have, err := env.aws(ctx, "eks", "describe-cluster",
 		"--name", clusterName(env.Cfg), "--query", "cluster.version")
@@ -59,6 +63,14 @@ func CheckVersionSkew(ctx context.Context, env *Env) doctor.Result {
 	}
 	if have == "" || have == "None" {
 		return ok(name, "no live cluster — any supported version is a valid starting point")
+	}
+	if leafDefault {
+		return warn(name, fmt.Sprintf(
+			"the cluster is on %s and cluster.version is rackctl's default, which is not sent: the "+
+				"cluster phase applies landing-zone's own default, and this check cannot read it. "+
+				"Skew is UNVERIFIED for this run. If that default is more than one minor ahead of %s, "+
+				"or behind it, the cluster phase fails; pin cluster.version to a version other than "+
+				"the default to have it checked and sent", have, have))
 	}
 
 	hMaj, hMin, okH := parseMinor(have)
