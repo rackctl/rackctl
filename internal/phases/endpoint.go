@@ -73,13 +73,21 @@ const destroyPlaceholderCIDR = "192.0.2.0/32"
 //   - endpointPublicAccess=false            -> private endpoint; no CIDR list injected.
 //   - endpointPublicAccess=true + allow-list -> that allow-list, verbatim (explicit wins).
 //   - endpointPublicAccess=true + empty list -> the cluster's LIVE allow-list when it already
-//     exists, and on a first apply this host's egress IP as <ip>/32. Never 0.0.0.0/0 —
-//     landing-zone rejects an empty allow-list at plan time, and so does this.
+//     exists with a public endpoint, and on a first apply, or over a cluster whose endpoint is
+//     private, this host's egress IP as <ip>/32. Never 0.0.0.0/0 — landing-zone rejects an
+//     empty allow-list at plan time, and so does this.
 //
 // The live list wins on a re-apply because an auto-detected value is a fact about whichever
 // host ran the apply. Re-detecting it from another host, a laptop on a different network or
 // a CI runner, re-scoped the endpoint to that host and silently locked out the operator who
 // built it. Changing the list takes an explicit cluster.endpointAllowlist.
+//
+// The live list counts only while the live endpoint is public. EKS reports 0.0.0.0/0 as the
+// allow-list of a cluster whose public endpoint is off, so keeping that value when public
+// access goes from off to on would open the API to the whole internet. A private cluster
+// admits nobody through its public allow-list, so detection there locks nobody out. A live
+// public list that admits every address is never kept implicitly either: opening the
+// endpoint to the world takes an explicit cluster.endpointAllowlist.
 //
 // A destroy never detects: it passes the live list when it can read it, and otherwise a
 // placeholder that admits nobody, because the destroy plan needs the precondition to hold
@@ -103,14 +111,26 @@ func clusterEndpointEnv(ctx context.Context, st *engine.State, verb string) ([]s
 		return withCIDRs(env, cidrs)
 	}
 
-	live, absent, liveErr := liveAllowlist(ctx, st)
+	live, absent, private, liveErr := liveAllowlist(ctx, st)
+	if private && verb != "destroy" {
+		note(st, "EKS API endpoint: %s exists with its public endpoint off, so it has no public allow-list to "+
+			"keep; this apply scopes the newly public endpoint as a first apply would", st.Config.ClusterName())
+	}
 	switch {
+	case verb != "destroy" && worldOpen(live) != "":
+		return nil, fmt.Errorf("cluster.endpointPublicAccess is true with an empty cluster.endpointAllowlist, "+
+			"and the live allow-list of %s admits every address (%s). rackctl keeps a live allow-list on a "+
+			"re-apply but never keeps one open to the whole internet without being told to. Set "+
+			"cluster.endpointAllowlist explicitly to proceed", st.Config.ClusterName(), worldOpen(live))
 	case verb == "destroy" && len(live) > 0:
 		note(st, "EKS API endpoint: (destroy) passing the live allow-list %s so the destroy plan's "+
 			"precondition holds — a destroy re-scopes nothing", strings.Join(live, ", "))
 		return withCIDRs(env, live)
 	case verb == "destroy":
 		why := "the cluster no longer exists"
+		if !absent && liveErr == nil {
+			why = "the cluster's public endpoint is off, so it has no public allow-list"
+		}
 		if liveErr != nil {
 			why = "the live allow-list could not be read (" + liveErr.Error() + ")"
 		}
@@ -130,7 +150,7 @@ func clusterEndpointEnv(ctx context.Context, st *engine.State, verb string) ([]s
 			"and the live allow-list of %s could not be read: %w. rackctl does not auto-detect over a "+
 			"cluster that may already be scoped to another host, which could lock its operator out. Set "+
 			"cluster.endpointAllowlist explicitly to proceed", st.Config.ClusterName(), liveErr)
-	case !absent:
+	case !absent && !private:
 		// The cluster exists with no allow-list at all, which the fail-closed tree never builds.
 		return nil, fmt.Errorf("cluster.endpointPublicAccess is true with an empty cluster.endpointAllowlist, "+
 			"and %s exists with no public allow-list to keep. Set cluster.endpointAllowlist explicitly to "+
@@ -164,25 +184,51 @@ func withCIDRs(env, cidrs []string) ([]string, error) {
 	return append(env, "TF_VAR_cluster_endpoint_public_access_cidrs="+string(j)), nil
 }
 
-// liveAllowlist reads the public allow-list of this config's cluster as EKS holds it.
+// liveAllowlist reads the public allow-list of this config's cluster as EKS holds it, and
+// whether that cluster's public endpoint is on. A cluster whose public endpoint is off has
+// no public allow-list: EKS still reports one, 0.0.0.0/0 by default, and that value admits
+// nobody until public access is turned on, so it is returned as no list with private set.
 // absent reports that EKS says the cluster does not exist; any other failure is err.
-func liveAllowlist(ctx context.Context, st *engine.State) (cidrs []string, absent bool, err error) {
+func liveAllowlist(ctx context.Context, st *engine.State) (cidrs []string, absent, private bool, err error) {
 	out, err := st.Runner.Query(ctx, "aws", "eks", "describe-cluster", "--name", st.Config.ClusterName(),
 		"--region", st.Config.Cloud.Region,
-		"--query", "cluster.resourcesVpcConfig.publicAccessCidrs", "--output", "json")
+		"--query", "cluster.resourcesVpcConfig.{public:endpointPublicAccess,cidrs:publicAccessCidrs}",
+		"--output", "json")
 	if err != nil {
 		if strings.Contains(err.Error(), "ResourceNotFoundException") {
-			return nil, true, nil
+			return nil, true, false, nil
 		}
-		return nil, false, err
+		return nil, false, false, err
 	}
-	if s := strings.TrimSpace(out); s == "" || s == "null" {
-		return nil, false, nil
+	var live struct {
+		Public *bool    `json:"public"`
+		CIDRs  []string `json:"cidrs"`
 	}
-	if err := json.Unmarshal([]byte(out), &cidrs); err != nil {
-		return nil, false, fmt.Errorf("aws eks describe-cluster: the allow-list %q is not a list: %w", out, err)
+	if err := json.Unmarshal([]byte(out), &live); err != nil {
+		return nil, false, false, fmt.Errorf("aws eks describe-cluster: the endpoint posture %q is not an "+
+			"object: %w", strings.TrimSpace(out), err)
 	}
-	return cidrs, false, nil
+	if live.Public == nil {
+		return nil, false, false, fmt.Errorf("aws eks describe-cluster: the endpoint posture %q does not say "+
+			"whether the public endpoint is on", strings.TrimSpace(out))
+	}
+	if !*live.Public {
+		return nil, false, true, nil
+	}
+	return live.CIDRs, false, false, nil
+}
+
+// worldOpen returns the first entry of cidrs that admits every address, or "" when none
+// does. Any prefix of length zero qualifies, however its address is spelled.
+func worldOpen(cidrs []string) string {
+	for _, c := range cidrs {
+		if _, n, err := net.ParseCIDR(strings.TrimSpace(c)); err == nil {
+			if ones, _ := n.Mask.Size(); ones == 0 {
+				return c
+			}
+		}
+	}
+	return ""
 }
 
 // egressInside says whether this host's egress IP falls inside the allow-list being kept.

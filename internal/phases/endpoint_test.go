@@ -169,7 +169,7 @@ func TestClusterEndpointEnv_AutodetectFailureIsFatal(t *testing.T) {
 // re-scoped the endpoint to that host and locked out the operator who built it; changing the
 // list takes an explicit cluster.endpointAllowlist.
 func TestClusterEndpointEnv_AReapplyKeepsTheLiveAllowlist(t *testing.T) {
-	withEKS(t, `echo '["203.0.113.9/32"]'`+"\n")
+	withEKS(t, `echo '{"public":true,"cidrs":["203.0.113.9/32"]}'`+"\n")
 	withResolver(t, func(context.Context) (string, error) { return "198.51.100.7", nil })
 	var out strings.Builder
 	st := endpointState(false /* apply */, true, nil)
@@ -211,7 +211,7 @@ func TestClusterEndpointEnv_ADestroyNeverDetects(t *testing.T) {
 		return "", nil
 	})
 	for _, c := range []struct{ name, aws, want string }{
-		{"live list", `echo '["203.0.113.9/32"]'` + "\n", `["203.0.113.9/32"]`},
+		{"live list", `echo '{"public":true,"cidrs":["203.0.113.9/32"]}'` + "\n", `["203.0.113.9/32"]`},
 		{"cluster gone", noCluster, `["` + destroyPlaceholderCIDR + `"]`},
 		{"unreadable", "echo 'An error occurred (AccessDeniedException)' >&2\nexit 254\n", `["` + destroyPlaceholderCIDR + `"]`},
 	} {
@@ -245,5 +245,95 @@ func TestComponentEnv_TheClusterDestroyCarriesTheVerb(t *testing.T) {
 	st := endpointState(false, true, nil)
 	if _, err := componentEnv(context.Background(), st, "cluster", "destroy"); err != nil {
 		t.Fatalf("componentEnv: %v", err)
+	}
+}
+
+// EKS reports 0.0.0.0/0 as the allow-list of a cluster whose public endpoint is off. Turning
+// public access on over such a cluster must scope the endpoint to this host, not keep a list
+// that would open the API to the whole internet.
+func TestClusterEndpointEnv_APrivateClusterReportingTheWorldIsNotKept(t *testing.T) {
+	withEKS(t, `echo '{"public":false,"cidrs":["0.0.0.0/0"]}'`+"\n")
+	withResolver(t, func(context.Context) (string, error) { return "198.51.100.7", nil })
+	var out strings.Builder
+	st := endpointState(false /* apply */, true, nil)
+	st.Runner.Out = &out
+
+	env, err := clusterEndpointEnv(context.Background(), st, "apply")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !slices.Contains(env, cidrsKey+`=["198.51.100.7/32"]`) {
+		t.Errorf("a private cluster has no allow-list to keep; the endpoint must be scoped to <ip>/32, got %v", env)
+	}
+	for _, e := range env {
+		if strings.Contains(e, "0.0.0.0/0") {
+			t.Errorf("the default allow-list of a private cluster must never be injected; got %v", env)
+		}
+	}
+	if !strings.Contains(out.String(), "public endpoint off") {
+		t.Errorf("the note must say why nothing was kept:\n%s", out.String())
+	}
+}
+
+// A destroy over a private cluster passes the placeholder, never the default 0.0.0.0/0.
+func TestClusterEndpointEnv_ADestroyOverAPrivateClusterPassesThePlaceholder(t *testing.T) {
+	withEKS(t, `echo '{"public":false,"cidrs":["0.0.0.0/0"]}'`+"\n")
+	withResolver(t, func(context.Context) (string, error) {
+		t.Fatal("a destroy must not detect an egress IP")
+		return "", nil
+	})
+	var out strings.Builder
+	st := endpointState(false, true, nil)
+	st.Runner.Out = &out
+	env, err := clusterEndpointEnv(context.Background(), st, "destroy")
+	if err != nil {
+		t.Fatalf("a destroy must not fail on the allow-list: %v", err)
+	}
+	if !slices.Contains(env, cidrsKey+`=["`+destroyPlaceholderCIDR+`"]`) {
+		t.Errorf("got %v, want the placeholder", env)
+	}
+	if !strings.Contains(out.String(), "public endpoint is off") {
+		t.Errorf("the note must say the endpoint is private:\n%s", out.String())
+	}
+}
+
+// A live public list that admits every address is never kept implicitly, however the
+// zero-length prefix is spelled; opening the API to the world takes an explicit list.
+func TestClusterEndpointEnv_AWorldOpenLiveListRefuses(t *testing.T) {
+	for _, world := range []string{"0.0.0.0/0", "::/0", "10.0.0.0/0"} {
+		t.Run(world, func(t *testing.T) {
+			withEKS(t, `echo '{"public":true,"cidrs":["203.0.113.9/32","`+world+`"]}'`+"\n")
+			withResolver(t, func(context.Context) (string, error) {
+				t.Fatal("nothing may be detected over a world-open live list")
+				return "", nil
+			})
+			_, err := clusterEndpointEnv(context.Background(), endpointState(false, true, nil), "apply")
+			if err == nil || !strings.Contains(err.Error(), "cluster.endpointAllowlist") ||
+				!strings.Contains(err.Error(), world) {
+				t.Fatalf("want a refusal naming %s and cluster.endpointAllowlist, got %v", world, err)
+			}
+		})
+	}
+}
+
+// A live public endpoint with no allow-list, or a posture that does not say whether the
+// endpoint is public, refuses rather than detecting over it.
+func TestClusterEndpointEnv_AnIncompleteLivePostureRefuses(t *testing.T) {
+	for name, body := range map[string]string{
+		"public, no list": `echo '{"public":true,"cidrs":[]}'`,
+		"no public field": `echo '{"cidrs":["203.0.113.9/32"]}'`,
+		"not an object":   `echo '["203.0.113.9/32"]'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			withEKS(t, body+"\n")
+			withResolver(t, func(context.Context) (string, error) {
+				t.Fatal("nothing may be detected over a cluster whose posture is incomplete")
+				return "", nil
+			})
+			_, err := clusterEndpointEnv(context.Background(), endpointState(false, true, nil), "apply")
+			if err == nil || !strings.Contains(err.Error(), "cluster.endpointAllowlist") {
+				t.Fatalf("want a refusal naming cluster.endpointAllowlist, got %v", err)
+			}
+		})
 	}
 }
