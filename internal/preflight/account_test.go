@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"context"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -139,7 +140,8 @@ func TestBucketNames_OwnedByAnotherAccountIsUnrecoverable(t *testing.T) {
 case "$1 $2" in
   "s3api list-buckets") echo "" ;;       # we own none of them
   "eks describe-cluster") `+eksAbsent+` ;;
-  "s3api head-bucket")    exit 0 ;;      # ...but they all exist. Reachable, not ours
+  "s3api head-bucket")                   # ...but they all exist, in another account
+    echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2; exit 254 ;;
   *) exit 1 ;;
 esac`)
 	r := CheckBucketNames(context.Background(), testEnv())
@@ -429,5 +431,57 @@ func TestSessionLifetime_UnsetDurationTakesTheHourDefault(t *testing.T) {
 
 	if r := CheckSessionLifetime(context.Background(), env); r.Status == doctor.Fail {
 		t.Fatalf("the default hour is the floor, not under it.\ngot: %s", r.Detail)
+	}
+}
+
+// A state-backend name another account owns is taken like any other. The backend's scope
+// excuses only a bucket THIS account already has; a 403 from head-bucket is someone else's.
+func TestBucketNames_ABackendNameAnotherAccountOwnsFails(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "s3api list-buckets")   echo "" ;;
+  "eks describe-cluster") `+eksAbsent+` ;;
+  "s3api head-bucket")
+    case "$4" in
+      *-tfstate) echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2; exit 254 ;;
+      *)         `+s3Absent+` ;;
+    esac ;;
+esac`)
+	r := CheckBucketNames(context.Background(), testEnv())
+	mustFail(t, r, "NOT owned by this account")
+	if !strings.Contains(r.Detail, "111122223333-us-west-2-tfstate (terraform backend)") {
+		t.Errorf("the refusal must name the backend bucket:\n%s", r.Detail)
+	}
+}
+
+// A 403 is an answer, not a transient fault: each name is asked once.
+func TestBucketNames_AForbiddenHeadIsNotRetried(t *testing.T) {
+	log := t.TempDir() + "/calls"
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "s3api list-buckets")   echo "" ;;
+  "eks describe-cluster") `+eksAbsent+` ;;
+  "s3api head-bucket")    echo "$4" >> `+log+`; echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2; exit 254 ;;
+esac`)
+	env := testEnv()
+	mustFail(t, CheckBucketNames(context.Background(), env), "NOT owned by this account")
+	b, _ := os.ReadFile(log)
+	asked := strings.Fields(string(b))
+	if want := len(plannedBuckets(env.Cfg)); len(asked) != want {
+		t.Errorf("head-bucket ran %d times for %d names — a 403 was retried:\n%s", len(asked), want, b)
+	}
+}
+
+// An expired token is neither free nor taken: the name went unchecked, and the verdict says so.
+func TestBucketNames_AnExpiredTokenIsUnchecked(t *testing.T) {
+	fakeBin(t, "aws", `
+case "$1 $2" in
+  "s3api list-buckets")   echo "" ;;
+  "eks describe-cluster") `+eksAbsent+` ;;
+  "s3api head-bucket")    echo "An error occurred (ExpiredToken) when calling the HeadBucket operation" >&2; exit 254 ;;
+esac`)
+	r := CheckBucketNames(context.Background(), testEnv())
+	if r.Status != doctor.Warn || !strings.Contains(r.Detail, "ExpiredToken") {
+		t.Fatalf("an expired token must leave the names unchecked: got %s %s", r.Status, r.Detail)
 	}
 }
