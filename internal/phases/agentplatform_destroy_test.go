@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -240,5 +241,173 @@ func TestApplyAgentPlatform_MissingOutputSaysNothingWasApplied(t *testing.T) {
 	st.Outputs["vpc_id"] = "vpc-0abc"
 	if err := applyAgentPlatform(context.Background(), st); err == nil {
 		t.Fatal("a missing account-chain output must fail the apply")
+	}
+}
+
+// ─────────────────────────── destroy from state ───────────────────────────
+
+// apStateAWS answers the state bucket as a tree whose listed keys hold the given number of
+// resources, and the head-bucket as present.
+func apStateAWS(held map[string]int) string {
+	var keys, arms strings.Builder
+	for key, n := range held {
+		fmt.Fprintf(&keys, "%s\t", key)
+		res := strings.TrimSuffix(strings.Repeat(`{"type":"aws_iam_role"},`, n), ",")
+		fmt.Fprintf(&arms, "             */%s) echo '{\"resources\":[%s]}' ;;\n", key, res)
+	}
+	return fmt.Sprintf(`
+case "$1 $2" in
+  "s3api head-bucket")    exit 0 ;;
+  "s3api list-objects-v2") printf '%s\n' ;;
+  "s3 cp") case "$3" in
+%s             *) echo '{"resources":[]}' ;;
+           esac ;;
+  *) exit 1 ;;
+esac`, keys.String(), arms.String())
+}
+
+// destroyedRoots is the working directories terragrunt was asked to destroy.
+func destroyedRoots(t *testing.T, logf string) []string {
+	t.Helper()
+	b, _ := os.ReadFile(logf)
+	var roots []string
+	for _, l := range strings.Split(string(b), "\n") {
+		f := strings.Fields(l)
+		if len(f) > 1 && slices.Contains(f, "destroy") && f[0] == "--working-dir" {
+			roots = append(roots, f[1])
+		}
+	}
+	return roots
+}
+
+// A config that turned the agent platform off after it was applied still has the tree
+// standing. A destroy reads the tree's state and tears down what it holds; the config alone
+// used to skip the tree, leaving its IAM, SSM and buckets and reporting a clean teardown.
+func TestDestroyAgentPlatform_FromStateTearsDownATreeTheConfigTurnedOff(t *testing.T) {
+	st, logf := apDestroyFakes(t, apStateAWS(map[string]int{
+		"development-platform/bedrock/terraform.tfstate":     2,
+		"development-platform/kill-switch/terraform.tfstate": 0,
+		"org/bedrock-account/terraform.tfstate":              1,
+	}))
+	off := false
+	st.Config.AgentPlatform.Enable = &off
+	var out strings.Builder
+	st.Runner.Out = &out
+
+	if err := DestroyAgentPlatform(context.Background(), st, AgentPlatformTeardown{FromState: true}); err != nil {
+		t.Fatalf("DestroyAgentPlatform: %v", err)
+	}
+	if got := destroyedRoots(t, logf); !slices.Equal(got, []string{"terraform/live/development-platform/bedrock"}) {
+		t.Errorf("destroyed %v, want only bedrock — the root that holds state; an emptied root and an "+
+			"account root this teardown does not reach are left alone", got)
+	}
+	// An account root this teardown does not reach is not announced as torn down.
+	if strings.Contains(out.String(), "bedrock-account is not in this config") {
+		t.Errorf("the teardown announced an account root it leaves standing:\n%s", out.String())
+	}
+
+	// Without FromState, a rollback's view: the config installs no tree, so nothing is touched.
+	st2, logf2 := apDestroyFakes(t, apStateAWS(map[string]int{"development-platform/bedrock/terraform.tfstate": 2}))
+	st2.Config.AgentPlatform.Enable = &off
+	if err := DestroyAgentPlatform(context.Background(), st2, AgentPlatformTeardown{}); err != nil {
+		t.Fatal(err)
+	}
+	if terragruntRan(logf2) {
+		t.Error("a rollback with the platform off walked the tree")
+	}
+}
+
+// With the cost tier turned off after it was applied, its per-cluster root is still standing
+// and is torn down with the rest; the account root waits for --account-scoped.
+func TestDestroyAgentPlatform_FromStateReachesACostTierTheConfigTurnedOff(t *testing.T) {
+	st, logf := apDestroyFakes(t, apStateAWS(map[string]int{
+		"development-platform/cost-access/terraform.tfstate": 3,
+		"org/cost-pipeline/terraform.tfstate":                4,
+	}))
+	off := false
+	st.Config.AgentPlatform.CostPipeline = &off
+
+	if err := DestroyAgentPlatform(context.Background(), st, AgentPlatformTeardown{FromState: true}); err != nil {
+		t.Fatalf("DestroyAgentPlatform: %v", err)
+	}
+	got := destroyedRoots(t, logf)
+	if !slices.Contains(got, "terraform/live/development-platform/cost-access") || slices.Contains(got, "terraform/live/org/cost-pipeline") {
+		t.Errorf("destroyed %v: cost-access holds state and must go; cost-pipeline is account-scoped", got)
+	}
+	if got[0] != "terraform/live/development-platform/cost-access" {
+		t.Errorf("the walk is reverse apply order, so cost-access comes first: %v", got)
+	}
+}
+
+// A disabled tree with nothing in it is nothing to destroy, and says so.
+func TestDestroyAgentPlatform_FromStateWithNothingHeldTouchesNothing(t *testing.T) {
+	st, logf := apDestroyFakes(t, apStateAWS(nil))
+	var out strings.Builder
+	st.Runner.Out = &out
+	off := false
+	st.Config.AgentPlatform.Enable = &off
+	if err := DestroyAgentPlatform(context.Background(), st, AgentPlatformTeardown{FromState: true}); err != nil {
+		t.Fatal(err)
+	}
+	if terragruntRan(logf) || !strings.Contains(out.String(), "nothing to destroy") {
+		t.Errorf("an empty tree the config does not install is nothing to destroy:\n%s", out.String())
+	}
+}
+
+// State that could not be listed is not a tree that holds nothing.
+func TestDestroyAgentPlatform_FromStateUnlistableIsAnError(t *testing.T) {
+	st, logf := apDestroyFakes(t, `case "$1 $2" in "s3api head-bucket") exit 0 ;; *) echo 'AccessDenied' >&2; exit 254 ;; esac`)
+	off := false
+	st.Config.AgentPlatform.Enable = &off
+	err := DestroyAgentPlatform(context.Background(), st, AgentPlatformTeardown{FromState: true})
+	if err == nil || !strings.Contains(err.Error(), "could not establish") {
+		t.Fatalf("an unlistable state bucket must not read as an empty tree: %v", err)
+	}
+	if terragruntRan(logf) {
+		t.Error("terragrunt ran over state nobody could read")
+	}
+}
+
+// The account roots a teardown leaves without --account-scoped are named when they hold
+// state, so a destroy that leaves them does not exit 0.
+func TestAgentPlatformLeft_NamesTheAccountRootsLeftStanding(t *testing.T) {
+	st, _ := apDestroyFakes(t, apStateAWS(map[string]int{
+		"org/bedrock-account/terraform.tfstate":          1,
+		"org/cost-pipeline/terraform.tfstate":            0,
+		"development-platform/bedrock/terraform.tfstate": 5,
+	}))
+	left, err := AgentPlatformLeft(context.Background(), st, AgentPlatformTeardown{})
+	if err != nil || !slices.Equal(left, []string{"bedrock-account (1 resource(s))"}) {
+		t.Errorf("left = %v, %v; want the one account root that holds state", left, err)
+	}
+	if left, err := AgentPlatformLeft(context.Background(), st, AgentPlatformTeardown{AccountScoped: true}); left != nil || err != nil {
+		t.Errorf("--account-scoped reaches the account roots, so none is left: %v, %v", left, err)
+	}
+
+	absent, _ := apDestroyFakes(t, `echo 'An error occurred (404) when calling the HeadBucket operation: Not Found' >&2; exit 254`)
+	if left, err := AgentPlatformLeft(context.Background(), absent, AgentPlatformTeardown{}); left != nil || err != nil {
+		t.Errorf("a tree never applied leaves nothing: %v, %v", left, err)
+	}
+	denied, _ := apDestroyFakes(t, `echo 'An error occurred (403) when calling the HeadBucket operation: Forbidden' >&2; exit 254`)
+	if _, err := AgentPlatformLeft(context.Background(), denied, AgentPlatformTeardown{}); err == nil || !strings.Contains(err.Error(), "Forbidden") {
+		t.Errorf("a bucket nobody could see is not a tree that left nothing: %v", err)
+	}
+}
+
+// A config that installs every component of the tree has nothing outside it to read, so a
+// destroy from state walks the config's own set without listing the bucket.
+func TestDestroyAgentPlatform_FromStateWithEveryComponentConfiguredListsNothing(t *testing.T) {
+	st, logf := apDestroyFakes(t, `case "$1 $2" in "s3api head-bucket") exit 0 ;; *) echo 'unexpected aws call' >&2; exit 254 ;; esac`)
+	if err := DestroyAgentPlatform(context.Background(), st, AgentPlatformTeardown{FromState: true}); err != nil {
+		t.Fatalf("DestroyAgentPlatform: %v", err)
+	}
+	var want int
+	for _, c := range allAPComponents() {
+		if !c.account {
+			want++
+		}
+	}
+	if got := destroyedRoots(t, logf); len(got) != want {
+		t.Errorf("destroyed %v, want every cluster root of the config's own set", got)
 	}
 }

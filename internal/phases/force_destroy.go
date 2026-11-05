@@ -2,6 +2,7 @@ package phases
 
 import (
 	"context"
+	"slices"
 
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/engine"
@@ -54,8 +55,17 @@ func ForceDestroyBucketComponents(cfg *config.Config) []string {
 // the backup component's backup_plans (validation message, variables.tf). rackctl has
 // no field for it and does not apply backup, so the path is unreachable here; the note
 // says so rather than pretending --force-buckets preserves restore points.
-func PermitBucketTeardown(ctx context.Context, st *engine.State) error {
+//
+// unconfigured names components this config does not apply that a destroy tears down from
+// state; the ones among them that own such buckets are permitted too, or a component turned
+// off after an apply would meet BucketNotEmpty on the destroy --force-buckets exists to clear.
+func PermitBucketTeardown(ctx context.Context, st *engine.State, unconfigured ...string) error {
 	comps := ForceDestroyBucketComponents(st.Config)
+	for _, c := range unconfigured {
+		if forceDestroyBucketComponents[c] && !slices.Contains(comps, c) {
+			comps = append(comps, c)
+		}
+	}
 	if len(comps) == 0 {
 		return nil
 	}

@@ -175,6 +175,18 @@ The usual causes, in order of likelihood:
   does not hold this host's egress IP. The line prints both. Re-run from a host the endpoint
   admits so the Platforms, NodeClaims and PVCs are reaped before the cluster goes.
 
+- **`the account-scoped roots … still hold state and were left standing`** — every component
+  of this environment came down, and the account's Bedrock invocation-logging root and cost
+  pipeline did not, because they are shared by every environment in the account. The exit is
+  `7` so an automation does not record an empty account. If other environments still run
+  here, that is the intended end state. If this is the last one, re-run with
+  `--account-scoped --force-buckets`.
+- **`<component> is not in this config but its state holds …`** — the config turned the
+  component off after an apply. The destroy tears it down with the rest; nothing to do unless
+  its own destroy fails. **`the state of <component>, which this config does not apply, could
+  not be read`** is the same case without proof either way: it is not walked, and the run exits
+  `7`. Fix the access to the state bucket and re-run.
+
 Both `rackctl destroy` and a rollback end with a **backstop summary**: one line per sweep
 that guards something terraform cannot see, saying whether it ran, found nothing, failed or
 did not run. `platform destroyed` is printed only when every one of them ran clean; otherwise

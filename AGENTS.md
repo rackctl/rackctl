@@ -80,7 +80,9 @@ inherit a Runner's ceilings.
 2. Register it in `phases.All()`. Order is load-bearing and terragrunt's dependency graph
    does not express it — the slice plus the phase boundary is what sequences the tree.
 3. If the phase applies a landing-zone component, add it to `CoreComponents` and give it a
-   `componentEnv` case. Derive from `CoreComponents`; never restate the list.
+   `componentEnv` case. Derive from `CoreComponents`; never restate the list. A new gate in
+   `CoreComponents` is also turned on in `allCoreComponents`: that is the set `rackctl destroy`
+   reads state for, so a component the config later turns off is still torn down.
 4. A failure that must NOT destroy the cloud returns `engine.NoRollbackError`. A failure to
    PROVISION may roll back; a failure to CONVERGE may not. A refusal made before anything is
    spent returns `engine.Refuse(err)`, so a run that stops there exits `9` refused rather
