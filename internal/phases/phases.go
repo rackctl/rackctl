@@ -1436,6 +1436,12 @@ func (fleet) Run(ctx context.Context, st *engine.State) error {
 	st.Runner.Dir = st.Repos.EKSFleet
 	note(st, "running from %s — every -f path below is relative to that checkout", st.Repos.EKSFleet)
 
+	// Before anything is installed on the hub role's behalf, so a role that does not exist
+	// stops the phase with nothing to unwind.
+	if err := verifyFleetHubRole(ctx, st); err != nil {
+		return err
+	}
+
 	// 1. Crossplane v2.
 	if err := st.Runner.Run(ctx, "helm", "repo", "add", "crossplane-stable", "https://charts.crossplane.io/stable"); err != nil {
 		// helm repo add fails if the repo already exists; treat that as fine and continue.
@@ -1451,14 +1457,15 @@ func (fleet) Run(ctx context.Context, st *engine.State) error {
 	}
 
 	// 2. provider-opentofu + functions. providers.yaml carries a placeholder
-	// eks.amazonaws.com/role-arn; the operator (or a prior fleet-hub apply) must have
-	// put the real hub role there, or IRSA will not attach. We apply the file as-is and
-	// say so — rewriting it would invent a role ARN we cannot see from the workload tree.
-	rendered, err := renderFleetProviders(st)
+	// eks.amazonaws.com/role-arn, so it is rendered with the hub role substituted, outside
+	// the checkout, and applied by absolute path. See renderFleetProviders.
+	rendered, cleanup, err := renderFleetProviders(st)
 	if err != nil {
 		return err
 	}
-	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", rendered); err != nil {
+	err = st.Runner.Run(ctx, "kubectl", "apply", "-f", rendered)
+	cleanup()
+	if err != nil {
 		return err
 	}
 	if err := st.Runner.Run(ctx, "kubectl", "apply", "-f", "config/functions.yaml"); err != nil {
