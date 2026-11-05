@@ -62,7 +62,6 @@ func waitCatalogConverged(ctx context.Context, st *engine.State, timeout time.Du
 
 	for time.Now().Before(deadline) {
 		count, unhealthy, err := catalogHealth(ctx, st)
-		lastErr = err
 		if err == nil {
 			everRead, lastUnhealthy = true, unhealthy
 			switch {

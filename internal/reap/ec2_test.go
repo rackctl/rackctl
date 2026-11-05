@@ -325,23 +325,24 @@ func TestReportUnprovableVolumes_NonCSIVolumesAreNotReported(t *testing.T) {
 	}
 }
 
-// Unreadable or unparseable output reports nothing rather than guessing.
-func TestReportUnprovableVolumes_UnreadableReportsNothing(t *testing.T) {
+// Unreadable or unparseable output names no volume rather than guessing — and says the
+// report did not run, rather than going silent.
+func TestReportUnprovableVolumes_UnreadableNamesNoVolume(t *testing.T) {
 	for _, raw := range []string{"", "not json"} {
 		f := &fakeEC2{unprovable: raw}
 		var out strings.Builder
 
 		reportUnprovableVolumes(t.Context(), f, &out, "development-platform", "us-east-1")
 
-		if out.String() != "" {
-			t.Errorf("input %q must produce no claim.\ngot: %s", raw, out.String())
+		if strings.Contains(out.String(), "vol-") || strings.Contains(out.String(), "cannot prove they belong") {
+			t.Errorf("input %q must name no volume.\ngot: %s", raw, out.String())
 		}
 	}
 	f := &fakeEC2{queryErr: errors.New("AccessDenied")}
 	var out strings.Builder
 	reportUnprovableVolumes(t.Context(), f, &out, "development-platform", "us-east-1")
-	if out.String() != "" {
-		t.Errorf("a failed read must produce no claim.\ngot: %s", out.String())
+	if !strings.Contains(out.String(), "did NOT run") || !strings.Contains(out.String(), "AccessDenied") {
+		t.Errorf("a failed read must say the report did not run, and why.\ngot: %s", out.String())
 	}
 }
 

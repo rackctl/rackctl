@@ -8,6 +8,9 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+
+	"github.com/rackctl/rackctl/internal/phases"
+	"github.com/rackctl/rackctl/internal/reap"
 )
 
 var rootCmd = &cobra.Command{
@@ -47,4 +50,6 @@ func Execute() error {
 
 func init() {
 	rootCmd.AddCommand(planCmd, applyCmd, destroyCmd, checkCmd, versionCmd)
+	// The teardown paths report an unreachable cluster against this host's egress IP.
+	reap.EgressIP = phases.EgressIP
 }

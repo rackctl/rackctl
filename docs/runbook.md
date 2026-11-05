@@ -76,8 +76,14 @@ off. Reaching it in phase 4 instead means the component set changed after acquir
 ### The catalog will not converge
 
 Phase 5 waits up to 30 minutes for every ArgoCD Application to report Healthy, requiring two
-consecutive samples at an unchanged count. On expiry it names what is unhealthy and returns
-`NoRollbackError`, so the cloud stays standing.
+consecutive samples at an unchanged count. On expiry it returns `NoRollbackError`, so the
+cloud stays standing, and says which of three things it saw last:
+
+- **the Application list was never readable** — the API, not the catalog: credentials, RBAC
+  or reachability.
+- **app-of-apps generated no child Applications** — the catalog source, or the credential to
+  read it.
+- **N of M not Healthy**, by name — the catalog is there and something in it has not settled.
 
 Some workloads converge slowly by design: opencost crashloops until its metrics reach AMP,
 which takes minutes of scraping. A wait that expires with almost everything Healthy is not a
@@ -112,6 +118,16 @@ The usual causes, in order of likelihood:
 - **`could not point kubectl at <cluster>`** — the in-cluster sweeps were skipped. The
   component teardown still ran and terraform state is scoped by state key, so nothing
   belonging to another cluster was touched. Fix the kubeconfig and re-run the destroy.
+- **`in-cluster reap did NOT run — <cluster> exists … but its API does not answer`** — the
+  cluster is there and this host cannot reach it: a private endpoint, or an allow-list that
+  does not hold this host's egress IP. The line prints both. Re-run from a host the endpoint
+  admits so the Platforms, NodeClaims and PVCs are reaped before the cluster goes.
+
+Both `rackctl destroy` and a rollback end with a **backstop summary**: one line per sweep
+that guards something terraform cannot see, saying whether it ran, found nothing, failed or
+did not run. `platform destroyed` is printed only when every one of them ran clean; otherwise
+the closing line says which did not, and those are what to check before calling the account
+empty. The unprovable-volume report is listed too, and is informational — it deletes nothing.
 
 ### Resources rackctl will not delete
 

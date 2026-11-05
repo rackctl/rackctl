@@ -168,3 +168,20 @@ func TestPortalTeardown_UninstallsFromTheNamespaceItInstalledInto(t *testing.T) 
 		t.Errorf("helm uninstall must name the release's namespace, got %q", got)
 	}
 }
+
+// The cluster teardown's volume sweep reports itself on State, so the rollback's summary
+// covers it alongside the sweeps the engine runs.
+func TestClusterTeardown_RecordsItsVolumeBackstops(t *testing.T) {
+	st := fakeAWSAndTG(t, 0)
+	if err := (cluster{}).Teardown(context.Background(), st); err != nil {
+		t.Fatalf("cluster teardown: %v", err)
+	}
+	var names []string
+	for _, b := range st.Backstops {
+		names = append(names, b.Name+"="+b.Outcome.String())
+	}
+	got := strings.Join(names, ", ")
+	if !strings.Contains(got, "unprovable EBS volumes=found nothing") || !strings.Contains(got, "orphaned EBS volumes=found nothing") {
+		t.Errorf("the volume sweep's backstops must be on State, got %q", got)
+	}
+}

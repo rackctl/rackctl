@@ -772,8 +772,8 @@ func (cluster) Teardown(ctx context.Context, st *engine.State) error {
 	}
 
 	// Anything still tagged for this cluster is an orphan — sweep it, or it bills forever.
-	reap.OrphanedVolumes(ctx, st.Runner, os.Stdout,
-		st.Config.ClusterName(), st.Config.Cloud.Region)
+	st.Backstops = append(st.Backstops, reap.OrphanedVolumes(ctx, st.Runner, os.Stdout,
+		st.Config.ClusterName(), st.Config.Cloud.Region)...)
 
 	return errors.Join(failed...)
 }

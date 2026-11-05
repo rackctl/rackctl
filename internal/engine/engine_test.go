@@ -308,6 +308,10 @@ func TestEngineDoesNotReapBeforeItHasACluster(t *testing.T) {
 				strings.TrimSpace(line), out.String())
 		}
 	}
+	// And the summary accounts for them, rather than leaving their absence to be inferred.
+	if !strings.Contains(out.String(), "cluster sweeps (in-cluster, operator IAM roles, Karpenter nodes): did NOT run") {
+		t.Errorf("the backstop summary must say the cluster sweeps did not run, and why:\n%s", out.String())
+	}
 }
 
 // The converse: once the cluster phase has repointed the kubeconfig, the sweep MUST run.

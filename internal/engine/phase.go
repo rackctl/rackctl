@@ -7,6 +7,7 @@ import (
 
 	"github.com/rackctl/rackctl/internal/config"
 	"github.com/rackctl/rackctl/internal/exec"
+	"github.com/rackctl/rackctl/internal/reap"
 )
 
 // Repos holds the local paths of the nanohype repos rackctl orchestrates.
@@ -48,6 +49,12 @@ type State struct {
 	// the best that consumer could do was list causes nobody had checked, while the error
 	// that explained the absence had already been discarded.
 	CaptureErr map[string]error
+
+	// Backstops collects what each teardown sweep reported about itself, in the order they
+	// ran — the in-cluster reap and the IAM and EC2 backstops the rollback runs, and the
+	// volume sweep a phase teardown runs. The rollback prints them as one summary at its end,
+	// so which guards held is said once, in one place, rather than left in the scroll.
+	Backstops []reap.Backstop
 }
 
 // Phase is one ordered step of the 0→running bootstrap.

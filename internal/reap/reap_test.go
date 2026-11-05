@@ -695,7 +695,9 @@ exit 0
 func TestAll_DisarmsArgoCDBeforeReapingAnything(t *testing.T) {
 	calls := fakeKubectl(t)
 
-	All(context.Background(), exec.New(io.Discard), io.Discard)
+	if b := All(context.Background(), exec.New(io.Discard), io.Discard, "development-platform", "us-west-2"); b.Outcome != Acted {
+		t.Errorf("a reap that ran clean reports it ran; got %s: %s", b.Outcome, b.Detail)
+	}
 
 	got := calls()
 	scaleAt, patchAt, verifyAt, deleteAt := -1, -1, -1, -1
