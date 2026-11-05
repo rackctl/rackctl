@@ -97,7 +97,11 @@ a config still setting it is refused by name rather than silently ignored.
 
 Defaults are applied **field by field**, never by replacing a struct: replacing one wipes a
 sibling the operator set deliberately. A boolean that defaults to true is a `*bool` with an
-accessor, because a plain bool cannot tell "explicitly false" from "omitted".
+accessor, because a plain bool cannot tell "explicitly false" from "omitted";
+`TestLoad_EveryTrueDefaultSurvivesAMinimalConfig` refuses a plain bool that is true in
+`Default()`. Every value `ApplyDefaults` fills is recorded with `fill`, which is what `plan`,
+`apply` and `check` print and what check's JSON carries as `defaulted`. `cloud.region` and
+`environment` are required and have no default.
 
 ## The gate suite
 

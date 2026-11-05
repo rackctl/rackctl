@@ -39,7 +39,7 @@ func fakeTools(t *testing.T) (*engine.State, func() []string) {
 		Name: "blank", Persona: "generic", Tenant: "example", MonthlyBudgetUSD: 100,
 	}
 	cfg.AgentPlatform.BedrockModelFamilies = []string{"anthropic", "amazon-nova"}
-	cfg.AgentPlatform.Compliance = config.Compliance{SOC2: true}
+	cfg.AgentPlatform.Compliance = config.Compliance{SOC2: boolPtr(true)}
 	st := &engine.State{Config: cfg, Runner: exec.New(io.Discard)}
 
 	return st, func() []string {
@@ -164,5 +164,18 @@ func TestSmoke_TeardownUninstallsTheTenant(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("helm uninstall missing %q; got: %s", want, got)
 		}
+	}
+}
+
+// An omitted compliance.soc2 is true. As a plain bool it reached the chart as soc2=false in
+// every config that left it out, while Default() said true.
+func TestSmoke_AnOmittedSOC2ReachesTheChartAsTrue(t *testing.T) {
+	st, calls := fakeTools(t)
+	st.Config.AgentPlatform.Compliance = config.Compliance{}
+	if err := (smoke{}).Run(context.Background(), st); err != nil {
+		t.Fatalf("smoke.Run: %v", err)
+	}
+	if got := callStartingWith(t, calls(), "helm upgrade"); !strings.Contains(got, "--set platform.compliance.soc2=true") {
+		t.Errorf("an omitted soc2 must reach the chart as true; got: %s", got)
 	}
 }

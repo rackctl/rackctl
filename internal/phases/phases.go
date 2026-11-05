@@ -820,16 +820,17 @@ func (cluster) Run(ctx context.Context, st *engine.State) error {
 				"the EKS API for %s does not answer from this host after update-kubeconfig: %w. %s "+
 					"The cluster is built and left standing; the GitOps phase needs this API, so re-run "+
 					"`rackctl apply` from a host that can reach it",
-				st.Config.ClusterName(), err, endpointPosture(st.Config.Cluster))}
+				st.Config.ClusterName(), err, endpointPosture(st.Config))}
 		}
 	}
 	return nil
 }
 
 // endpointPosture says, in one sentence, which hosts this config's EKS endpoint admits.
-func endpointPosture(c config.Cluster) string {
+func endpointPosture(cfg *config.Config) string {
+	c := cfg.Cluster
 	switch {
-	case !c.EndpointPublicAccess:
+	case !cfg.PublicEndpoint():
 		return "Its endpoint is PRIVATE (cluster.endpointPublicAccess is false), so only hosts inside " +
 			"the VPC reach it — run from a bastion or over a VPN, or make it public with an allow-list."
 	case len(c.EndpointAllowlist) > 0:
@@ -1788,7 +1789,7 @@ func (smoke) Run(ctx context.Context, st *engine.State) error {
 		"--set", "platform.tenant=" + ft.Tenant,
 		"--set", "platform.persona=" + ft.Persona,
 		"--set", fmt.Sprintf("budget.monthlyUsd=%d", ft.MonthlyBudgetUSD),
-		"--set", fmt.Sprintf("platform.compliance.soc2=%t", st.Config.AgentPlatform.Compliance.SOC2),
+		"--set", fmt.Sprintf("platform.compliance.soc2=%t", st.Config.AgentPlatform.Compliance.SOC2Enabled()),
 		"--set", fmt.Sprintf("platform.compliance.hipaa=%t", st.Config.AgentPlatform.Compliance.HIPAA),
 	}
 	// helm's --set parses commas as list separators, so a families list rides the

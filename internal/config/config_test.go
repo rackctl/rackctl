@@ -9,6 +9,7 @@ func valid() *Config {
 	c := Default()
 	c.Org.Name = "acme"
 	c.Cloud.AccountID = "111111111111"
+	c.Cloud.Region = "us-west-2"
 	c.Cloud.Profile = "workload-development"
 	c.Cluster.Name = "platform"
 	c.ApplyDefaults()
@@ -64,11 +65,13 @@ func TestValidate(t *testing.T) {
 		"short account id":                           func(c *Config) { c.Cloud.AccountID = "123" },
 		"non-aws provider":                           func(c *Config) { c.Cloud.Provider = ProviderAzure },
 		"bad environment":                            func(c *Config) { c.Environment = "qa" },
+		"missing environment":                        func(c *Config) { c.Environment = "" },
+		"missing region":                             func(c *Config) { c.Cloud.Region = "" },
 		"missing cluster.name":                       func(c *Config) { c.Cluster.Name = "" },
 		"bad cluster.name":                           func(c *Config) { c.Cluster.Name = "Platform_1" },
 		"cluster.name too long":                      func(c *Config) { c.Cluster.Name = "thirteenchars" }, // 13 > 12 char cap
 		"cluster.name == env":                        func(c *Config) { c.Cluster.Name = string(c.Environment) },
-		"prod public endpoint":                       func(c *Config) { c.Environment = EnvProduction; c.Cluster.EndpointPublicAccess = true },
+		"prod public endpoint":                       func(c *Config) { c.Environment = EnvProduction; c.Cluster.EndpointPublicAccess = boolPtr(true) },
 		"bad cidr in allowlist":                      func(c *Config) { c.Cluster.EndpointAllowlist = []string{"10.0.0.0"} }, // no mask
 		"bare ip in allowlist":                       func(c *Config) { c.Cluster.EndpointAllowlist = []string{"203.0.113.4"} },
 		"eksFleet no clustersRepo":                   func(c *Config) { c.ControlPlane.EKSFleet = true },
@@ -189,7 +192,7 @@ func TestValidate_NetworkLevers(t *testing.T) {
 // dead by a human halfway through an import, which is what Terraform would do.
 func TestValidate_ModelImport(t *testing.T) {
 	// The supported case: the gate on, in a region where Custom Model Import runs.
-	c := valid() // Default() puts the region at us-west-2
+	c := valid() // valid() puts the region at us-west-2
 	c.AgentPlatform.ModelImport = true
 	if err := c.Validate(); err != nil {
 		t.Fatalf("modelImport in a Custom Model Import region must validate: %v", err)
@@ -247,12 +250,6 @@ func TestApplyDefaults_PreservesNetworkLevers(t *testing.T) {
 func TestApplyDefaults(t *testing.T) {
 	c := &Config{Org: Org{Name: "acme"}}
 	c.ApplyDefaults()
-	if c.Cloud.Region != "us-west-2" {
-		t.Errorf("region default = %q, want us-west-2", c.Cloud.Region)
-	}
-	if c.Environment != EnvDev {
-		t.Errorf("environment default = %q, want development", c.Environment)
-	}
 	if c.Org.GitOps.EKSGitopsRepo != "github.com/acme/eks-gitops" {
 		t.Errorf("eksGitopsRepo = %q, want derived from org", c.Org.GitOps.EKSGitopsRepo)
 	}
@@ -373,6 +370,7 @@ func TestValidate_RejectsImpossibleSystemNodeSizing(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := Default()
 			c.Org.Name, c.Cloud.AccountID, c.Cloud.Profile, c.Cluster.Name = "acme", "111111111111", "p", "platform"
+			c.Cloud.Region = "us-west-2"
 			mut(c)
 			c.ApplyDefaults()
 			if err := c.Validate(); err == nil {
@@ -418,6 +416,7 @@ func TestValidate_EKSFleetDoesNotRequireAPastedHubRole(t *testing.T) {
 	c.Org.GitOps.EKSGitopsRepo = "github.com/acme/eks-gitops"
 	c.Org.GitOps.ClustersRepo = "github.com/acme/clusters"
 	c.Cloud.AccountID = "111111111111"
+	c.Cloud.Region = "us-west-2"
 	c.Cloud.Profile = "acme"
 	c.Cluster.Name = "platform"
 	c.ControlPlane.EKSFleet = true

@@ -88,9 +88,15 @@ rackctl check -c rackctl.yaml --output json | jq '.preflight[] | select(.status=
   "clusterExists": "present",
   "passed": false,
   "preflight": [{ "name": "vcpu quota", "status": "fail", "detail": "…" }],
-  "platform": []
+  "platform": [],
+  "defaulted": [{ "field": "cluster.endpointPublicAccess", "value": "true" }]
 }
 ```
+
+`defaulted` lists every value the config left out and rackctl filled in: `field` is the
+dotted `rackctl.yaml` path and `value` the value used, as it would be written in the file.
+It is an empty list when the config names every value, and `null` on a report whose config
+did not load.
 
 Each result's `status` is one of:
 

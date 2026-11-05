@@ -69,10 +69,10 @@ func TestEndpointPosture_NamesWhoTheEndpointAdmits(t *testing.T) {
 		want string
 	}{
 		{config.Cluster{}, "PRIVATE"},
-		{config.Cluster{EndpointPublicAccess: true, EndpointAllowlist: []string{"203.0.113.0/24"}}, "203.0.113.0/24"},
-		{config.Cluster{EndpointPublicAccess: true}, "egress IP this host had"},
+		{config.Cluster{EndpointPublicAccess: boolPtr(true), EndpointAllowlist: []string{"203.0.113.0/24"}}, "203.0.113.0/24"},
+		{config.Cluster{EndpointPublicAccess: boolPtr(true)}, "egress IP this host had"},
 	} {
-		if got := endpointPosture(tc.c); !strings.Contains(got, tc.want) {
+		if got := endpointPosture(&config.Config{Cluster: tc.c}); !strings.Contains(got, tc.want) {
 			t.Errorf("endpointPosture(%+v) = %q, want it to carry %q", tc.c, got, tc.want)
 		}
 	}

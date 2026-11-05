@@ -84,6 +84,11 @@ func TestCheckJSON_EndToEnd(t *testing.T) {
 		t.Error("no preflight results reached the document — a report with an empty list and " +
 			"clusterHealth set is indistinguishable from a healthy one")
 	}
+	// A config that loaded always carries the list, empty or not, so a caller never has to
+	// tell "nothing was defaulted" from "the field is missing".
+	if _, ok := doc["defaulted"].([]any); !ok {
+		t.Errorf("defaulted = %v, want a list", doc["defaulted"])
+	}
 	if plat, _ := doc["platform"].([]any); len(plat) != 0 {
 		t.Errorf("platform carries %d results against an unreachable cluster", len(plat))
 	}

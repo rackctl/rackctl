@@ -45,6 +45,7 @@ exit 0
 	cfg := baseCfg()
 	cfg.Environment = config.EnvDev
 	cfg.Cluster.Name = "platform"
+	cfg.Cluster.EndpointPublicAccess = boolPtr(false) // a private endpoint reads no live allow-list
 	cfg.Cluster.Network = config.ClusterNet{VPCCIDR: "10.0.0.0/16", NATGateways: 1}
 	// A real directory, because tg() chdirs into the checkout before invoking terragrunt.
 	return &engine.State{

@@ -318,6 +318,8 @@ func TestCheckJSON_ShapeIsStable(t *testing.T) {
 	cfg.Cluster.Name = "platform"
 	cfg.Cloud.AccountID = "111111111111"
 	cfg.Cloud.Region = "us-east-1"
+	cfg.Quotas.VCPU = 0
+	cfg.ApplyDefaults()
 
 	old := os.Stdout
 	r, w, err := os.Pipe()
@@ -352,7 +354,7 @@ func TestCheckJSON_ShapeIsStable(t *testing.T) {
 		t.Fatalf("the report must be valid JSON: %v\n%s", err, buf.String())
 	}
 	for _, key := range []string{"cluster", "environment", "account", "region",
-		"clusterHealth", "passed", "preflight", "platform", "clusterExists"} {
+		"clusterHealth", "passed", "preflight", "platform", "clusterExists", "defaulted"} {
 		if _, ok := doc[key]; !ok {
 			t.Errorf("the report lost the %q field — docs/exit-codes.md publishes this shape", key)
 		}
@@ -364,6 +366,14 @@ func TestCheckJSON_ShapeIsStable(t *testing.T) {
 	// findings" or "nobody looked". Without it the two are the same document.
 	if doc["clusterHealth"] != "asserted" {
 		t.Errorf("clusterHealth = %v, want asserted", doc["clusterHealth"])
+	}
+	// Every value the config left out is listed with the value rackctl used.
+	defaulted, _ := doc["defaulted"].([]any)
+	if len(defaulted) != 1 {
+		t.Fatalf("defaulted = %v, want the one value ApplyDefaults filled", doc["defaulted"])
+	}
+	if d, _ := defaulted[0].(map[string]any); d["field"] != "quotas.vcpu" || d["value"] != "256" {
+		t.Errorf("defaulted[0] = %v, want field quotas.vcpu and value 256", defaulted[0])
 	}
 	pre, _ := doc["preflight"].([]any)
 	if len(pre) != 1 {

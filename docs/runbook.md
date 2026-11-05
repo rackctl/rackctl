@@ -18,6 +18,12 @@ Confirm the **account** and the **profile** in that line before you proceed. The
 shared by every account you have and the org name says nothing about which credentials are
 in scope, so those two are the only fields that identify the cloud about to change.
 
+Under the banner, `plan`, `apply` and `check` list every value the config left out and the
+default used, such as `cluster.endpointPublicAccess: true`. A default you did not mean is
+fixed by setting the field. `cloud.region` and `environment` have no default: a config
+without them exits `2` naming the field, and so does a node-group size set to `0`, which is
+refused rather than replaced.
+
 `rackctl destroy` then asks you to type the cluster name. That is deliberately worse
 ergonomics than a y/n: the failure this guards is a reflex failure, and the name is the one
 thing you cannot type correctly while thinking about a different cluster.

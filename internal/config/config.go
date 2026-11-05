@@ -82,6 +82,44 @@ type Config struct {
 	ControlPlane  ControlPlane  `json:"controlPlane"`
 	FirstTenant   *FirstTenant  `json:"firstTenant,omitempty"`
 	Versions      Versions      `json:"versions,omitempty"`
+
+	// raw is the decoded document Load read, kept so ApplyDefaults can tell a key the file
+	// left out from one it set to a zero value. Nil for a config built in code, where a zero
+	// value is treated as omitted.
+	raw map[string]any
+	// defaulted is every value ApplyDefaults filled in, in the order it filled them.
+	defaulted []DefaultedValue
+}
+
+// DefaultedValue is one field the config left out and rackctl filled in.
+//
+// A default is a decision the operator did not write down, and some of them decide a lot:
+// whether the EKS API is reachable from the internet, which node sizes production gets.
+// Reporting each one, in the plan output and in check's JSON, is what makes a default
+// something an operator can see and override rather than something they discover.
+type DefaultedValue struct {
+	// Field is the dotted rackctl.yaml path, e.g. "cluster.endpointPublicAccess".
+	Field string `json:"field"`
+	// Value is the value rackctl used, as it would be written in the file.
+	Value string `json:"value"`
+}
+
+// Defaulted returns every value ApplyDefaults filled in. Empty when the config named them all.
+func (c *Config) Defaulted() []DefaultedValue { return append([]DefaultedValue(nil), c.defaulted...) }
+
+// IsDefaulted reports whether field was filled in by ApplyDefaults rather than read from the file.
+func (c *Config) IsDefaulted(field string) bool {
+	for _, d := range c.defaulted {
+		if d.Field == field {
+			return true
+		}
+	}
+	return false
+}
+
+// setInFile reports whether the file Load read sets the dotted path, at any value.
+func (c *Config) setInFile(path string) bool {
+	return c.raw != nil && present(c.raw, strings.Split(path, "."))
 }
 
 // Versions pins the platform repos this install is built from.
@@ -308,8 +346,14 @@ type Cluster struct {
 	// TF_VAR_cluster_version into landing-zone's cluster component only when it differs
 	// from Default() — an ambient TF_VAR beats a leaf's inputs, so injecting the default
 	// would silently override a leaf that deliberately pins a different version.
-	Version              string `json:"version"`
-	EndpointPublicAccess bool   `json:"endpointPublicAccess"` // prod should be false (needs bastion/VPN)
+	Version string `json:"version"`
+	// EndpointPublicAccess turns the EKS API's public endpoint on. A pointer, because what an
+	// omitted value means depends on the environment: public in development, where the kubectl
+	// and helm phases run from the operator's own host, and private in staging and production,
+	// which are reached from inside the VPC. A plain bool read an omitted key as false
+	// everywhere, so a minimal development config built a private endpoint that stranded the
+	// phases that run from the operator's host. Read it through Config.PublicEndpoint.
+	EndpointPublicAccess *bool `json:"endpointPublicAccess,omitempty"`
 	// EndpointAllowlist is the set of CIDR blocks permitted to reach the public EKS API
 	// endpoint. It rides TF_VAR_cluster_endpoint_public_access_cidrs into landing-zone's
 	// cluster component, whose committed tree is private-by-default and fail-closed: a
@@ -322,6 +366,16 @@ type Cluster struct {
 	EndpointAllowlist []string   `json:"endpointAllowlist,omitempty"`
 	SystemNodes       NodeGroup  `json:"systemNodes"`
 	Network           ClusterNet `json:"network"`
+}
+
+// PublicEndpoint reports whether the EKS API's public endpoint is on. An omitted value is
+// public in development and private in staging and production; ApplyDefaults resolves it
+// the same way and records that it did.
+func (c *Config) PublicEndpoint() bool {
+	if p := c.Cluster.EndpointPublicAccess; p != nil {
+		return *p
+	}
+	return c.Environment == EnvDev
 }
 
 // ClusterName is the resolved EKS cluster name, <environment>-<cluster.name> — the
@@ -586,9 +640,14 @@ func (a AgentPlatform) CostPipelineEnabled() bool {
 }
 
 type Compliance struct {
-	SOC2  bool `json:"soc2"`
-	HIPAA bool `json:"hipaa"`
+	// SOC2 defaults to true, so it is a pointer: a plain bool cannot tell an omitted key from
+	// an explicit false, and read the omission as false. Read it through SOC2Enabled.
+	SOC2  *bool `json:"soc2,omitempty"`
+	HIPAA bool  `json:"hipaa"`
 }
+
+// SOC2Enabled reports whether the platform is held to SOC 2 controls. Unset means yes.
+func (c Compliance) SOC2Enabled() bool { return c.SOC2 == nil || *c.SOC2 }
 
 type ControlPlane struct {
 	EKSFleet bool `json:"eksFleet"` // Crossplane cluster control plane (multi-cluster)
@@ -651,16 +710,22 @@ type FirstTenant struct {
 func boolPtr(b bool) *bool { return &b }
 
 // Default returns a Config populated with the sane development defaults.
+//
+// It carries no region, and its environment is the one these defaults describe rather than
+// one a loaded config inherits: ApplyDefaults fills neither, and Validate refuses a config
+// that names neither. A region picked on the operator's behalf can land outside the region an
+// organization's SCPs allow, and an environment picked for them decides the overlay, the
+// sizing and the endpoint posture of a cluster they did not describe.
 func Default() *Config {
 	return &Config{
-		Cloud:       Cloud{Provider: ProviderAWS, Region: "us-west-2"},
+		Cloud:       Cloud{Provider: ProviderAWS},
 		Environment: EnvDev,
 		Cluster: Cluster{
 			// Matches landing-zone's cluster_version default. Diverging here made every
 			// operator who trusted the example config believe they were pinning 1.35 while
 			// the leaf installed 1.36 regardless — the field was read by nothing.
 			Version:              "1.36",
-			EndpointPublicAccess: true,
+			EndpointPublicAccess: boolPtr(true),
 			// Matches landing-zone's system_node_instance_types default, for the same reason
 			// Version does. No leaf pins the variable, and a value equal to Default() is never
 			// injected — so a single-type list here would not merely be wrong, it would be
@@ -673,26 +738,36 @@ func Default() *Config {
 		Observability: Observability{Tier: TierFull},
 		AgentPlatform: AgentPlatform{
 			Enable:               boolPtr(true),
+			CostPipeline:         boolPtr(true),
 			BedrockModelFamilies: []string{"anthropic", "amazon-nova"},
-			Compliance:           Compliance{SOC2: true},
+			Compliance:           Compliance{SOC2: boolPtr(true)},
 		},
 	}
 }
 
-// ApplyDefaults fills unset fields on a loaded config.
+// ApplyDefaults fills unset fields on a loaded config, and records each value it fills so
+// the plan output and check's JSON can say which values the operator did not write.
+//
+// cloud.region and environment are not defaulted. Both are required, and Validate refuses a
+// config that leaves either out, by name.
 func (c *Config) ApplyDefaults() {
 	d := Default()
+	fill := func(field, value string) {
+		c.defaulted = append(c.defaulted, DefaultedValue{Field: field, Value: value})
+	}
 	if c.Cloud.Provider == "" {
 		c.Cloud.Provider = d.Cloud.Provider
-	}
-	if c.Cloud.Region == "" {
-		c.Cloud.Region = d.Cloud.Region
-	}
-	if c.Environment == "" {
-		c.Environment = d.Environment
+		fill("cloud.provider", string(c.Cloud.Provider))
 	}
 	if c.Cluster.Version == "" {
 		c.Cluster.Version = d.Cluster.Version
+		fill("cluster.version", c.Cluster.Version)
+	}
+	// Public in development, private in staging and production. Resolved here rather than
+	// left nil so the recorded value is the one every reader sees.
+	if c.Cluster.EndpointPublicAccess == nil {
+		c.Cluster.EndpointPublicAccess = boolPtr(c.PublicEndpoint())
+		fill("cluster.endpointPublicAccess", fmt.Sprintf("%t", *c.Cluster.EndpointPublicAccess))
 	}
 	// Field by field, never the whole struct — the same rule ClusterNet and Observability
 	// state below, and for a sharper reason now that all four fields ride TF_VARs.
@@ -703,17 +778,27 @@ func (c *Config) ApplyDefaults() {
 	// 3/9/3 pin and is rejected outright by EKS, failing the cluster phase mid-install. A
 	// config naming only sizes had them silently replaced by 2/6/2 and injected nothing,
 	// which is precisely the "documented but inert" defect this field was wired to kill.
+	//
+	// A size the file sets to 0 is not defaulted. It is a value the operator wrote, and
+	// replacing it with 2 hid a request EKS would refuse behind one it accepts; Validate
+	// refuses it by name instead.
 	if len(c.Cluster.SystemNodes.InstanceTypes) == 0 {
 		c.Cluster.SystemNodes.InstanceTypes = d.Cluster.SystemNodes.InstanceTypes
+		fill("cluster.systemNodes.instanceTypes", "["+strings.Join(c.Cluster.SystemNodes.InstanceTypes, ", ")+"]")
 	}
-	if c.Cluster.SystemNodes.MinSize == 0 {
-		c.Cluster.SystemNodes.MinSize = d.Cluster.SystemNodes.MinSize
-	}
-	if c.Cluster.SystemNodes.MaxSize == 0 {
-		c.Cluster.SystemNodes.MaxSize = d.Cluster.SystemNodes.MaxSize
-	}
-	if c.Cluster.SystemNodes.DesiredSize == 0 {
-		c.Cluster.SystemNodes.DesiredSize = d.Cluster.SystemNodes.DesiredSize
+	for _, size := range []struct {
+		field string
+		v     *int
+		def   int
+	}{
+		{"cluster.systemNodes.minSize", &c.Cluster.SystemNodes.MinSize, d.Cluster.SystemNodes.MinSize},
+		{"cluster.systemNodes.maxSize", &c.Cluster.SystemNodes.MaxSize, d.Cluster.SystemNodes.MaxSize},
+		{"cluster.systemNodes.desiredSize", &c.Cluster.SystemNodes.DesiredSize, d.Cluster.SystemNodes.DesiredSize},
+	} {
+		if *size.v == 0 && !c.setInFile(size.field) {
+			*size.v = size.def
+			fill(size.field, fmt.Sprintf("%d", size.def))
+		}
 	}
 	// Default the two base fields individually, never the whole struct — replacing
 	// ClusterNet wholesale would wipe an IPAM/transit-gateway/egress lever set without a
@@ -721,14 +806,17 @@ func (c *Config) ApplyDefaults() {
 	// vpcCidr is left at its default).
 	if c.Cluster.Network.VPCCIDR == "" {
 		c.Cluster.Network.VPCCIDR = d.Cluster.Network.VPCCIDR
+		fill("cluster.network.vpcCidr", c.Cluster.Network.VPCCIDR)
 	}
 	if c.Cluster.Network.NATGateways == 0 {
 		c.Cluster.Network.NATGateways = d.Cluster.Network.NATGateways
+		fill("cluster.network.natGateways", fmt.Sprintf("%d", c.Cluster.Network.NATGateways))
 	}
 	// Default the tier field itself, not the whole struct — same rule as ClusterNet below:
 	// replacing a sub-struct wholesale is how a deliberately-set sibling field gets wiped.
 	if c.Observability.Tier == "" {
 		c.Observability.Tier = d.Observability.Tier
+		fill("observability.tier", string(c.Observability.Tier))
 	}
 	// Field by field, for the third time in this function and for the same reason:
 	// replacing the struct wholesale wipes a sibling the operator set deliberately.
@@ -736,14 +824,37 @@ func (c *Config) ApplyDefaults() {
 	// a quota increase on my behalf", and taking the whole default struct turned it back
 	// on — so preflight filed a real AWS request against an account whose operator had
 	// declined it.
+	if c.Quotas.AutoRequest == nil {
+		c.Quotas.AutoRequest = d.Quotas.AutoRequest
+		fill("quotas.autoRequest", fmt.Sprintf("%t", *c.Quotas.AutoRequest))
+	}
 	if c.Quotas.VCPU == 0 {
 		c.Quotas.VCPU = d.Quotas.VCPU
+		fill("quotas.vcpu", fmt.Sprintf("%d", c.Quotas.VCPU))
 	}
-	if c.AgentPlatform.Enabled() && len(c.AgentPlatform.BedrockModelFamilies) == 0 {
-		c.AgentPlatform.BedrockModelFamilies = d.AgentPlatform.BedrockModelFamilies
+	if c.AgentPlatform.Enable == nil {
+		c.AgentPlatform.Enable = d.AgentPlatform.Enable
+		fill("agentPlatform.enable", fmt.Sprintf("%t", *c.AgentPlatform.Enable))
+	}
+	// The agent platform's own defaults are reported only when it is installed: a value
+	// nothing reads is not a decision anyone needs to see.
+	if c.AgentPlatform.Enabled() {
+		if len(c.AgentPlatform.BedrockModelFamilies) == 0 {
+			c.AgentPlatform.BedrockModelFamilies = d.AgentPlatform.BedrockModelFamilies
+			fill("agentPlatform.bedrockModelFamilies", "["+strings.Join(c.AgentPlatform.BedrockModelFamilies, ", ")+"]")
+		}
+		if c.AgentPlatform.CostPipeline == nil {
+			c.AgentPlatform.CostPipeline = d.AgentPlatform.CostPipeline
+			fill("agentPlatform.costPipeline", fmt.Sprintf("%t", *c.AgentPlatform.CostPipeline))
+		}
+		if c.AgentPlatform.Compliance.SOC2 == nil {
+			c.AgentPlatform.Compliance.SOC2 = d.AgentPlatform.Compliance.SOC2
+			fill("agentPlatform.compliance.soc2", fmt.Sprintf("%t", *c.AgentPlatform.Compliance.SOC2))
+		}
 	}
 	if c.Org.Name != "" && c.Org.GitOps.EKSGitopsRepo == "" {
 		c.Org.GitOps.EKSGitopsRepo = fmt.Sprintf("github.com/%s/eks-gitops", c.Org.Name)
+		fill("org.gitops.eksGitopsRepo", c.Org.GitOps.EKSGitopsRepo)
 	}
 }
 
@@ -763,7 +874,8 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("cloud.accountId %q must be a 12-digit AWS account id", c.Cloud.AccountID))
 	}
 	if c.Cloud.Region == "" {
-		errs = append(errs, "cloud.region is required")
+		errs = append(errs, "cloud.region is required and has no default — name the region this "+
+			"platform is built in, one your organization's SCPs allow")
 	}
 	if c.Cloud.Profile == "" {
 		errs = append(errs, "cloud.profile is required (AWS SSO profile)")
@@ -793,6 +905,9 @@ func (c *Config) Validate() error {
 	}
 	switch c.Environment {
 	case EnvDev, EnvStaging, EnvProduction:
+	case "":
+		errs = append(errs, "environment is required and has no default — development, staging or "+
+			"production; it selects the overlay, the node sizing and the endpoint posture")
 	default:
 		errs = append(errs, fmt.Sprintf("environment must be development|staging|production, got %q", c.Environment))
 	}
@@ -829,7 +944,9 @@ func (c *Config) Validate() error {
 			errs = append(errs, "cluster.systemNodes.instanceTypes must not be empty")
 		}
 	}
-	if c.Environment == EnvProduction && c.Cluster.EndpointPublicAccess {
+	// Only an explicit true: an omitted value resolves to private in production, so a minimal
+	// production config is not refused for a posture it never asked for.
+	if c.Environment == EnvProduction && c.Cluster.EndpointPublicAccess != nil && *c.Cluster.EndpointPublicAccess {
 		errs = append(errs, "cluster.endpointPublicAccess should be false for production (requires bastion/VPN)")
 	}
 	// Every allow-list entry must parse as a CIDR block: a malformed entry (a bare IP, a

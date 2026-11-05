@@ -92,6 +92,9 @@ cannot be trusted to audit it. It names the remedy and exits non-zero.`,
 		}
 
 		say(ui.Title(commandTitle("check", cfg)))
+		for _, l := range defaultedLines(cfg) {
+			say(l)
+		}
 		say(ui.OK("required tools present"))
 		say()
 
@@ -257,6 +260,10 @@ type checkReport struct {
 	// which passes, and a cluster this shell cannot reach, which does not. Absent on a run
 	// that stopped before it could ask.
 	ClusterExists string `json:"clusterExists,omitempty"`
+	// Defaulted is every value the config left out and rackctl filled in, each with the
+	// value used. An empty list when the config names every value, and null on a report
+	// whose config did not load.
+	Defaulted []config.DefaultedValue `json:"defaulted"`
 }
 
 type checkResult struct {
@@ -287,6 +294,7 @@ func newCheckReport(cfg *config.Config, clusterHealth string, pre, platform []do
 		doc.Environment = string(cfg.Environment)
 		doc.Account = cfg.Cloud.AccountID
 		doc.Region = cfg.Cloud.Region
+		doc.Defaulted = append([]config.DefaultedValue{}, cfg.Defaulted()...)
 	}
 	return doc
 }

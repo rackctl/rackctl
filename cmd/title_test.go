@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -42,6 +43,25 @@ func TestCommandTitle_DistinguishesEnvironments(t *testing.T) {
 
 	if commandTitle("destroy", dev) == commandTitle("destroy", prod) {
 		t.Fatal("two different accounts and environments rendered an identical banner")
+	}
+}
+
+// The header lists every value the config left out, with the value used, and says nothing
+// when the config named them all.
+func TestDefaultedLines_NameEachDefaultedValue(t *testing.T) {
+	cfg := config.Default()
+	cfg.ApplyDefaults()
+	if got := defaultedLines(cfg); got != nil {
+		t.Errorf("a config that names every value must print no defaults block, got %q", got)
+	}
+	cfg.Cluster.EndpointPublicAccess = nil
+	cfg.Quotas.VCPU = 0
+	cfg.ApplyDefaults()
+	got := strings.Join(defaultedLines(cfg), "\n")
+	for _, want := range []string{"2 value(s) not set", "cluster.endpointPublicAccess: true", "quotas.vcpu: 256"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the defaults block must carry %q:\n%s", want, got)
+		}
 	}
 }
 
@@ -142,5 +162,44 @@ func TestPrintResults_RendersEveryStatus(t *testing.T) {
 	}
 	if lines := strings.Count(strings.TrimSpace(got), "\n") + 1; lines != 4 {
 		t.Errorf("got %d lines, want 4 — one per result", lines)
+	}
+}
+
+// plan prints the defaults block under its title, through the binary, so an operator reading
+// the plan sees each value the config left out before reading what it would build.
+func TestPlan_PrintsEveryDefaultedValueUnderTheTitle(t *testing.T) {
+	bin := buildRackctl(t)
+	stubs := t.TempDir()
+	for _, tool := range []string{"tofu", "terragrunt", "kubectl", "helm", "git", "gh", "aws"} {
+		if err := os.WriteFile(filepath.Join(stubs, tool), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := filepath.Join(t.TempDir(), "rackctl.yaml")
+	if err := os.WriteFile(cfg, []byte(`org:
+  name: acme
+cloud:
+  accountId: "111111111111"
+  region: us-west-2
+  profile: test
+environment: development
+cluster:
+  name: platform
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := osexec.Command(bin, "plan", "-c", cfg)
+	cmd.Env = append(os.Environ(), "PATH="+stubs, "HOME="+t.TempDir())
+	out, _ := cmd.CombinedOutput()
+	title := strings.Index(string(out), "rackctl plan")
+	block := strings.Index(string(out), "value(s) not set in the config, using defaults")
+	if title < 0 || block < title {
+		t.Fatalf("the defaults block must follow the plan title:\n%s", out)
+	}
+	for _, want := range []string{"cluster.endpointPublicAccess: true", "agentPlatform.compliance.soc2: true",
+		"cluster.systemNodes.minSize: 2"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("the plan must name the defaulted value %q:\n%s", want, out)
+		}
 	}
 }
